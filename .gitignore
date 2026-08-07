@@ -1,0 +1,11 @@
+node_modules/
+tmp/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+chatgpt-protocol-session.json
+sub2api-import*.json
+login-checkpoint.json
+job-meta.json
