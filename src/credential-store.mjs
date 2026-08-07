@@ -9,6 +9,7 @@ const WINDOWS_ENTROPY = "toSub2.credentials.v1";
 
 const WINDOWS_PROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Security
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $plainText = [Console]::In.ReadToEnd()
@@ -24,6 +25,7 @@ $cipherBytes = [Security.Cryptography.ProtectedData]::Protect(
 
 const WINDOWS_UNPROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Security
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $cipherText = [Console]::In.ReadToEnd().Trim()
