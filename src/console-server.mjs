@@ -1271,6 +1271,7 @@ async function deleteJobsByEmail(email) {
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   const directories = new Set();
   matching.forEach((job) => {
+    job.deleted = true;
     stopMailPolling(job);
     releaseLubanNumber(job, "idle");
     job.runId = crypto.randomUUID();
@@ -1279,6 +1280,7 @@ async function deleteJobsByEmail(email) {
     directories.add(path.dirname(job.outputPath));
     jobs.delete(job.id);
   });
+  await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
   await Promise.all([
     ...[...directories].map((directory) => fs.rm(directory, { recursive: true, force: true })),
     deleteStoredLoginCredentials(email),
@@ -1559,9 +1561,11 @@ async function updateJobCredentials(job, credentials) {
 }
 
 async function saveJobMetadata(job) {
+  if (job.deleted) return;
   job.metadataWritePromise = (job.metadataWritePromise || Promise.resolve())
     .catch(() => {})
     .then(async () => {
+      if (job.deleted) return;
       const metadataPath = path.join(path.dirname(job.outputPath), JOB_META_FILENAME);
       const data = {
         version: 1,
