@@ -36,7 +36,9 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 ## 环境要求
 
 - Node.js 20 或更高版本，建议使用 Node.js 22。
-- macOS 可使用 Keychain（钥匙串）持久保存密码和 2FA 密钥。其他系统仍可使用邮箱验证码流程，但服务重启后的敏感登录资料恢复会受限。
+- macOS 使用 Keychain（钥匙串）持久保存密码和 2FA 密钥。
+- Windows 使用当前用户的 DPAPI（数据保护接口）加密保存，密文位于 `%LOCALAPPDATA%\toSub2\credentials`，只能由同一个 Windows 用户解密。
+- Linux 仍可使用邮箱验证码流程，但目前不持久保存密码和 2FA 密钥。
 
 ## 安装与启动
 
@@ -121,6 +123,7 @@ node src/protocol-login.mjs --help
 ## 安全说明
 
 - `tmp/` 中包含 Cookie（登录凭证）、OAuth Token（授权令牌）和登录检查点，禁止提交或分享。
+- Windows 保存的密码和 2FA 密钥由 DPAPI（数据保护接口）按当前用户加密，不会以明文写入任务目录。
 - sub2api 导入文件包含可用的授权令牌，应当按密码文件保护。
 - 不要把 API Key、密码、2FA 密钥、验证码、Cookie 或 Token 提交到 Git 仓库。
 - 网页控制台用于本机或可信局域网，不提供公网部署所需的身份认证。

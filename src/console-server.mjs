@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
+import { createCredentialStore } from "./credential-store.mjs";
 import { fetchMailboxOtpCandidates, validateMailApiUrl } from "./mail-otp.mjs";
 import { createLubanSmsClient } from "./luban-sms.mjs";
 
@@ -22,7 +23,6 @@ const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
-const KEYCHAIN_SERVICE = "com.local.chatgpt-onboarding.credentials";
 const LUBAN_SMS_POLL_INTERVAL_MS = Number(process.env.LUBAN_SMS_POLL_INTERVAL_MS || 3_000);
 const LUBAN_SMS_POLL_TIMEOUT_MS = Number(process.env.LUBAN_SMS_POLL_TIMEOUT_MS || 10 * 60_000);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -33,6 +33,7 @@ const WORKSPACE_ROOT = TOOL_ROOT;
 const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
+const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
 let outputSyncPromise = null;
@@ -1100,10 +1101,10 @@ async function exportSourceAccounts(res, ids) {
       totpSecret ||= storedCredentials.totpSecret;
     }
     if ((job.loginMode === "password" || job.hasPasswordCredential) && !password) {
-      throw httpError(409, `${job.email} 的密码未能从 Keychain（钥匙串）读取，请重新导入该账号资料`);
+      throw httpError(409, `${job.email} 的密码未能从系统安全凭据存储读取，请重新导入该账号资料`);
     }
     if (job.hasTotpCredential && !totpSecret) {
-      throw httpError(409, `${job.email} 的 2FA 密钥未能从 Keychain（钥匙串）读取，请重新导入该账号资料`);
+      throw httpError(409, `${job.email} 的 2FA 密钥未能从系统安全凭据存储读取，请重新导入该账号资料`);
     }
     if (password) {
       lines.push(totpSecret
@@ -1594,35 +1595,12 @@ async function saveStoredLoginCredentials(email, credentials = {}) {
     await deleteStoredLoginCredentials(email);
     return;
   }
-  ensureKeychainAvailable();
-  const payload = JSON.stringify({ version: 1, password, totpSecret });
-  const result = await runSecurity([
-    "add-generic-password",
-    "-a",
-    keychainAccount(email),
-    "-s",
-    KEYCHAIN_SERVICE,
-    "-U",
-    "-w",
-  ], `${payload}\n${payload}\n`);
-  if (result.code !== 0) {
-    throw httpError(500, "无法将密码和 2FA 密钥保存到 macOS Keychain（钥匙串），请先解锁登录钥匙串");
-  }
+  await credentialStore.save(email, { password, totpSecret });
 }
 
 async function loadStoredLoginCredentials(email) {
-  if (process.platform !== "darwin") return { password: "", totpSecret: "" };
-  const result = await runSecurity([
-    "find-generic-password",
-    "-a",
-    keychainAccount(email),
-    "-s",
-    KEYCHAIN_SERVICE,
-    "-w",
-  ]);
-  if (result.code !== 0) return { password: "", totpSecret: "" };
   try {
-    const data = JSON.parse(result.stdout);
+    const data = await credentialStore.load(email);
     return {
       password: typeof data.password === "string" ? data.password : "",
       totpSecret: data.totpSecret ? normalizeTotpSecret(data.totpSecret) : "",
@@ -1633,47 +1611,7 @@ async function loadStoredLoginCredentials(email) {
 }
 
 async function deleteStoredLoginCredentials(email) {
-  if (process.platform !== "darwin") return;
-  const result = await runSecurity([
-    "delete-generic-password",
-    "-a",
-    keychainAccount(email),
-    "-s",
-    KEYCHAIN_SERVICE,
-  ]);
-  if (![0, 44].includes(result.code)) {
-    throw httpError(500, "无法从 macOS Keychain（钥匙串）删除该邮箱的登录凭据");
-  }
-}
-
-function ensureKeychainAvailable() {
-  if (process.platform !== "darwin") {
-    throw httpError(501, "持久保存密码和 2FA 密钥目前需要 macOS Keychain（钥匙串）");
-  }
-}
-
-function keychainAccount(email) {
-  return String(email || "").trim().toLowerCase();
-}
-
-function runSecurity(args, input = "") {
-  return new Promise((resolve, reject) => {
-    const child = spawn("/usr/bin/security", args, {
-      detached: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout = `${stdout}${chunk}`.slice(-16_384);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr = `${stderr}${chunk}`.slice(-16_384);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
-    child.stdin.end(input);
-  });
+  await credentialStore.delete(email);
 }
 
 async function loadMailboxBaseline(job) {

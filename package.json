@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node src/console-server.mjs",
     "start": "node src/console-server.mjs",
-    "check": "node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs"
+    "check": "node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/credential-store.mjs && node test/credential-store.mjs"
   },
   "keywords": [
     "chatgpt",
