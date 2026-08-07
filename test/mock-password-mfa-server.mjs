@@ -7,11 +7,12 @@ const base = `http://127.0.0.1:${port}`;
 const factorId = "0123456789abcdef0123456789abcdef";
 const password = "local-test-password";
 const totpSecret = "JBSWY3DPEHPK3PXP";
-const idTokenPayload = Buffer.from(JSON.stringify({
-  email: "mfa-test@example.com",
-  sid: "mock-account-id",
-  sub: "mock-user-id",
-})).toString("base64url");
+const organizationWorkspaceId = "workspace-organization";
+const personalWorkspaceId = "workspace-personal";
+let chatgptWorkspaceSelected = false;
+let chatgptLoginComplete = false;
+let workspaceSelectionCount = 0;
+let selectedEmail = "mfa-test@example.com";
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
@@ -26,8 +27,14 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/auth/providers") return sendJson(res, 200, {});
   if (req.method === "GET" && url.pathname === "/api/auth/csrf") return sendJson(res, 200, { csrfToken: "mock-csrf" });
+  if (req.method === "GET" && url.pathname === "/__test/state") {
+    return sendJson(res, 200, { chatgptLoginComplete, chatgptWorkspaceSelected, workspaceSelectionCount });
+  }
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
-    const passwordMode = url.searchParams.get("login_hint") !== "email-mfa@example.com";
+    chatgptWorkspaceSelected = false;
+    chatgptLoginComplete = false;
+    selectedEmail = url.searchParams.get("login_hint") || selectedEmail;
+    const passwordMode = selectedEmail !== "email-mfa@example.com";
     return sendJson(res, 200, { url: `${base}/api/accounts/authorize?mode=${passwordMode ? "password" : "email"}` });
   }
   if (req.method === "GET" && url.pathname === "/api/accounts/authorize") {
@@ -63,22 +70,69 @@ const server = http.createServer(async (req, res) => {
     if (payload.type !== "totp" || payload.id !== factorId || !acceptedCodes.includes(payload.code)) {
       return sendJson(res, 400, { error: { message: "invalid totp" } });
     }
-    return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "external_url" } });
+    if (selectedEmail === "skip-workspace@example.com") {
+      return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "workspace" } });
+    }
+    return sendJson(res, 200, {
+      continue_url: `${base}/workspace`,
+      page: { type: "workspace" },
+      "oai-client-auth-session": {
+        workspaces: [
+          { id: organizationWorkspaceId, kind: "organization" },
+          { id: personalWorkspaceId, kind: "personal" },
+        ],
+      },
+    });
   }
-  if (req.method === "GET" && url.pathname === "/web-callback") return redirect(res, `${base}/`);
-  if (req.method === "GET" && url.pathname === "/oauth/authorize") return redirect(res, `${base}/choose-an-account`);
+  if (req.method === "GET" && url.pathname === "/workspace") {
+    return sendText(res, 200, "<html><title>Select workspace</title></html>", "text/html");
+  }
+  if (req.method === "GET" && url.pathname === "/web-callback") {
+    chatgptLoginComplete = true;
+    return redirect(res, `${base}/`);
+  }
+  if (req.method === "GET" && url.pathname === "/oauth/authorize") {
+    return redirect(res, `${base}${chatgptLoginComplete ? "/choose-an-account" : "/log-in"}`);
+  }
+  if (req.method === "GET" && url.pathname === "/log-in") {
+    return sendText(res, 200, "<html><title>Log in</title></html>", "text/html");
+  }
   if (req.method === "GET" && url.pathname === "/choose-an-account") {
     return sendText(res, 200, '<html><input name="session_id" value="us_1234567890abcdef"></html>', "text/html");
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/session/select") {
+    if (selectedEmail === "direct-codex-callback@example.com") {
+      return sendJson(res, 200, {
+        continue_url: "http://localhost:1455/auth/callback?code=mock-code&state=mock-state",
+        page: { type: "external_url" },
+      });
+    }
     return sendJson(res, 200, {
-      "oai-client-auth-session": { workspaces: [{ id: "workspace-personal", kind: "personal" }] },
+      "oai-client-auth-session": { workspaces: [{ id: personalWorkspaceId, kind: "personal" }] },
     });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/workspace/select") {
+    const payload = parseJson(body);
+    if (!chatgptWorkspaceSelected && selectedEmail !== "skip-workspace@example.com") {
+      if (payload.workspace_id !== organizationWorkspaceId) {
+        return sendJson(res, 400, { error: { message: "unexpected ChatGPT workspace" } });
+      }
+      chatgptWorkspaceSelected = true;
+      workspaceSelectionCount += 1;
+      return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "external_url" } });
+    }
+    if (payload.workspace_id !== personalWorkspaceId) {
+      return sendJson(res, 400, { error: { message: "unexpected Codex workspace" } });
+    }
+    workspaceSelectionCount += 1;
     return sendJson(res, 200, { continue_url: "http://localhost:1455/auth/callback?code=mock-code&state=mock-state" });
   }
   if (req.method === "POST" && url.pathname === "/oauth/token") {
+    const idTokenPayload = Buffer.from(JSON.stringify({
+      email: selectedEmail,
+      sid: "mock-account-id",
+      sub: "mock-user-id",
+    })).toString("base64url");
     return sendJson(res, 200, {
       access_token: "mock-access-token",
       refresh_token: "mock-refresh-token",
@@ -99,9 +153,19 @@ function mfaPayload() {
 }
 
 function mfaSession() {
+  if (selectedEmail === "skip-workspace@example.com") {
+    return {
+      mfa_factors: [{ factor_type: "totp", id: factorId, metadata: {} }],
+      mfa_challenge_factors: [{ factor_type: "totp", id: factorId, metadata: {} }],
+    };
+  }
   return {
     mfa_factors: [{ factor_type: "totp", id: factorId, metadata: {} }],
     mfa_challenge_factors: [{ factor_type: "totp", id: factorId, metadata: {} }],
+    workspaces: [
+      { id: organizationWorkspaceId, kind: "organization" },
+      { id: personalWorkspaceId, kind: "personal" },
+    ],
   };
 }
 

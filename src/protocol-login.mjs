@@ -475,6 +475,10 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     totpSecret,
     referer: authPage.finalUrl,
   });
+  authenticated = await selectChatgptLoginWorkspaceIfNeeded(client, {
+    authBase,
+    payload: authenticated,
+  });
   const callback = await continueFlow(client, authenticated);
   return {
     deviceId,
@@ -484,6 +488,22 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     loginMethod,
     mfaVerified: mfaRequired,
   };
+}
+
+async function selectChatgptLoginWorkspaceIfNeeded(client, { authBase, payload }) {
+  if (!isWorkspaceSelectionPayload(payload)) return payload;
+  const workspaces = payload?.["oai-client-auth-session"]?.workspaces;
+  const workspaceId = Array.isArray(workspaces) ? workspaces.find((item) => item?.id)?.id : null;
+  if (!workspaceId) {
+    console.log("[web] Workspace page did not include a selectable workspace; skipping selection.");
+    return payload;
+  }
+  const workspaceUrl = getContinueUrl(payload) || `${authBase}/workspace`;
+  console.log("[web] Select ChatGPT login workspace");
+  const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/workspace/select", {
+    workspace_id: workspaceId,
+  }, { referer: workspaceUrl });
+  return data;
 }
 
 async function verifyPassword(client, { authBase, rl, password, referer }) {
@@ -566,6 +586,15 @@ function isMfaChallengePayload(payload) {
   }
 }
 
+function isWorkspaceSelectionPayload(payload) {
+  if (payload?.page?.type === "workspace") return true;
+  try {
+    return new URL(getContinueUrl(payload)).pathname === "/workspace";
+  } catch {
+    return false;
+  }
+}
+
 function pickTotpFactor(payload) {
   const session = payload?.["oai-client-auth-session"] || {};
   const factors = [
@@ -643,6 +672,11 @@ async function runCodexOauth(client, options) {
   const html = authorized.last?.text || "";
   const sessionId = extractFirstSessionId(html);
   if (!sessionId) {
+    if (isAuthLoginPage(authorized.finalUrl)) {
+      throw new Error(
+        "CODEX_AUTH_LOGIN_REQUIRED: Codex authorization returned to the login page because the ChatGPT web session is missing or expired.",
+      );
+    }
     throw new Error(
       "SESSION_SELECTION_INVALID: Could not find a us_ account session on choose-account page. " +
         "The authorization page may require a browser security check.",
@@ -668,6 +702,8 @@ async function runCodexOauth(client, options) {
     current = await bindPhoneIfNeeded(client, { ...options, checkpointOauth: oauth }, current, addPhoneUrl);
   } else if (hasWorkspace(current)) {
     console.log("[4/5] Existing workspace/session selected; phone binding was not requested");
+  } else if (isLocalCallback(getContinueUrl(current))) {
+    console.log("[4/5] Account selected; phone binding and workspace selection were not requested");
   } else {
     throw unexpectedSessionSelectionError(current);
   }
@@ -1304,7 +1340,7 @@ async function removeProtocolCheckpoint(checkpointPath) {
 }
 
 function isExpiredCheckpointError(error) {
-  return /CHECKPOINT_INVALID|SESSION_SELECTION_INVALID|invalid_state|no longer valid|session.+(?:invalid|expired)|expired.+session/i.test(
+  return /CHECKPOINT_INVALID|SESSION_SELECTION_INVALID|CODEX_AUTH_LOGIN_REQUIRED|invalid_state|no longer valid|session.+(?:invalid|expired)|expired.+session/i.test(
     String(error?.message || ""),
   );
 }
@@ -1441,6 +1477,14 @@ function isLocalCallback(url) {
       (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1") &&
       parsed.pathname === "/auth/callback"
     );
+  } catch {
+    return false;
+  }
+}
+
+function isAuthLoginPage(value) {
+  try {
+    return ["/log-in", "/log-in/password", "/log-in-or-create-account"].includes(new URL(value).pathname);
   } catch {
     return false;
   }
