@@ -1,5 +1,9 @@
 # toSub2
 
+QQ 交流群：`1085165735`
+
+[点击链接加入群聊【toSub2】](https://qm.qq.com/q/n40xuIClm8)
+
 toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 Codex OAuth（授权登录），自动判断账号是否需要绑定手机号，并生成可供 sub2api 导入的 JSON（结构化数据）文件。
 
 > 本项目不是 OpenAI 官方项目。上游登录接口随时可能变化。
