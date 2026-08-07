@@ -133,6 +133,10 @@ node src/protocol-login.mjs --help
 
 本项目仅供学习、研究和管理本人账号使用，不隶属于 OpenAI，也未获得 OpenAI 背书。使用者应自行遵守 OpenAI 服务条款、相关平台规则以及所在地法律法规。因接口变更、账号限制、数据泄露或不当使用造成的后果由使用者自行承担。
 
+## 更新日志
+
+版本变化和升级说明请查看 [CHANGELOG.md](CHANGELOG.md)。
+
 ## License（开源许可证）
 
 [MIT](LICENSE)
