@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { fetchSentinelToken } from "./sentinel.mjs";
 
 const DEFAULT_CHATGPT_BASE = "https://chatgpt.com";
 const DEFAULT_AUTH_BASE = "https://auth.openai.com";
@@ -12,6 +13,16 @@ const DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const DEFAULT_OUT = "tmp/chatgpt-protocol-session.json";
 const DEFAULT_SUB2API_OUT = "tmp/sub2api-import-oauth.json";
 const DEFAULT_TIMEOUT_MS = 30_000;
+const PROFILE_MIN_AGE = 20;
+const PROFILE_MAX_AGE = 50;
+const PROFILE_FIRST_NAMES = [
+  "Alex", "Avery", "Blake", "Cameron", "Casey", "Drew", "Emerson", "Hayden",
+  "Jamie", "Jordan", "Logan", "Morgan", "Parker", "Quinn", "Reese", "Taylor",
+];
+const PROFILE_LAST_NAMES = [
+  "Adams", "Baker", "Brooks", "Carter", "Clark", "Collins", "Cooper", "Evans",
+  "Foster", "Gray", "Hall", "Hayes", "Morgan", "Perry", "Reed", "Walker",
+];
 const HAR_ADD_PHONE_COOKIE_NAMES = new Set([
   "oai-login-csrf_dev_3772291445",
   "oai-did",
@@ -475,6 +486,11 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     totpSecret,
     referer: authPage.finalUrl,
   });
+  authenticated = await completeAccountProfileIfNeeded(client, {
+    authBase,
+    deviceId,
+    payload: authenticated,
+  });
   authenticated = await selectChatgptLoginWorkspaceIfNeeded(client, {
     authBase,
     payload: authenticated,
@@ -593,6 +609,102 @@ function isWorkspaceSelectionPayload(payload) {
   } catch {
     return false;
   }
+}
+
+function isAccountProfileRequired(payload) {
+  if (payload?.page?.type === "about_you") return true;
+  try {
+    return new URL(getContinueUrl(payload)).pathname === "/about-you";
+  } catch {
+    return false;
+  }
+}
+
+async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payload }) {
+  if (!isAccountProfileRequired(payload)) return payload;
+
+  const profile = generateAccountProfile();
+  const profileUrl = getContinueUrl(payload) || `${authBase}/about-you`;
+  console.log(
+    `[profile] Account profile is incomplete; generating a name and an age between ${PROFILE_MIN_AGE} and ${PROFILE_MAX_AGE}.`,
+  );
+  console.log("[sentinel] Requesting a fresh security token for account profile creation.");
+  let sentinelToken;
+  try {
+    sentinelToken = await fetchSentinelToken({
+      flow: "oauth_create_account",
+      deviceID: deviceId,
+      fetch: (url, options) => fetch(url, {
+        ...options,
+        signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+      }),
+      reqEndpoint: sentinelRequirementsEndpoint(authBase),
+      userAgent: UA,
+    });
+  } catch (error) {
+    throw new Error(
+      `[profile-security-check-required] Could not generate the Sentinel security token: ${error.message}`,
+    );
+  }
+
+  let data;
+  try {
+    ({ data } = await authJsonStep(
+      client,
+      authBase,
+      "POST",
+      "/api/accounts/create_account",
+      profile,
+      {
+        referer: profileUrl,
+        headers: { "openai-sentinel-token": sentinelToken },
+      },
+    ));
+  } catch (error) {
+    if (/registration_disallowed/i.test(String(error?.message || ""))) {
+      throw new Error(
+        "[profile-security-check-required] Account profile creation was rejected after Sentinel verification.",
+      );
+    }
+    throw error;
+  }
+  if (isAccountProfileRequired(data)) {
+    throw new Error("ACCOUNT_PROFILE_REQUIRED: Account profile submission did not advance the login flow.");
+  }
+  console.log("[ok] Account profile completed");
+  return data;
+}
+
+function sentinelRequirementsEndpoint(authBase) {
+  const target = new URL(authBase);
+  if (target.hostname === "auth.openai.com") {
+    return "https://sentinel.openai.com/backend-api/sentinel/req";
+  }
+  return new URL("/backend-api/sentinel/req", target).toString();
+}
+
+function generateAccountProfile(now = new Date()) {
+  const firstName = PROFILE_FIRST_NAMES[crypto.randomInt(PROFILE_FIRST_NAMES.length)];
+  const lastName = PROFILE_LAST_NAMES[crypto.randomInt(PROFILE_LAST_NAMES.length)];
+  return {
+    name: `${firstName} ${lastName}`,
+    birthdate: generateBirthdate(PROFILE_MIN_AGE, PROFILE_MAX_AGE, now),
+  };
+}
+
+function generateBirthdate(minAge, maxAge, now) {
+  const todayUtc = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const latest = new Date(todayUtc);
+  latest.setUTCFullYear(latest.getUTCFullYear() - minAge);
+
+  const earliest = new Date(todayUtc);
+  earliest.setUTCFullYear(earliest.getUTCFullYear() - maxAge - 1);
+  earliest.setUTCDate(earliest.getUTCDate() + 1);
+
+  const dayMs = 24 * 60 * 60 * 1000;
+  const dayCount = Math.floor((latest.getTime() - earliest.getTime()) / dayMs);
+  const selected = new Date(earliest.getTime() + crypto.randomInt(dayCount + 1) * dayMs);
+  return selected.toISOString().slice(0, 10);
 }
 
 function pickTotpFactor(payload) {
@@ -912,6 +1024,7 @@ async function authJsonStep(client, authBase, method, pathname, body, options = 
   return client.getJson(method, `${authBase}${pathname}`, {
     origin: authBase,
     referer: options.referer || `${authBase}/`,
+    headers: options.headers,
     json: body,
   });
 }

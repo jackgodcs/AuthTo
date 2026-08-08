@@ -98,7 +98,7 @@ try {
     return;
   }
 
-  if (args.email === "luban@example.com") {
+  if (["luban@example.com", "sms-provider@example.com"].includes(args.email)) {
     await rl.question("Phone number, E.164 format (p=quit): ");
     console.log("Phone OTP (r=resend, p=change phone, q=quit): ");
     await rl.question("");

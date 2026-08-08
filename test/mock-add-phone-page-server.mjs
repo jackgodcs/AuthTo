@@ -11,6 +11,8 @@ const idTokenPayload = Buffer.from(JSON.stringify({
   sub: "mock-user-id",
 })).toString("base64url");
 
+let lastLoginHint = "";
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
   const body = await readBody(req);
@@ -25,6 +27,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/auth/providers") return sendJson(res, 200, {});
   if (req.method === "GET" && url.pathname === "/api/auth/csrf") return sendJson(res, 200, { csrfToken: "mock-csrf" });
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
+    lastLoginHint = url.searchParams.get("login_hint") || "";
     return sendJson(res, 200, { url: `${publicBase}/api/accounts/authorize` });
   }
   if (req.method === "GET" && url.pathname === "/api/accounts/authorize") {
@@ -34,9 +37,49 @@ const server = http.createServer(async (req, res) => {
     return sendText(res, 200, "<html><title>Check your inbox</title></html>", "text/html");
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/validate") {
+    if (lastLoginHint === "account-profile@example.com") {
+      return sendJson(res, 200, {
+        continue_url: `${publicBase}/about-you`,
+        page: { type: "about_you" },
+        "oai-client-auth-session": { email_verified: true },
+      });
+    }
     return sendJson(res, 200, {
       continue_url: `${publicBase}/web-callback`,
       "oai-client-auth-session": { email_verified: true },
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/backend-api/sentinel/req") {
+    const payload = JSON.parse(body || "{}");
+    if (payload.flow !== "oauth_create_account" || typeof payload.id !== "string" || !payload.id) {
+      return sendJson(res, 400, { error: { message: "invalid sentinel request" } });
+    }
+    return sendJson(res, 200, {
+      token: "mock-sentinel-challenge",
+      proofofwork: { required: false },
+      turnstile: { required: false },
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/create_account") {
+    const payload = JSON.parse(body || "{}");
+    const sentinel = parseJson(req.headers["openai-sentinel-token"]);
+    if (
+      sentinel?.flow !== "oauth_create_account"
+      || sentinel?.c !== "mock-sentinel-challenge"
+      || typeof sentinel?.id !== "string"
+      || !sentinel.id
+    ) {
+      return sendJson(res, 400, { error: { message: "missing sentinel token" } });
+    }
+    if (!/^[A-Za-z]+ [A-Za-z]+$/.test(payload.name || "")) {
+      return sendJson(res, 400, { error: { message: "invalid generated name" } });
+    }
+    if (!isAgeBetween(payload.birthdate, 20, 50)) {
+      return sendJson(res, 400, { error: { message: "generated age must be between 20 and 50" } });
+    }
+    return sendJson(res, 200, {
+      continue_url: `${publicBase}/web-callback`,
+      "oai-client-auth-session": { email_verified: true, profile_completed: true },
     });
   }
   if (req.method === "GET" && url.pathname === "/web-callback") return redirect(res, `${publicBase}/`);
@@ -116,4 +159,25 @@ async function readBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
+}
+
+function parseJson(value) {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return null;
+  }
+}
+
+function isAgeBetween(birthdate, minAge, maxAge) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(birthdate || "")) return false;
+  const birth = new Date(`${birthdate}T00:00:00Z`);
+  if (Number.isNaN(birth.getTime())) return false;
+  const now = new Date();
+  let age = now.getUTCFullYear() - birth.getUTCFullYear();
+  const birthdayPassed =
+    now.getUTCMonth() > birth.getUTCMonth()
+    || (now.getUTCMonth() === birth.getUTCMonth() && now.getUTCDate() >= birth.getUTCDate());
+  if (!birthdayPassed) age -= 1;
+  return age >= minAge && age <= maxAge;
 }

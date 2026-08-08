@@ -11,7 +11,7 @@ import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import { fetchMailboxOtpCandidates, validateMailApiUrl } from "./mail-otp.mjs";
-import { createLubanSmsClient } from "./luban-sms.mjs";
+import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
@@ -23,8 +23,8 @@ const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
-const LUBAN_SMS_POLL_INTERVAL_MS = Number(process.env.LUBAN_SMS_POLL_INTERVAL_MS || 3_000);
-const LUBAN_SMS_POLL_TIMEOUT_MS = Number(process.env.LUBAN_SMS_POLL_TIMEOUT_MS || 10 * 60_000);
+const SMS_POLL_INTERVAL_MS = Number(process.env.SMS_POLL_INTERVAL_MS || process.env.LUBAN_SMS_POLL_INTERVAL_MS || 3_000);
+const SMS_POLL_TIMEOUT_MS = Number(process.env.SMS_POLL_TIMEOUT_MS || process.env.LUBAN_SMS_POLL_TIMEOUT_MS || 10 * 60_000);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TOOL_ROOT = path.resolve(__dirname, "..");
 const WEB_ROOT = path.join(TOOL_ROOT, "web");
@@ -153,7 +153,7 @@ async function handleApi(req, res, requestUrl) {
         bulkActions: true,
         pagination: true,
         uniqueEmail: true,
-        lubanSms: true,
+        smsProviders: publicSmsProviderDefinitions(),
         queue: true,
         sourceExport: true,
         cancelAll: true,
@@ -262,7 +262,26 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|logs|download|luban-number))?$/.exec(requestUrl.pathname);
+  const providerOptionsMatch = /^\/api\/sms-providers\/([a-z0-9_-]+)\/options$/.exec(requestUrl.pathname);
+  if (req.method === "POST" && providerOptionsMatch) {
+    const body = await readJson(req);
+    let smsClient;
+    try {
+      smsClient = createSmsProvider(providerOptionsMatch[1], body.config, {
+        lubanApiBase: process.env.LUBAN_SMS_API_BASE,
+        smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+      });
+      if (!smsClient.listNumberOptions) throw httpError(400, "该接码平台不支持价格查询");
+      const options = await smsClient.listNumberOptions();
+      sendJson(res, 200, { providerId: smsClient.id, options });
+    } catch (error) {
+      if (error?.status) throw error;
+      throw httpError(502, safeSmsProviderError(error, body.config?.apiKey));
+    }
+    return;
+  }
+
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -283,9 +302,13 @@ async function handleApi(req, res, requestUrl) {
     await downloadResult(res, job);
     return;
   }
-  if (req.method === "POST" && action === "luban-number") {
+  if (req.method === "POST" && ["sms-number", "luban-number"].includes(action)) {
     const body = await readJson(req);
-    await acquireLubanNumber(job, body.serviceId, body.apiKey);
+    const providerId = action === "luban-number" ? "luban" : body.providerId;
+    const config = action === "luban-number"
+      ? { apiKey: body.apiKey, serviceId: body.serviceId }
+      : body.config;
+    await acquireSmsNumber(job, providerId, config);
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
@@ -396,7 +419,7 @@ async function startJob(email, credentials = {}) {
     queuedAt: new Date().toISOString(),
     queuedStartPrompt: "正在建立登录会话",
     fallbackInProgress: false,
-    ...newLubanState(),
+    ...newSmsState(),
   };
   jobs.set(id, job);
   await saveJobMetadata(job);
@@ -532,8 +555,8 @@ async function retryJob(job) {
   const resumingCheckpoint = job.status === "resume_available"
     || (retryingSecurityCheck && await fileExists(job.checkpointPath));
   stopMailPolling(job);
-  if (resumingCheckpoint) stopLubanSmsPolling(job);
-  else releaseLubanNumber(job, "idle");
+  if (resumingCheckpoint) stopSmsPolling(job);
+  else releaseSmsNumber(job, "idle");
   job.runId = crypto.randomUUID();
   job.child?.kill("SIGTERM");
   job.child = null;
@@ -544,7 +567,7 @@ async function retryJob(job) {
   job.parserTail = "";
   job.resultSaved = false;
   job.completedAt = null;
-  job.currentPhone = resumingCheckpoint ? (job.currentPhone || job.lubanNumber) : null;
+  job.currentPhone = resumingCheckpoint ? (job.currentPhone || job.smsNumber) : null;
   job.phoneError = null;
   job.securityCheckRequired = false;
   job.restartRequired = false;
@@ -567,7 +590,7 @@ function regenerateJob(job) {
   job.parserTail = "";
   job.currentPhone = null;
   job.phoneError = null;
-  releaseLubanNumber(job, "idle");
+  releaseSmsNumber(job, "idle");
   job.restartRequired = false;
   job.completedAt = null;
   job.attempt += 1;
@@ -579,7 +602,7 @@ async function fallbackFromRefresh(job) {
   if (job.runMode !== "refresh" || job.fallbackInProgress) return;
   job.fallbackInProgress = true;
   stopMailPolling(job);
-  releaseLubanNumber(job, "idle");
+  releaseSmsNumber(job, "idle");
   job.runId = crypto.randomUUID();
   job.child?.kill("SIGTERM");
   job.child = null;
@@ -612,14 +635,24 @@ function consumeOutput(job, rawText) {
     return;
   }
 
+  if (scan.includes("[profile-security-check-required]")) {
+    requireProfileSecurityCheck(job);
+    return;
+  }
+
+  if (scan.includes("ACCOUNT_PROFILE_REQUIRED")) {
+    failAccountProfileRequired(job);
+    return;
+  }
+
   if (/Your sign-in session is no longer valid|["']code["']\s*:\s*["']invalid_state["']/i.test(scan)) {
     requireReauthorization(job, "当前登录状态已经失效，继续更换手机号也无法发送验证码");
     return;
   }
 
   if (scan.includes("[auth-expired]")) {
-    stopLubanSmsPolling(job);
-    releaseLubanNumber(job, "idle");
+    stopSmsPolling(job);
+    releaseSmsNumber(job, "idle");
     job.currentPhone = null;
     job.phoneError = null;
     setStage(job, "starting", "新登录状态被服务端拒绝，正在自动重新获取邮箱验证码");
@@ -654,7 +687,7 @@ function consumeOutput(job, rawText) {
       "phone_otp",
       job.currentPhone ? `短信验证码已发送至 ${job.currentPhone}` : "请输入手机短信验证码",
     );
-    if (job.lubanRequestId && job.lubanNumber === job.currentPhone) void beginLubanSmsPolling(job);
+    if (job.smsOrderId && job.smsNumber === job.currentPhone) void beginSmsPolling(job);
   }
 
   const sendFailures = [...scan.matchAll(/\[warn\] Could not send SMS to (\+\d+):\s*([^\r\n]+)/g)];
@@ -662,8 +695,8 @@ function consumeOutput(job, rawText) {
     const latest = sendFailures.at(-1);
     job.currentPhone = latest[1];
     job.phoneError = friendlyPhoneError(latest[2]);
-    if (job.lubanRequestId && job.lubanNumber === job.currentPhone) {
-      releaseLubanNumber(job, "error", "该平台手机号无法接收验证码，请重新取号或手动输入其他手机号");
+    if (job.smsOrderId && job.smsNumber === job.currentPhone) {
+      releaseSmsNumber(job, "error", "该平台手机号无法接收验证码，请重新取号或手动输入其他手机号");
     }
     setStage(job, "phone", `手机号 ${job.currentPhone} 无法接收验证码，请更换手机号`);
   }
@@ -671,9 +704,9 @@ function consumeOutput(job, rawText) {
   const validationFailures = [...scan.matchAll(/\[warn\] Phone OTP validation failed:\s*([^\r\n]+)/g)];
   if (validationFailures.length) {
     job.phoneError = friendlyPhoneOtpError(validationFailures.at(-1)[1]);
-    if (job.lubanStatus === "submitted") {
-      job.lubanStatus = "error";
-      job.lubanError = "平台返回的验证码未通过验证，请重新发送或更换手机号";
+    if (job.smsStatus === "submitted") {
+      job.smsStatus = "error";
+      job.smsError = "平台返回的验证码未通过验证，请重新发送或更换手机号";
     }
     setStage(
       job,
@@ -702,7 +735,7 @@ function consumeOutput(job, rawText) {
 function requireReauthorization(job, message) {
   if (isTerminalStatus(job.status)) return;
   stopMailPolling(job);
-  releaseLubanNumber(job, "idle");
+  releaseSmsNumber(job, "idle");
   job.status = "reauth_required";
   job.prompt = "登录状态已失效，需要重新授权";
   job.lastError = message;
@@ -715,7 +748,7 @@ function requireReauthorization(job, message) {
 function requireBrowserSecurityCheck(job) {
   if (isTerminalStatus(job.status)) return;
   stopMailPolling(job);
-  releaseLubanNumber(job, "idle");
+  releaseSmsNumber(job, "idle");
   job.status = "failed";
   job.prompt = "手机号绑定需要浏览器安全校验";
   job.lastError = "邮箱登录已经成功，但服务端拒绝了本次纯协议短信请求；可以手动重试，若仍被拒绝则需要稍后再试";
@@ -725,9 +758,36 @@ function requireBrowserSecurityCheck(job) {
   touch(job);
 }
 
+function requireProfileSecurityCheck(job) {
+  if (isTerminalStatus(job.status)) return;
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.status = "failed";
+  job.prompt = "账号资料创建需要安全校验";
+  job.lastError = "邮箱验证码已经通过，但账号资料创建仍被 Sentinel 安全校验拒绝；可以点击重新授权再次生成动态校验令牌";
+  job.phoneError = null;
+  job.securityCheckRequired = true;
+  job.child?.kill("SIGTERM");
+  touch(job);
+  void saveJobMetadata(job).catch(() => {});
+}
+
+function failAccountProfileRequired(job) {
+  if (isTerminalStatus(job.status)) return;
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.status = "failed";
+  job.prompt = "账号注册资料未完成";
+  job.lastError = "邮箱验证已经成功，但该邮箱还没有完成账号资料填写。请先在官方页面完成姓名和出生日期后再重新授权。";
+  job.phoneError = null;
+  job.child?.kill("SIGTERM");
+  touch(job);
+  void saveJobMetadata(job).catch(() => {});
+}
+
 function markResumeAvailable(job, reason = "登录流程中断") {
   stopMailPolling(job);
-  stopLubanSmsPolling(job);
+  stopSmsPolling(job);
   job.status = "resume_available";
   job.prompt = "邮箱登录检查点仍然有效，可以继续手机号绑定";
   job.lastError = `${reason}，继续时会优先恢复已保存状态；状态失效才重新获取邮箱验证码`;
@@ -772,159 +832,189 @@ function friendlyPhoneOtpError(message) {
   return "手机验证码不正确，请重新输入；也可以重新发送或更换手机号";
 }
 
-async function acquireLubanNumber(job, serviceIdValue, apiKeyValue) {
+async function acquireSmsNumber(job, providerId, config) {
   requireStage(job, "phone");
-  const serviceId = String(serviceIdValue || "").trim();
-  const apiKey = String(apiKeyValue || "").trim();
-  if (!/^[a-zA-Z0-9._:-]{1,80}$/.test(serviceId)) throw httpError(400, "请输入有效的接码平台服务编号");
-  if (!/^[a-zA-Z0-9._-]{8,256}$/.test(apiKey)) throw httpError(400, "请在页面上方输入有效的 LubanSMS API Key");
-  if (job.lubanStatus === "requesting") throw httpError(409, "正在获取手机号，请不要重复提交");
+  if (job.smsStatus === "requesting") throw httpError(409, "正在获取手机号，请不要重复提交");
 
-  releaseLubanNumber(job, "idle");
-  const lubanClient = createLubanSmsClient({ apiKey, apiBase: process.env.LUBAN_SMS_API_BASE });
-  job.lubanClient = lubanClient;
-  job.lubanServiceId = serviceId;
-  job.lubanStatus = "requesting";
-  job.lubanError = null;
+  let smsClient;
+  try {
+    smsClient = createSmsProvider(providerId, config, {
+      lubanApiBase: process.env.LUBAN_SMS_API_BASE,
+      smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+    });
+  } catch (error) {
+    throw httpError(400, safeSmsProviderError(error, config?.apiKey));
+  }
+
+  releaseSmsNumber(job, "idle");
+  job.smsClient = smsClient;
+  job.smsProviderId = smsClient.id;
+  job.smsProviderName = smsClient.name;
+  job.smsServiceLabel = smsClient.serviceLabel;
+  job.smsStatus = "requesting";
+  job.smsError = null;
   touch(job);
 
   let order;
   try {
-    order = await lubanClient.getNumber(serviceId);
+    order = await smsClient.getNumber();
     if (job.status !== "phone" || !job.child) {
-      void lubanClient.release(order.requestId).catch(() => {});
+      void smsClient.release(order.requestId).catch(() => {});
       throw httpError(409, "任务已经不在手机号输入步骤，平台号码已释放");
     }
-    job.lubanRequestId = order.requestId;
-    job.lubanNumber = order.number;
-    job.lubanStatus = "number_acquired";
-    job.lubanError = null;
+    job.smsOrderId = order.requestId;
+    job.smsNumber = order.number;
+    job.smsStatus = "number_acquired";
+    job.smsError = null;
     await saveJobMetadata(job);
-    appendJobLog(job, "[sms] 已从 LubanSMS 获取手机号并提交，等待短信发送结果。\n");
-    await submitJobInput(job, { action: "phone", value: order.number }, { source: "luban" });
+    appendJobLog(job, `[sms] 已从 ${smsClient.name} 获取手机号并提交，等待短信发送结果。\n`);
+    await submitJobInput(job, { action: "phone", value: order.number }, { source: "sms-provider" });
   } catch (error) {
-    if (order?.requestId && job.lubanRequestId === order.requestId) releaseLubanNumber(job, "error");
+    if (order?.requestId && job.smsOrderId === order.requestId) releaseSmsNumber(job, "error");
     if (job.status === "phone") {
-      job.lubanStatus = "error";
-      job.lubanError = safeLubanError(error, apiKey);
-      if (!order) job.lubanClient = null;
+      job.smsStatus = "error";
+      job.smsError = safeSmsProviderError(error, smsClient.apiKey);
+      if (!order) job.smsClient = null;
       touch(job);
     }
     if (error?.status) throw error;
-    throw httpError(502, safeLubanError(error, apiKey));
+    throw httpError(502, safeSmsProviderError(error, smsClient.apiKey));
   }
 }
 
-async function beginLubanSmsPolling(job) {
-  if (!job.lubanClient || !job.lubanRequestId || job.lubanPollToken || job.status !== "phone_otp") return;
+async function beginSmsPolling(job) {
+  if (!job.smsClient || !job.smsOrderId || job.smsPollToken || job.status !== "phone_otp") return;
   const pollToken = crypto.randomUUID();
-  const requestId = job.lubanRequestId;
-  const lubanClient = job.lubanClient;
+  const requestId = job.smsOrderId;
+  const smsClient = job.smsClient;
   const startedAt = Date.now();
-  job.lubanPollToken = pollToken;
-  job.lubanStatus = "waiting_sms";
-  job.lubanError = null;
+  job.smsPollToken = pollToken;
+  job.smsStatus = "waiting_sms";
+  job.smsError = null;
   touch(job);
 
   try {
+    if (smsClient.markReady) {
+      await smsClient.markReady(requestId).catch((error) => {
+        appendJobLog(job, `[sms] ${smsClient.name} 更新号码就绪状态失败：${safeSmsProviderError(error)}\n`);
+      });
+    }
     while (
-      job.lubanPollToken === pollToken &&
-      job.lubanRequestId === requestId &&
+      job.smsPollToken === pollToken &&
+      job.smsOrderId === requestId &&
       job.status === "phone_otp" &&
       job.child &&
-      Date.now() - startedAt < LUBAN_SMS_POLL_TIMEOUT_MS
+      Date.now() - startedAt < SMS_POLL_TIMEOUT_MS
     ) {
       try {
-        const result = await lubanClient.getSms(requestId);
-        if (job.lubanPollToken !== pollToken || job.status !== "phone_otp" || !job.child) return;
+        const result = await smsClient.getSms(requestId);
+        if (job.smsPollToken !== pollToken || job.status !== "phone_otp" || !job.child) return;
         if (result.status === "received") {
-          job.lubanStatus = "submitting";
-          job.lubanError = null;
-          appendJobLog(job, "[sms] 已从 LubanSMS 获取短信验证码并自动提交。\n");
-          await submitJobInput(job, { action: "phone_otp", value: result.code }, { source: "luban" });
+          job.smsStatus = "submitting";
+          job.smsError = null;
+          appendJobLog(job, `[sms] 已从 ${smsClient.name} 获取短信验证码并自动提交。\n`);
+          await submitJobInput(job, { action: "phone_otp", value: result.code }, { source: "sms-provider" });
+          if (smsClient.complete) {
+            await smsClient.complete(requestId).catch((error) => {
+              appendJobLog(job, `[sms] ${smsClient.name} 完成订单失败：${safeSmsProviderError(error)}\n`);
+            });
+          }
           return;
         }
-        job.lubanStatus = "waiting_sms";
-        job.lubanError = null;
+        job.smsStatus = "waiting_sms";
+        job.smsError = null;
       } catch (error) {
-        if (job.lubanPollToken !== pollToken) return;
+        if (job.smsPollToken !== pollToken) return;
         if (error?.terminal) {
-          job.lubanStatus = "error";
-          job.lubanError = `${safeLubanError(error)}，可以手动输入验证码或更换手机号`;
+          job.smsStatus = "error";
+          job.smsError = `${safeSmsProviderError(error)}，可以手动输入验证码或更换手机号`;
           touch(job);
           return;
         }
-        job.lubanStatus = "waiting_sms";
-        job.lubanError = `${safeLubanError(error)}，正在自动重试`;
+        job.smsStatus = "waiting_sms";
+        job.smsError = `${safeSmsProviderError(error)}，正在自动重试`;
         touch(job);
       }
-      await delay(LUBAN_SMS_POLL_INTERVAL_MS);
+      await delay(SMS_POLL_INTERVAL_MS);
     }
 
-    if (job.lubanPollToken === pollToken && job.status === "phone_otp") {
-      job.lubanStatus = "error";
-      job.lubanError = "等待平台短信超时，可以手动输入验证码或更换手机号";
+    if (job.smsPollToken === pollToken && job.status === "phone_otp") {
+      job.smsStatus = "error";
+      job.smsError = "等待平台短信超时，可以手动输入验证码或更换手机号";
       touch(job);
     }
   } finally {
-    if (job.lubanPollToken === pollToken) {
-      job.lubanPollToken = null;
+    if (job.smsPollToken === pollToken) {
+      job.smsPollToken = null;
       touch(job);
     }
   }
 }
 
-function stopLubanSmsPolling(job) {
-  job.lubanPollToken = null;
+function stopSmsPolling(job) {
+  job.smsPollToken = null;
 }
 
-function releaseLubanNumber(job, nextStatus = "idle", errorMessage = null) {
-  const requestId = job.lubanRequestId;
-  const lubanClient = job.lubanClient;
-  stopLubanSmsPolling(job);
-  job.lubanRequestId = null;
-  job.lubanNumber = null;
-  job.lubanClient = null;
-  job.lubanStatus = nextStatus;
-  job.lubanError = errorMessage;
-  if (requestId && lubanClient) {
-    void lubanClient.release(requestId).catch(() => {
-      appendJobLog(job, "[sms] LubanSMS 号码释放请求失败，请在平台控制台检查订单。\n");
+function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null) {
+  const requestId = job.smsOrderId;
+  const smsClient = job.smsClient;
+  const providerName = job.smsProviderName || smsClient?.name || "接码平台";
+  stopSmsPolling(job);
+  job.smsOrderId = null;
+  job.smsNumber = null;
+  job.smsClient = null;
+  job.smsStatus = nextStatus;
+  job.smsError = errorMessage;
+  if (nextStatus === "idle") {
+    job.smsProviderId = null;
+    job.smsProviderName = null;
+    job.smsServiceLabel = null;
+  }
+  if (requestId && smsClient) {
+    void smsClient.release(requestId).catch(() => {
+      appendJobLog(job, `[sms] ${providerName} 号码释放请求失败，请在平台控制台检查订单。\n`);
     });
   }
   if (job.outputPath) void saveJobMetadata(job).catch(() => {});
 }
 
-function newLubanState() {
+function newSmsState() {
   return {
-    lubanServiceId: null,
-    lubanRequestId: null,
-    lubanNumber: null,
-    lubanClient: null,
-    lubanStatus: "idle",
-    lubanError: null,
-    lubanPollToken: null,
+    smsProviderId: null,
+    smsProviderName: null,
+    smsServiceLabel: null,
+    smsOrderId: null,
+    smsNumber: null,
+    smsClient: null,
+    smsStatus: "idle",
+    smsError: null,
+    smsPollToken: null,
   };
 }
 
-function restoredLubanState(metadata = {}) {
-  if (!metadata.luban_request_id || !metadata.luban_number) return newLubanState();
+function restoredSmsState(metadata = {}) {
+  const orderId = metadata.sms_order_id || metadata.luban_request_id;
+  const number = metadata.sms_number || metadata.luban_number;
+  if (!orderId || !number) return newSmsState();
   return {
-    lubanServiceId: null,
-    lubanRequestId: String(metadata.luban_request_id),
-    lubanNumber: String(metadata.luban_number),
-    lubanClient: null,
-    lubanStatus: "error",
-    lubanError: "服务重启后已停止自动收短信，可手动输入验证码或换号",
-    lubanPollToken: null,
+    smsProviderId: metadata.sms_provider_id || "luban",
+    smsProviderName: metadata.sms_provider_name || (metadata.sms_provider_id === "smsbower" ? "SMSBower" : "LubanSMS"),
+    smsServiceLabel: metadata.sms_service_label || metadata.luban_service_id || null,
+    smsOrderId: String(orderId),
+    smsNumber: String(number),
+    smsClient: null,
+    smsStatus: "error",
+    smsError: "服务重启后已停止自动收短信，可手动输入验证码或换号",
+    smsPollToken: null,
   };
 }
 
-function safeLubanError(error, apiKey = "") {
+function safeSmsProviderError(error, apiKey = "") {
   let message = String(error?.message || "接码平台请求失败");
   if (apiKey) message = message.replaceAll(apiKey, "<已隐藏密钥>");
   return message
     .replace(/apikey=[^&\s]+/gi, "apikey=<已隐藏>")
+    .replace(/api_key=[^&\s]+/gi, "api_key=<已隐藏>")
     .replace(/https?:\/\/\S+/gi, "<已隐藏接口地址>")
     .replace(/[\r\n]+/g, " ")
     .slice(0, 220);
@@ -968,7 +1058,7 @@ async function submitJobInput(job, body, options = {}) {
   } else if (action === "phone") {
     requireStage(job, "phone");
     if (!/^\+[1-9]\d{6,14}$/.test(value)) throw httpError(400, "Phone number must use E.164 format, for example +60123456789");
-    if (options.source !== "luban") releaseLubanNumber(job, "idle");
+    if (options.source !== "sms-provider") releaseSmsNumber(job, "idle");
     job.currentPhone = value;
     job.phoneError = null;
     inputValue = value;
@@ -976,21 +1066,21 @@ async function submitJobInput(job, body, options = {}) {
   } else if (action === "phone_otp") {
     requireStage(job, "phone_otp");
     if (!/^\d{4,8}$/.test(value)) throw httpError(400, "Phone code must be 4 to 8 digits");
-    stopLubanSmsPolling(job);
-    if (job.lubanRequestId) job.lubanStatus = options.source === "luban" ? "submitted" : "manual_submitted";
+    stopSmsPolling(job);
+    if (job.smsOrderId) job.smsStatus = options.source === "sms-provider" ? "submitted" : "manual_submitted";
     job.phoneError = null;
     inputValue = value;
     setStage(job, "working", "正在验证手机验证码");
   } else if (action === "resend_phone") {
     requireStage(job, "phone_otp");
-    stopLubanSmsPolling(job);
-    if (job.lubanRequestId) job.lubanStatus = "number_acquired";
+    stopSmsPolling(job);
+    if (job.smsOrderId) job.smsStatus = "number_acquired";
     job.phoneError = null;
     inputValue = "r";
     setStage(job, "working", job.currentPhone ? `正在向 ${job.currentPhone} 重新发送验证码` : "正在重新发送手机验证码");
   } else if (action === "change_phone") {
     requireStage(job, "phone_otp");
-    releaseLubanNumber(job, "idle");
+    releaseSmsNumber(job, "idle");
     job.currentPhone = null;
     job.phoneError = null;
     inputValue = "p";
@@ -1007,7 +1097,7 @@ async function submitJobInput(job, body, options = {}) {
 function cancelJob(job) {
   if (!isActive(job.status)) return;
   stopMailPolling(job);
-  releaseLubanNumber(job, "idle");
+  releaseSmsNumber(job, "idle");
   job.status = "canceled";
   job.prompt = "流程已取消";
   job.child?.kill("SIGTERM");
@@ -1107,9 +1197,10 @@ async function exportSourceAccounts(res, ids) {
       throw httpError(409, `${job.email} 的 2FA 密钥未能从系统安全凭据存储读取，请重新导入该账号资料`);
     }
     if (password) {
-      lines.push(totpSecret
-        ? `${job.email}----${password}----${totpSecret}`
-        : `${job.email}----${password}`);
+      const parts = [job.email, password];
+      if (job.mailApiUrl) parts.push(job.mailApiUrl);
+      if (totpSecret) parts.push(totpSecret);
+      lines.push(parts.join("----"));
       continue;
     }
     if (job.mailApiUrl) {
@@ -1154,9 +1245,11 @@ function publicJob(job) {
     mailApiError: job.mailApiError,
     currentPhone: job.currentPhone,
     phoneError: job.phoneError,
-    lubanServiceId: job.lubanServiceId,
-    lubanStatus: job.lubanStatus,
-    lubanError: job.lubanError,
+    smsProviderId: job.smsProviderId,
+    smsProviderName: job.smsProviderName,
+    smsServiceLabel: job.smsServiceLabel,
+    smsStatus: job.smsStatus,
+    smsError: job.smsError,
     securityCheckRequired: Boolean(job.securityCheckRequired),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canResume: job.status === "resume_available",
@@ -1189,7 +1282,7 @@ function setStage(job, status, prompt) {
 function failJob(job, message) {
   if (isTerminalStatus(job.status)) return;
   stopMailPolling(job);
-  releaseLubanNumber(job, "idle");
+  releaseSmsNumber(job, "idle");
   job.status = "failed";
   job.prompt = "流程失败";
   job.lastError = message;
@@ -1273,7 +1366,7 @@ async function deleteJobsByEmail(email) {
   matching.forEach((job) => {
     job.deleted = true;
     stopMailPolling(job);
-    releaseLubanNumber(job, "idle");
+    releaseSmsNumber(job, "idle");
     job.runId = crypto.randomUUID();
     job.child?.kill("SIGTERM");
     job.child = null;
@@ -1350,14 +1443,14 @@ async function syncCompletedOutputs(force = false) {
           mailApiError: null,
           mailPollRunning: false,
           mailPollToken: null,
-          currentPhone: metadata.luban_number || null,
+          currentPhone: metadata.sms_number || metadata.luban_number || null,
           phoneError: null,
           restartRequired: false,
           attempt: 1,
           runId: null,
           runMode: null,
           fallbackInProgress: false,
-          ...newLubanState(),
+          ...newSmsState(),
         });
         return;
       } catch {}
@@ -1396,14 +1489,14 @@ async function syncCompletedOutputs(force = false) {
           mailApiError: null,
           mailPollRunning: false,
           mailPollToken: null,
-          currentPhone: checkpoint.oauth?.phone || metadata.luban_number || null,
+          currentPhone: checkpoint.oauth?.phone || metadata.sms_number || metadata.luban_number || null,
           phoneError: null,
           restartRequired: false,
           attempt: 1,
           runId: null,
           runMode: null,
           fallbackInProgress: false,
-          ...restoredLubanState(metadata),
+          ...restoredSmsState(metadata),
         });
       } catch {
         if (
@@ -1450,7 +1543,7 @@ async function syncCompletedOutputs(force = false) {
           queuedAt: metadata.queued_at || restoredAt,
           queuedStartPrompt: "正在建立登录会话",
           fallbackInProgress: false,
-          ...newLubanState(),
+          ...newSmsState(),
         });
       }
     }));
@@ -1469,7 +1562,7 @@ function normalizeLoginCredentials(value = {}) {
   const mailApiUrl = validateMailApiUrl(value.mailApiUrl) ? String(value.mailApiUrl).trim() : null;
   const totpSecret = value.totpSecret ? normalizeTotpSecret(value.totpSecret) : "";
   const loginMode = password ? "password" : "email_otp";
-  return { loginMode, mailApiUrl: loginMode === "email_otp" ? mailApiUrl : null, password, totpSecret };
+  return { loginMode, mailApiUrl, password, totpSecret };
 }
 
 function restoredCredentialFlags(metadata = {}, credentials = {}) {
@@ -1505,15 +1598,32 @@ function parseBatchEntries(value) {
   if (lines.length > MAX_BATCH_JOBS) throw httpError(400, `一次最多添加 ${MAX_BATCH_JOBS} 条任务`);
 
   const entries = lines.map((line, index) => {
-    const delimiterAt = line.indexOf("----");
-    if (delimiterAt < 0) {
+    const split = splitAccountLine(line);
+    if (!split) {
       if (!isEmail(line)) throw httpError(400, `第 ${index + 1} 行邮箱格式错误`);
       return { email: line, loginMode: "email_otp", mailApiUrl: null, password: "", totpSecret: "" };
     }
-    if (delimiterAt === 0) throw httpError(400, `第 ${index + 1} 行邮箱格式错误`);
-    const email = line.slice(0, delimiterAt).trim();
-    const remainder = line.slice(delimiterAt + 4);
+    const { email, remainder } = split;
     if (!isEmail(email)) throw httpError(400, `第 ${index + 1} 行邮箱格式错误`);
+
+    const passwordMailSeparator = /----(?=https?:\/\/)/i.exec(remainder);
+    if (passwordMailSeparator && passwordMailSeparator.index > 0) {
+      const password = remainder.slice(0, passwordMailSeparator.index).trim();
+      const mailAndTotp = remainder.slice(passwordMailSeparator.index + 4).trim();
+      let mailApiUrl = mailAndTotp;
+      let totpSecret = "";
+      const totpDelimiterAt = mailAndTotp.lastIndexOf("----");
+      if (totpDelimiterAt >= 0) {
+        const candidateUrl = mailAndTotp.slice(0, totpDelimiterAt).trim();
+        if (validateMailApiUrl(candidateUrl)) {
+          mailApiUrl = candidateUrl;
+          totpSecret = normalizeTotpSecret(mailAndTotp.slice(totpDelimiterAt + 4), index + 1);
+        }
+      }
+      if (!password) throw httpError(400, `第 ${index + 1} 行密码不能为空`);
+      if (!validateMailApiUrl(mailApiUrl)) throw httpError(400, `第 ${index + 1} 行邮件接收 API 格式错误`);
+      return { email, loginMode: "password", mailApiUrl, password, totpSecret };
+    }
 
     const lastDelimiterAt = remainder.lastIndexOf("----");
     if (lastDelimiterAt < 0) {
@@ -1537,6 +1647,19 @@ function parseBatchEntries(value) {
   const unique = new Map();
   entries.forEach((entry) => unique.set(entry.email.toLowerCase(), entry));
   return [...unique.values()];
+}
+
+function splitAccountLine(line) {
+  const separators = line.matchAll(/-{3,4}/g);
+  for (const separator of separators) {
+    const email = line.slice(0, separator.index).trim();
+    if (!isEmail(email)) continue;
+    return {
+      email,
+      remainder: line.slice(separator.index + separator[0].length),
+    };
+  }
+  return null;
 }
 
 async function updateJobCredentials(job, credentials) {
@@ -1579,10 +1702,12 @@ async function saveJobMetadata(job) {
         has_password: Boolean(job.password || job.hasPasswordCredential),
         has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
         mail_api_url: job.mailApiUrl || null,
-        luban_service_id: job.lubanServiceId || null,
-        luban_request_id: job.lubanRequestId || null,
-        luban_number: job.lubanNumber || null,
-        luban_status: job.lubanStatus || null,
+        sms_provider_id: job.smsProviderId || null,
+        sms_provider_name: job.smsProviderName || null,
+        sms_service_label: job.smsServiceLabel || null,
+        sms_order_id: job.smsOrderId || null,
+        sms_number: job.smsNumber || null,
+        sms_status: job.smsStatus || null,
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;

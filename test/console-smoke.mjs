@@ -75,16 +75,60 @@ try {
   const refreshed = await refreshedResponse.json();
   assert.match(refreshed.accounts?.[0]?.credentials?.access_token || "", /^refreshed-access-/);
 
+  const profileResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "account-profile@example.com" }),
+  });
+  assert.equal(profileResponse.status, 201);
+  const profileCreated = await profileResponse.json();
+  const profileJob = await waitForJob(headers, profileCreated.job.id, (value) => value.status === "completed");
+  assert.equal(profileJob.canDownload, true);
+
+  const mailApiUrl = `${baseUrl}/api/bootstrap`;
+  const sourceLines = [
+    `password-mail@example.com---test-password----${mailApiUrl}`,
+    `password-mail-totp@example.com----test-password-2----${mailApiUrl}----JBSWY3DPEHPK3PXP`,
+  ];
+  const batchResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ text: sourceLines.join("\n") }),
+  });
+  const batchText = await batchResponse.text();
+  assert.equal(batchResponse.status, 201, batchText);
+  const batch = JSON.parse(batchText);
+  assert.equal(batch.jobs.length, 2);
+  batch.jobs.forEach((item) => {
+    assert.equal(item.loginMode, "password");
+    assert.equal(item.autoEmailOtp, true);
+  });
+  assert.equal(batch.jobs[0].hasTotpKey, false);
+  assert.equal(batch.jobs[1].hasTotpKey, true);
+  await Promise.all(batch.jobs.map((item) => waitForJob(headers, item.id, (value) => value.status === "completed")));
+
+  const sourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: batch.jobs.map((item) => item.id) }),
+  });
+  assert.equal(sourceResponse.status, 200);
+  const sourceExport = (await sourceResponse.text()).replace(/^\uFEFF/, "").trim().split("\n").sort();
+  assert.deepEqual(sourceExport, [
+    `password-mail-totp@example.com----test-password-2----${mailApiUrl}----JBSWY3DPEHPK3PXP`,
+    `password-mail@example.com----test-password----${mailApiUrl}`,
+  ]);
+
   const deleteResponse = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ ids: [jobId] }),
+    body: JSON.stringify({ ids: [jobId, profileJob.id, ...batch.jobs.map((item) => item.id)] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 1);
+  assert.equal(deleted.deleted, 4);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);

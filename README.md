@@ -16,7 +16,7 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 2. 账号启用 2FA（双重身份验证）时，自动生成并提交 TOTP（基于时间的一次性密码）。
 3. 发起 Codex OAuth（授权登录）。
 4. 根据服务端响应判断账号是否已经绑定手机号。
-5. 未绑定手机号时进入短信验证，支持手动号码或 LubanSMS（鲁班接码）。
+5. 未绑定手机号时进入短信验证，支持手动号码、LubanSMS（鲁班接码）或 SMSBower（短信接码平台）。
 6. 选择 workspace（工作区），兑换 OAuth Token（授权令牌）。
 7. 生成标准 `sub2api-data` 导入文件。
 
@@ -27,7 +27,7 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 - 支持手动邮箱验证码、邮箱收码 API（接口）自动取码。
 - 支持密码登录，以及密码或邮箱验证码登录后的 2FA（双重身份验证）。
 - 自动跳过已经完成手机号绑定的账号。
-- 未绑定账号支持手动手机号、手动短信验证码和 LubanSMS（鲁班接码）自动取号收码。
+- 未绑定账号支持手动手机号、手动短信验证码，以及 LubanSMS、SMSBower 自动取号收码。
 - 邮箱登录成功后立即保存 checkpoint（检查点），中断后可继续手机号流程。
 - 支持重新授权；优先使用已有 Refresh Token（刷新令牌），失效后再重新登录。
 - 支持分页、精确筛选、跨页多选、批量删除、停止全部、批量重新授权和批量下载。
@@ -78,6 +78,8 @@ npm run dev -- --host 0.0.0.0
 邮箱----邮箱收码接口
 邮箱----密码
 邮箱----密码----2FA身份验证密钥
+邮箱----密码----邮件接收API
+邮箱----密码----邮件接收API----2FA身份验证密钥
 邮箱----邮箱收码接口----2FA身份验证密钥
 ```
 
@@ -87,16 +89,27 @@ npm run dev -- --host 0.0.0.0
 name@example.com
 name2@example.com----https://mail.example/messages/account-token
 name3@example.com----账号密码----JBSWY3DPEHPK3PXP
-name4@example.com----https://mail.example/messages/account-token----JBSWY3DPEHPK3PXP
+name4@example.com----账号密码----https://mail.example/messages/name4
+name5@example.com----账号密码----https://mail.example/messages/name5----JBSWY3DPEHPK3PXP
+name6@example.com----https://mail.example/messages/account-token----JBSWY3DPEHPK3PXP
 ```
 
-第二段以 `http://` 或 `https://` 开头时按邮箱收码接口处理，否则按密码处理。邮箱是唯一字段，重复导入会更新原任务资料。
+第二段以 `http://` 或 `https://` 开头时按邮箱收码接口处理，否则按密码处理。密码后的字段以 `http://` 或 `https://` 开头时，作为密码登录的备用邮件收码接口；如果还有第四段，则按 2FA 密钥处理。邮箱是唯一字段，重复导入会更新原任务资料。
 
-## LubanSMS 配置
+## 接码平台配置
 
-API Key（接口密钥）和供应商编号在网页顶部统一填写，修改后立即保存到当前浏览器的 localStorage（本地存储）。点击任务中的“平台取号”时会读取输入框最新值。
+网页顶部的“接码平台”区域可以打开统一配置页面。每个平台拥有独立配置，保存后写入当前浏览器的 localStorage（本地存储）；服务端不会持久保存 API Key（接口密钥）。
 
-API Key 只会随取号请求临时发送给本地服务，不会写入任务元数据、协议日志或导出文件。手动手机号和手动验证码流程始终保留。
+目前支持：
+
+- LubanSMS：填写 API Key 和供应商编号。
+- SMSBower：填写 API Key 后查询 OpenAI 实时价格，再从下拉框选择国家。列表按价格从低到高显示中文国家名称、价格和库存，不显示国家缩写和国际区号。
+
+任务到达手机号步骤后，可以使用当前选中的平台取号。SMSBower 取号时会带上用户选择时的最高价格，避免实时价格上涨后按更高价格购买。服务端会自动轮询短信、提取独立的 6 位数字验证码并提交；换号、取消或发送失败时会请求平台释放号码。手动手机号和手动验证码流程始终保留。
+
+新增平台时，通过统一 SmsProvider（短信平台适配器）接入，不需要复制任务轮询和状态处理代码。
+
+API Key 只会随取号请求临时发送给本地服务，不会写入任务元数据、协议日志或导出文件。
 
 ## 输出文件
 

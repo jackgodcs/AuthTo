@@ -74,6 +74,38 @@ try {
   const refreshedExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(refreshedExport.type, "sub2api-data");
   assert.equal(refreshedExport.accounts?.[0]?.credentials?.refresh_token, "mock-refresh-token");
+
+  const profileCheckpointPath = path.join(tempRoot, "profile-checkpoint.json");
+  const profileOutputPath = path.join(tempRoot, "profile-sub2api.json");
+  const profileCompleted = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "account-profile@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    profileOutputPath,
+    "--checkpoint",
+    profileCheckpointPath,
+    "--verbose",
+  ], [
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+    { pattern: /Phone number, E\.164 format/, value: "+60123456789" },
+    { pattern: /Phone OTP \(r=resend/, value: "654321" },
+  ]);
+  assert.equal(profileCompleted.code, 0, processFailure("profile completion", profileCompleted));
+  assert.equal(profileCompleted.completedInputSteps, 3, processFailure("profile input", profileCompleted));
+  assert.match(profileCompleted.output, /age between 20 and 50/);
+  assert.match(profileCompleted.output, /fresh security token/);
+  assert.match(profileCompleted.output, /Account profile completed/);
+  assert.match(profileCompleted.output, /Start Codex OAuth flow/);
+  const profileExport = JSON.parse(await fs.readFile(profileOutputPath, "utf8"));
+  assert.equal(profileExport.accounts?.[0]?.credentials?.email, "add-phone-page@example.com");
+  assert.equal(await fileExists(profileCheckpointPath), false);
   console.log("protocol smoke tests passed");
 } catch (error) {
   error.message = `${error.message}\nMock server output:\n${serverLogs}`;

@@ -11,7 +11,6 @@ import {
   Download,
   FileText,
   Filter,
-  Hash,
   KeyRound,
   ListPlus,
   LoaderCircle,
@@ -21,6 +20,7 @@ import {
   RefreshCw,
   RotateCcw,
   Send,
+  Settings2,
   ShieldCheck,
   Smartphone,
   PhoneIncoming,
@@ -32,6 +32,10 @@ import "./styles.css";
 const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
+const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
+const REGION_NAMES = typeof Intl.DisplayNames === "function"
+  ? new Intl.DisplayNames(["zh-CN"], { type: "region" })
+  : null;
 
 function App() {
   const [token, setToken] = useState("");
@@ -55,11 +59,14 @@ function App() {
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
-  const [lubanApiKey, setLubanApiKey] = useState(() => readLocalSetting(LUBAN_API_KEY_STORAGE_KEY));
-  const [lubanServiceId, setLubanServiceId] = useState(() => readLocalSetting(LUBAN_SERVICE_ID_STORAGE_KEY));
+  const [smsSettings, setSmsSettings] = useState(readSmsProviderSettings);
+  const [smsSettingsOpen, setSmsSettingsOpen] = useState(false);
+  const [smsSettingsDraft, setSmsSettingsDraft] = useState(readSmsProviderSettings);
+  const [smsSettingsError, setSmsSettingsError] = useState("");
+  const [smsNumberOptions, setSmsNumberOptions] = useState([]);
+  const [smsOptionsLoading, setSmsOptionsLoading] = useState(false);
 
-  useEffect(() => writeLocalSetting(LUBAN_API_KEY_STORAGE_KEY, lubanApiKey), [lubanApiKey]);
-  useEffect(() => writeLocalSetting(LUBAN_SERVICE_ID_STORAGE_KEY, lubanServiceId), [lubanServiceId]);
+  useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
 
   useEffect(() => {
     let stopped = false;
@@ -111,6 +118,15 @@ function App() {
   }, [token, page, emailFilter]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
+  const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
+  const activeSmsProvider = useMemo(
+    () => resolveSmsProvider(smsProviderDefinitions, smsSettings),
+    [smsProviderDefinitions, smsSettings],
+  );
+  const draftSmsProvider = useMemo(
+    () => resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft),
+    [smsProviderDefinitions, smsSettingsDraft],
+  );
   const selectedJobs = useMemo(
     () => jobSelectionIndex.filter((job) => selectedJobIds.has(job.id)),
     [jobSelectionIndex, selectedJobIds],
@@ -121,6 +137,80 @@ function App() {
     && downloadableSelectedCount > 0;
   const canReauthorizeSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && selectedJobs.every((job) => job.canRegenerate || job.canRetry);
+
+  function openSmsSettings() {
+    const draft = withSmsProviderDefaults(smsProviderDefinitions, smsSettings);
+    setSmsSettingsDraft(draft);
+    setSmsSettingsError("");
+    setSmsSettingsOpen(true);
+    const resolved = resolveSmsProvider(smsProviderDefinitions, draft);
+    if (resolved.definition?.optionsEndpoint && resolved.config.apiKey) void loadSmsNumberOptions(draft);
+  }
+
+  async function loadSmsNumberOptions(settings = smsSettingsDraft) {
+    const resolved = resolveSmsProvider(smsProviderDefinitions, settings);
+    if (!resolved.definition?.optionsEndpoint) return;
+    if (!String(resolved.config.apiKey || "").trim()) {
+      setSmsSettingsError("请先填写 API Key");
+      return;
+    }
+    setSmsOptionsLoading(true);
+    setSmsSettingsError("");
+    try {
+      const data = await apiFetch(token, resolved.definition.optionsEndpoint, {
+        method: "POST",
+        body: JSON.stringify({ config: resolved.config }),
+      });
+      const options = Array.isArray(data.options) ? data.options : [];
+      setSmsNumberOptions(options);
+      const current = resolved.config.maxPrice
+        ? options.find((option) => option.country === resolved.config.country) || options[0]
+        : options[0];
+      if (!current) throw new Error("当前没有可购买的国家号码");
+      updateSmsProviderConfig(resolved.id, {
+        country: current.country,
+        maxPrice: String(current.price),
+        countryLabel: formatSmsCountryName(current),
+      });
+    } catch (requestError) {
+      setSmsNumberOptions([]);
+      setSmsSettingsError(requestError.message);
+    } finally {
+      setSmsOptionsLoading(false);
+    }
+  }
+
+  function updateSmsProviderConfig(providerId, values) {
+    setSmsSettingsDraft((current) => ({
+      ...current,
+      configs: {
+        ...(current.configs || {}),
+        [providerId]: {
+          ...(current.configs?.[providerId] || {}),
+          ...values,
+        },
+      },
+    }));
+  }
+
+  function saveSmsSettings(event) {
+    event.preventDefault();
+    const resolved = resolveSmsProvider(smsProviderDefinitions, smsSettingsDraft);
+    if (!resolved.definition) {
+      setSmsSettingsError("请选择接码平台");
+      return;
+    }
+    const missing = resolved.definition.fields.find((field) => (
+      field.required !== false && !String(resolved.config[field.key] || "").trim()
+    ));
+    if (missing) {
+      setSmsSettingsError(`请填写${missing.label}`);
+      return;
+    }
+    setSmsSettings(withSmsProviderDefaults(smsProviderDefinitions, smsSettingsDraft));
+    setSmsSettingsOpen(false);
+    setSmsSettingsError("");
+  }
 
   useEffect(() => {
     const valid = new Set(jobSelectionIndex.map((job) => job.id));
@@ -374,30 +464,18 @@ function App() {
           </form>
         </div>
 
-        <div className="provider-toolbar" aria-label="LubanSMS 接码配置">
-          <div className="provider-heading"><PhoneIncoming size={17} /><strong>LubanSMS 接码</strong><span>配置会保存在当前浏览器</span></div>
-          <label className="provider-field">
-            <KeyRound size={15} />
-            <input
-              type="password"
-              value={lubanApiKey}
-              onChange={(event) => setLubanApiKey(event.target.value)}
-              placeholder="API Key"
-              aria-label="LubanSMS API Key"
-              autoComplete="off"
-            />
-          </label>
-          <label className="provider-field service-field">
-            <Hash size={15} />
-            <input
-              value={lubanServiceId}
-              onChange={(event) => setLubanServiceId(event.target.value)}
-              placeholder="供应商编号"
-              aria-label="LubanSMS 供应商编号"
-              autoComplete="off"
-            />
-          </label>
-          {lubanApiKey && lubanServiceId && <span className="provider-ready"><Check size={14} />已就绪</span>}
+        <div className="provider-toolbar sms-provider-toolbar" aria-label="接码平台配置">
+          <div className="provider-heading"><PhoneIncoming size={17} /><strong>接码平台</strong></div>
+          <span className="provider-name">{activeSmsProvider.name || "未选择"}</span>
+          <span className={`provider-ready ${activeSmsProvider.ready ? "" : "incomplete"}`}>
+            {activeSmsProvider.ready ? <Check size={14} /> : <CircleAlert size={14} />}
+            {activeSmsProvider.ready
+              ? (activeSmsProvider.summary ? `已配置 · ${activeSmsProvider.summary}` : "已配置")
+              : "未完成配置"}
+          </span>
+          <button type="button" className="secondary-button provider-settings-button" onClick={openSmsSettings} disabled={!smsProviderDefinitions.length}>
+            <Settings2 size={16} />配置
+          </button>
         </div>
 
         {error && (
@@ -486,8 +564,8 @@ function App() {
                     selected={selectedJobIds.has(job.id)}
                     onToggleSelected={() => toggleJobSelection(job.id)}
                     selectionSupported={Boolean(features.bulkActions)}
-                    lubanSmsAvailable={Boolean(features.lubanSms)}
-                    lubanConfig={{ apiKey: lubanApiKey, serviceId: lubanServiceId }}
+                    smsProviderAvailable={smsProviderDefinitions.length > 0}
+                    smsProvider={activeSmsProvider}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -511,6 +589,122 @@ function App() {
           </nav>
         )}
       </section>
+      {smsSettingsOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setSmsSettingsOpen(false);
+        }}>
+          <form className="batch-dialog sms-settings-dialog" onSubmit={saveSmsSettings} role="dialog" aria-modal="true" aria-labelledby="sms-settings-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="sms-settings-title">接码平台配置</h2>
+                <span>配置保存在当前浏览器</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setSmsSettingsOpen(false)} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="provider-tabs" role="tablist" aria-label="选择接码平台">
+              {smsProviderDefinitions.map((provider) => (
+                <button
+                  key={provider.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={draftSmsProvider.id === provider.id}
+                  className={draftSmsProvider.id === provider.id ? "active" : ""}
+                  onClick={() => {
+                    const next = withSmsProviderDefaults(smsProviderDefinitions, {
+                      ...smsSettingsDraft,
+                      selectedProviderId: provider.id,
+                    });
+                    setSmsSettingsDraft((current) => withSmsProviderDefaults(smsProviderDefinitions, {
+                      ...current,
+                      selectedProviderId: provider.id,
+                    }));
+                    setSmsSettingsError("");
+                    const resolved = resolveSmsProvider(smsProviderDefinitions, next);
+                    if (resolved.definition?.optionsEndpoint && resolved.config.apiKey) void loadSmsNumberOptions(next);
+                  }}
+                >
+                  {provider.name}
+                </button>
+              ))}
+            </div>
+
+            {draftSmsProvider.definition && (
+              <div className="provider-config-section">
+                <div className="provider-description">{draftSmsProvider.definition.description}</div>
+                <div className="provider-config-grid">
+                  {draftSmsProvider.definition.fields.filter((field) => field.type !== "hidden").map((field) => (
+                    <label key={field.key} className={`settings-field ${field.type === "price-select" ? "price-settings-field" : ""}`}>
+                      <span>{field.label}</span>
+                      {field.type === "price-select" ? (
+                        <div className="price-select-row">
+                          <div className="price-select-box">
+                            <Settings2 size={15} />
+                            <select
+                              value={draftSmsProvider.config.country || ""}
+                              onChange={(event) => {
+                                const selected = smsNumberOptions.find((option) => option.country === event.target.value);
+                                if (!selected) return;
+                                updateSmsProviderConfig(draftSmsProvider.id, {
+                                  country: selected.country,
+                                  maxPrice: String(selected.price),
+                                  countryLabel: formatSmsCountryName(selected),
+                                });
+                              }}
+                              disabled={!smsNumberOptions.length || smsOptionsLoading}
+                              aria-label="SMSBower 国家与价格"
+                            >
+                              {!smsNumberOptions.length && (
+                                <option value={draftSmsProvider.config.country || ""}>
+                                  {smsOptionsLoading ? "正在查询实时价格..." : "请先查询实时价格"}
+                                </option>
+                              )}
+                              {smsNumberOptions.map((option) => (
+                                <option key={option.country} value={option.country}>{formatSmsPriceOption(option)}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <button
+                            type="button"
+                            className="price-refresh-button"
+                            onClick={() => loadSmsNumberOptions()}
+                            disabled={smsOptionsLoading || !draftSmsProvider.config.apiKey}
+                          >
+                            {smsOptionsLoading ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
+                            {smsOptionsLoading ? "查询中" : "查询价格"}
+                          </button>
+                        </div>
+                      ) : (
+                        <div>
+                          {field.type === "password" ? <KeyRound size={15} /> : <Settings2 size={15} />}
+                          <input
+                            type={field.type || "text"}
+                            value={draftSmsProvider.config[field.key] || ""}
+                            onChange={(event) => updateSmsProviderConfig(draftSmsProvider.id, { [field.key]: event.target.value })}
+                            placeholder={field.placeholder}
+                            autoComplete="off"
+                            spellCheck="false"
+                          />
+                        </div>
+                      )}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {smsSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{smsSettingsError}</div>}
+            <div className="dialog-footer">
+              <button type="button" className="cancel-button" onClick={() => setSmsSettingsOpen(false)}>取消</button>
+              <button type="submit" className="primary-button" disabled={!draftSmsProvider.definition}>
+                <Check size={17} />保存配置
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
       {batchOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget && !batchBusy) setBatchOpen(false);
@@ -525,12 +719,12 @@ function App() {
                 <X size={18} />
               </button>
             </div>
-            <label className="batch-label" htmlFor="batch-input">每行一条：邮箱 + 收码接口，或邮箱 + 密码/收码接口 + 2FA 密钥</label>
+            <label className="batch-label" htmlFor="batch-input">每行一条：邮箱 + 密码/收码接口，可继续添加邮件接收 API 和 2FA 密钥</label>
             <textarea
               id="batch-input"
               value={batchText}
               onChange={(event) => setBatchText(event.target.value)}
-              placeholder={"name@icloud.com----https://mail.example/messages/token/name%40icloud.com\nname2@example.com----账号密码----BASE32二步验证密钥\nname3@example.com----https://mail.example/messages/token/name3----BASE32二步验证密钥"}
+              placeholder={"name@icloud.com----https://mail.example/messages/token/name%40icloud.com\nname2@example.com----账号密码----https://mail.example/messages/name2\nname3@example.com----账号密码----https://mail.example/messages/name3----BASE32二步验证密钥"}
               spellCheck="false"
               autoFocus
             />
@@ -596,7 +790,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, lubanSmsAvailable, lubanConfig }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -653,13 +847,13 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
-  async function requestLubanNumber() {
-    if (!lubanConfig.apiKey.trim() || !lubanConfig.serviceId.trim()) return;
+  async function requestSmsNumber() {
+    if (!smsProvider.ready) return;
     setSubmitting(true);
     try {
-      await apiFetch(token, `/api/jobs/${job.id}/luban-number`, {
+      await apiFetch(token, `/api/jobs/${job.id}/sms-number`, {
         method: "POST",
-        body: JSON.stringify({ apiKey: lubanConfig.apiKey.trim(), serviceId: lubanConfig.serviceId.trim() }),
+        body: JSON.stringify({ providerId: smsProvider.id, config: smsProvider.config }),
       });
       onError("");
     } catch (requestError) {
@@ -711,10 +905,10 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <div className="phone-target"><Smartphone size={13} />当前手机号：<strong>{job.currentPhone}</strong></div>
         )}
         {job.phoneError && <div className="phone-error"><CircleAlert size={13} />{job.phoneError}</div>}
-        {job.lubanStatus && !["idle", "unavailable"].includes(job.lubanStatus) && (
-          <div className={`luban-status ${job.lubanStatus === "error" ? "error" : ""}`}>
-            {job.lubanStatus === "error" ? <CircleAlert size={13} /> : <PhoneIncoming size={13} />}
-            <span>{lubanStatusText(job)}</span>
+        {job.smsStatus && !["idle", "unavailable"].includes(job.smsStatus) && (
+          <div className={`sms-status ${job.smsStatus === "error" ? "error" : ""}`}>
+            {job.smsStatus === "error" ? <CircleAlert size={13} /> : <PhoneIncoming size={13} />}
+            <span>{smsStatusText(job)}</span>
           </div>
         )}
         {inputConfig && (
@@ -758,18 +952,18 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
                 </button>
               </>
             )}
-            {job.status === "phone" && lubanSmsAvailable && (
+            {job.status === "phone" && smsProviderAvailable && (
               <>
                 <span className="input-separator" aria-hidden="true" />
                 <button
                   type="button"
                   className="platform-number-button"
-                  onClick={requestLubanNumber}
-                  disabled={!lubanConfig.apiKey.trim() || !lubanConfig.serviceId.trim() || submitting || job.lubanStatus === "requesting"}
-                  title={lubanConfig.apiKey.trim() && lubanConfig.serviceId.trim() ? "使用上方统一配置取号" : "请先填写上方的 API Key 和供应商编号"}
+                  onClick={requestSmsNumber}
+                  disabled={!smsProvider.ready || submitting || job.smsStatus === "requesting"}
+                  title={smsProvider.ready ? `使用 ${smsProvider.name} 取号` : "请先完成接码平台配置"}
                 >
-                  {submitting || job.lubanStatus === "requesting" ? <LoaderCircle className="spin" size={15} /> : <PhoneIncoming size={15} />}
-                  平台取号
+                  {submitting || job.smsStatus === "requesting" ? <LoaderCircle className="spin" size={15} /> : <PhoneIncoming size={15} />}
+                  {smsProvider.name || "平台"}取号
                 </button>
               </>
             )}
@@ -863,10 +1057,11 @@ function StatusBadge({ status }) {
 
 function LoginMethodBadge({ job }) {
   if (job.loginMode === "password") {
+    const methods = ["密码", job.autoEmailOtp ? "自动收码" : "", job.hasTotpKey ? "2FA" : ""].filter(Boolean);
     return (
       <span className="mail-mode password-mode">
         {job.hasTotpKey ? <ShieldCheck size={12} /> : <KeyRound size={12} />}
-        {job.hasTotpKey ? "密码 + 2FA" : "密码登录"}
+        {methods.join(" + ")}
       </span>
     );
   }
@@ -912,16 +1107,17 @@ function getInputConfig(status, currentPhone) {
   return null;
 }
 
-function lubanStatusText(job) {
-  if (job.lubanError) return `LubanSMS：${job.lubanError}`;
+function smsStatusText(job) {
+  const providerName = job.smsProviderName || "接码平台";
+  if (job.smsError) return `${providerName}：${job.smsError}`;
   return {
-    requesting: "LubanSMS：正在获取手机号",
-    number_acquired: "LubanSMS：已获取手机号，正在发送验证码",
-    waiting_sms: "LubanSMS：验证码已发送，正在等待短信",
-    submitting: "LubanSMS：已收到验证码，正在自动提交",
-    submitted: "LubanSMS：验证码已自动提交",
-    manual_submitted: "LubanSMS：已停止自动读取，正在验证手动输入的验证码",
-  }[job.lubanStatus] || "LubanSMS：处理中";
+    requesting: `${providerName}：正在获取手机号`,
+    number_acquired: `${providerName}：已获取手机号，正在发送验证码`,
+    waiting_sms: `${providerName}：验证码已发送，正在等待短信`,
+    submitting: `${providerName}：已收到验证码，正在自动提交`,
+    submitted: `${providerName}：验证码已自动提交`,
+    manual_submitted: `${providerName}：已停止自动读取，正在验证手动输入的验证码`,
+  }[job.smsStatus] || `${providerName}：处理中`;
 }
 
 async function saveDownloadResponse(response, fallbackName) {
@@ -1032,10 +1228,80 @@ function readLocalSetting(key) {
   }
 }
 
-function writeLocalSetting(key, value) {
+function readSmsProviderSettings() {
   try {
-    if (value) window.localStorage.setItem(key, value);
-    else window.localStorage.removeItem(key);
+    const stored = JSON.parse(window.localStorage.getItem(SMS_PROVIDER_SETTINGS_KEY) || "null");
+    if (stored && typeof stored === "object" && stored.configs && typeof stored.configs === "object") {
+      return stored;
+    }
+  } catch {}
+  return {
+    selectedProviderId: "luban",
+    configs: {
+      luban: {
+        apiKey: readLocalSetting(LUBAN_API_KEY_STORAGE_KEY),
+        serviceId: readLocalSetting(LUBAN_SERVICE_ID_STORAGE_KEY),
+      },
+    },
+  };
+}
+
+function withSmsProviderDefaults(definitions, settings) {
+  const configs = { ...(settings?.configs || {}) };
+  definitions.forEach((provider) => {
+    const current = { ...(configs[provider.id] || {}) };
+    provider.fields.forEach((field) => {
+      if (!String(current[field.key] || "").trim() && field.defaultValue) current[field.key] = field.defaultValue;
+    });
+    configs[provider.id] = current;
+  });
+  const selectedProviderId = definitions.some((provider) => provider.id === settings?.selectedProviderId)
+    ? settings.selectedProviderId
+    : definitions[0]?.id || settings?.selectedProviderId || "luban";
+  return { selectedProviderId, configs };
+}
+
+function resolveSmsProvider(definitions, settings) {
+  const normalized = withSmsProviderDefaults(definitions, settings || {});
+  const definition = definitions.find((provider) => provider.id === normalized.selectedProviderId) || null;
+  const config = definition ? normalized.configs[definition.id] || {} : {};
+  const ready = Boolean(definition) && definition.fields.every((field) => (
+    field.required === false || String(config[field.key] || "").trim()
+  ));
+  const summary = definition
+    ? definition.fields
+      .filter((field) => field.summary || field.summaryKey)
+      .map((field) => config[field.summaryKey || field.key])
+      .filter(Boolean)
+      .join(" / ")
+    : "";
+  return {
+    id: definition?.id || "",
+    name: definition?.name || "",
+    definition,
+    config,
+    ready,
+    summary,
+  };
+}
+
+function formatSmsCountryName(option) {
+  if (option.iso && REGION_NAMES) {
+    try {
+      return REGION_NAMES.of(option.iso) || option.title;
+    } catch {}
+  }
+  return option.title || `国家 ${option.country}`;
+}
+
+function formatSmsPriceOption(option) {
+  const name = formatSmsCountryName(option);
+  return `${name} | 价格 ${option.price} | 库存 ${option.count}`;
+}
+
+function writeLocalJson(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
   } catch {
     // Private browsing modes may disable localStorage; the current tab still works.
   }
