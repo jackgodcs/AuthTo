@@ -965,7 +965,10 @@ async function bindPhoneIfNeeded(client, options, current, addPhoneUrl) {
       }
 
       const validated = await tryValidatePhoneOtp(client, options.authBase, phoneCode, phoneReferer);
-      if (validated.ok) return validated.data;
+      if (validated.ok) {
+        console.log("[ok] Phone OTP validated");
+        return validated.data;
+      }
       if (isExpiredCheckpointError(new Error(validated.message))) {
         throw new Error(validated.message);
       }

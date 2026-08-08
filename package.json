@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node src/console-server.mjs",
     "start": "node src/console-server.mjs",
-    "check": "node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/sentinel.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/smsbower.mjs && node --check src/sms-providers.mjs && node --check src/credential-store.mjs && node test/credential-store.mjs && node test/sms-providers.mjs && node test/console-smoke.mjs && node test/sms-provider-console-smoke.mjs && node test/protocol-smoke.mjs && node test/password-mfa-workspace-smoke.mjs"
+    "check": "node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/sentinel.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/smsbower.mjs && node --check src/custom-sms.mjs && node --check src/sms-providers.mjs && node --check src/credential-store.mjs && node test/credential-store.mjs && node test/sms-providers.mjs && node test/console-smoke.mjs && node test/sms-provider-console-smoke.mjs && node test/protocol-smoke.mjs && node test/password-mfa-workspace-smoke.mjs"
   },
   "keywords": [
     "chatgpt",

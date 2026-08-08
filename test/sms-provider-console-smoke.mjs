@@ -11,8 +11,21 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-sms-provider-"));
 const smsActions = [];
 let smsChecks = 0;
+let customInboxChecks = 0;
 const smsServer = http.createServer((req, res) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");
+  if (url.pathname === "/custom-inbox") {
+    customInboxChecks += 1;
+    const messages = customInboxChecks === 1
+      ? [{ id: "old-sms", text: "OpenAI code\n111111\n" }]
+      : [
+          { id: "new-sms", text: "OpenAI code\n654321\n" },
+          { id: "old-sms", text: "OpenAI code\n111111\n" },
+        ];
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ messages }));
+    return;
+  }
   const action = url.searchParams.get("action");
   smsActions.push({ action, status: url.searchParams.get("status"), maxPrice: url.searchParams.get("maxPrice") });
   let body = "BAD_ACTION";
@@ -59,7 +72,7 @@ const childExit = new Promise((resolve) => child.once("exit", resolve));
 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
-  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower"]);
+  assert.deepEqual(bootstrap.features.smsProviders.map((provider) => provider.id), ["luban", "smsbower", "custom"]);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
   const optionsResponse = await fetch(`${baseUrl}/api/sms-providers/smsbower/options`, {
     method: "POST",
@@ -90,12 +103,73 @@ try {
   assert.equal(numberResponse.status, 200, await numberResponse.text());
   const completed = await waitForJob(headers, created.job.id, (job) => job.status === "completed");
   assert.equal(completed.smsProviderName, "SMSBower");
-  assert.equal(completed.smsStatus, "submitted");
+  assert.equal(completed.smsStatus, "completed");
   assert.ok(smsActions.some((item) => item.action === "getNumber"));
   assert.ok(smsActions.some((item) => item.action === "getStatus"));
   assert.ok(smsActions.some((item) => item.action === "setStatus" && item.status === "1"));
   assert.ok(smsActions.some((item) => item.action === "setStatus" && item.status === "6"));
   assert.ok(smsActions.some((item) => item.action === "getNumber" && item.maxPrice === "0.42"));
+
+  const completedOrderCount = smsActions.filter((item) => item.action === "setStatus" && item.status === "6").length;
+  const releasedOrderCount = smsActions.filter((item) => item.action === "setStatus" && item.status === "8").length;
+  const smsChecksBeforeRejectedNumber = smsChecks;
+  const rejectedResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "sms-recently-used@example.com" }),
+  });
+  assert.equal(rejectedResponse.status, 201);
+  const rejected = await rejectedResponse.json();
+  await waitForJob(headers, rejected.job.id, (job) => job.status === "phone");
+  const rejectedNumberResponse = await fetch(`${baseUrl}/api/jobs/${rejected.job.id}/sms-number`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      providerId: "smsbower",
+      config: { apiKey: "test-api-key", service: "dr", country: "1001", maxPrice: "0.42" },
+    }),
+  });
+  assert.equal(rejectedNumberResponse.status, 200, await rejectedNumberResponse.text());
+  const returnedToPhone = await waitForJob(
+    headers,
+    rejected.job.id,
+    (job) => job.status === "phone" && /\u8fd1\u671f\u5df2\u88ab\u4f7f\u7528/.test(job.phoneError || ""),
+  );
+  assert.equal(returnedToPhone.smsStatus, "error");
+  assert.equal(smsChecks - smsChecksBeforeRejectedNumber, 1);
+  assert.equal(
+    smsActions.filter((item) => item.action === "setStatus" && item.status === "6").length,
+    completedOrderCount,
+  );
+  assert.equal(
+    smsActions.filter((item) => item.action === "setStatus" && item.status === "8").length,
+    releasedOrderCount + 1,
+  );
+
+  const customCreatedResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "custom-sms@example.com" }),
+  });
+  assert.equal(customCreatedResponse.status, 201);
+  const customCreated = await customCreatedResponse.json();
+  await waitForJob(headers, customCreated.job.id, (job) => job.status === "phone");
+  const customNumberResponse = await fetch(`${baseUrl}/api/jobs/${customCreated.job.id}/sms-number`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      providerId: "custom",
+      config: {
+        entries: `+8613711111111----${baseUrl.replace(String(consolePort), String(smsServer.address().port))}/custom-inbox`,
+      },
+    }),
+  });
+  assert.equal(customNumberResponse.status, 200, await customNumberResponse.text());
+  const customCompleted = await waitForJob(headers, customCreated.job.id, (job) => job.status === "completed");
+  assert.equal(customCompleted.smsProviderName, "自定义接码");
+  assert.equal(customCompleted.currentPhone, "+8613711111111");
+  assert.equal(customCompleted.smsStatus, "completed");
+  assert.ok(customInboxChecks >= 2);
   console.log("sms provider console tests passed");
 } catch (error) {
   error.message = `${error.message}\nConsole output:\n${logs}`;
@@ -121,15 +195,17 @@ async function waitForJson(url) {
 
 async function waitForJob(headers, jobId, predicate) {
   const deadline = Date.now() + 10_000;
+  let lastJob = null;
   while (Date.now() < deadline) {
     const response = await fetch(`${baseUrl}/api/jobs`, { headers });
     const page = await response.json();
     const job = page.jobs.find((item) => item.id === jobId);
+    lastJob = job || lastJob;
     if (job && predicate(job)) return job;
     if (job?.status === "failed") throw new Error(job.lastError || "task failed");
     await delay(50);
   }
-  throw new Error("task did not reach expected state");
+  throw new Error(`task did not reach expected state: ${JSON.stringify(lastJob)}`);
 }
 
 function listen(server) {

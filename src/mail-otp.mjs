@@ -22,11 +22,12 @@ export function validateMailApiUrl(value) {
 export async function fetchMailboxOtpCandidates(url, options = {}) {
   if (!validateMailApiUrl(url)) throw new Error("收码接口必须是有效的 HTTP 或 HTTPS 地址");
 
+  const fetchImpl = options.fetchImpl || fetch;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs || DEFAULT_TIMEOUT_MS);
   let response;
   try {
-    response = await fetch(url, {
+    response = await fetchImpl(url, {
       method: "GET",
       headers: {
         accept: "application/json, text/plain, text/html, */*",

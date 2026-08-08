@@ -33,6 +33,7 @@ const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
+const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const REGION_NAMES = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "region" })
   : null;
@@ -65,8 +66,17 @@ function App() {
   const [smsSettingsError, setSmsSettingsError] = useState("");
   const [smsNumberOptions, setSmsNumberOptions] = useState([]);
   const [smsOptionsLoading, setSmsOptionsLoading] = useState(false);
+  const [sub2apiSettings, setSub2apiSettings] = useState(readSub2ApiSettings);
+  const [sub2apiSettingsDraft, setSub2apiSettingsDraft] = useState(readSub2ApiSettings);
+  const [sub2apiGroups, setSub2apiGroups] = useState([]);
+  const [sub2apiProxies, setSub2apiProxies] = useState([]);
+  const [sub2apiSettingsOpen, setSub2apiSettingsOpen] = useState(false);
+  const [sub2apiSettingsError, setSub2apiSettingsError] = useState("");
+  const [sub2apiGroupsLoading, setSub2apiGroupsLoading] = useState(false);
+  const [uploadNotice, setUploadNotice] = useState("");
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
+  useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
 
   useEffect(() => {
     let stopped = false;
@@ -137,14 +147,86 @@ function App() {
     && downloadableSelectedCount > 0;
   const canReauthorizeSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && selectedJobs.every((job) => job.canRegenerate || job.canRetry);
+  const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
 
   function openSmsSettings() {
     const draft = withSmsProviderDefaults(smsProviderDefinitions, smsSettings);
     setSmsSettingsDraft(draft);
     setSmsSettingsError("");
     setSmsSettingsOpen(true);
-    const resolved = resolveSmsProvider(smsProviderDefinitions, draft);
-    if (resolved.definition?.optionsEndpoint && resolved.config.apiKey) void loadSmsNumberOptions(draft);
+  }
+
+  function openSub2ApiSettings() {
+    setSub2apiSettingsDraft({ ...sub2apiSettings });
+    setSub2apiSettingsError("");
+    setSub2apiSettingsOpen(true);
+  }
+
+  async function loadSub2ApiOptions(settings = sub2apiSettingsDraft) {
+    setSub2apiGroupsLoading(true);
+    setSub2apiSettingsError("");
+    try {
+      const data = await apiFetch(token, "/api/sub2api/options", {
+        method: "POST",
+        body: JSON.stringify({ config: settings }),
+      });
+      setSub2apiGroups(Array.isArray(data.groups) ? data.groups : []);
+      setSub2apiProxies(Array.isArray(data.proxies) ? data.proxies : []);
+    } catch (requestError) {
+      setSub2apiGroups([]);
+      setSub2apiProxies([]);
+      setSub2apiSettingsError(requestError.message);
+    } finally {
+      setSub2apiGroupsLoading(false);
+    }
+  }
+
+  function saveSub2ApiSettings(event) {
+    event.preventDefault();
+    const baseUrl = String(sub2apiSettingsDraft.baseUrl || "").trim();
+    const adminApiKey = String(sub2apiSettingsDraft.adminApiKey || "").trim();
+    if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
+      setSub2apiSettingsError("请输入 http:// 或 https:// 开头的 Sub2API 后端地址");
+      return;
+    }
+    if (!adminApiKey) {
+      setSub2apiSettingsError("请输入 Sub2API 管理员 API Key");
+      return;
+    }
+    setSub2apiSettings({
+      ...readSub2ApiSettings(sub2apiSettingsDraft),
+      baseUrl: baseUrl.replace(/\/+$/, ""),
+      adminApiKey,
+    });
+    setSub2apiSettingsOpen(false);
+    setSub2apiSettingsError("");
+  }
+
+  async function uploadSelected(ids) {
+    if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
+      openSub2ApiSettings();
+      setUploadNotice("请先配置 Sub2API 后端地址、管理员 API Key 和目标号池");
+      return;
+    }
+    if (batchAction) return;
+    setBatchAction("upload");
+    setUploadNotice("");
+    try {
+      const data = await apiFetch(token, "/api/sub2api/upload", {
+        method: "POST",
+        body: JSON.stringify({ ids, config: sub2apiSettings }),
+      });
+      const result = data.result || {};
+      const created = result.account_created ?? result.success ?? data.uploaded;
+      const failed = result.account_failed ?? result.failed ?? 0;
+      setUploadNotice(`已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
   }
 
   async function loadSmsNumberOptions(settings = smsSettingsDraft) {
@@ -206,6 +288,13 @@ function App() {
     if (missing) {
       setSmsSettingsError(`请填写${missing.label}`);
       return;
+    }
+    if (resolved.id === "custom") {
+      const customEntries = inspectCustomSmsEntries(resolved.config.entries);
+      if (customEntries.error) {
+        setSmsSettingsError(customEntries.error);
+        return;
+      }
     }
     setSmsSettings(withSmsProviderDefaults(smsProviderDefinitions, smsSettingsDraft));
     setSmsSettingsOpen(false);
@@ -478,11 +567,32 @@ function App() {
           </button>
         </div>
 
+        <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 上传配置">
+          <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
+          <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
+          <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
+            {sub2apiSettings.adminApiKey ? <Check size={14} /> : <CircleAlert size={14} />}
+            {sub2apiSettings.adminApiKey
+              ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""}`
+              : "未完成配置"}
+          </span>
+          <button type="button" className="secondary-button provider-settings-button" onClick={openSub2ApiSettings} disabled={!token}>
+            <Settings2 size={16} />配置
+          </button>
+        </div>
+
         {error && (
           <div className="global-error" role="alert">
             <CircleAlert size={17} />
             <span>{error}</span>
             <button type="button" onClick={() => setError("")} title="关闭"><X size={16} /></button>
+          </div>
+        )}
+        {uploadNotice && (
+          <div className="global-success" role="status">
+            <Check size={17} />
+            <span>{uploadNotice}</span>
+            <button type="button" onClick={() => setUploadNotice("")} title="关闭"><X size={16} /></button>
           </div>
         )}
 
@@ -513,6 +623,12 @@ function App() {
                 {batchAction === "download" ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}
                 批量下载
               </button>
+              {features.sub2apiUpload && (
+                <button type="button" className="secondary-button bulk-button" onClick={() => uploadSelected([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
+                  {batchAction === "upload" ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
+                  上传到 Sub2API
+                </button>
+              )}
               {features.sourceExport && (
                 <button type="button" className="secondary-button bulk-button" onClick={exportSelectedSource} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                   {batchAction === "source" ? <LoaderCircle className="spin" size={16} /> : <FileText size={16} />}
@@ -566,6 +682,8 @@ function App() {
                     selectionSupported={Boolean(features.bulkActions)}
                     smsProviderAvailable={smsProviderDefinitions.length > 0}
                     smsProvider={activeSmsProvider}
+                    onUpload={() => uploadSelected([job.id])}
+                    sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -613,17 +731,11 @@ function App() {
                   aria-selected={draftSmsProvider.id === provider.id}
                   className={draftSmsProvider.id === provider.id ? "active" : ""}
                   onClick={() => {
-                    const next = withSmsProviderDefaults(smsProviderDefinitions, {
-                      ...smsSettingsDraft,
-                      selectedProviderId: provider.id,
-                    });
                     setSmsSettingsDraft((current) => withSmsProviderDefaults(smsProviderDefinitions, {
                       ...current,
                       selectedProviderId: provider.id,
                     }));
                     setSmsSettingsError("");
-                    const resolved = resolveSmsProvider(smsProviderDefinitions, next);
-                    if (resolved.definition?.optionsEndpoint && resolved.config.apiKey) void loadSmsNumberOptions(next);
                   }}
                 >
                   {provider.name}
@@ -636,7 +748,7 @@ function App() {
                 <div className="provider-description">{draftSmsProvider.definition.description}</div>
                 <div className="provider-config-grid">
                   {draftSmsProvider.definition.fields.filter((field) => field.type !== "hidden").map((field) => (
-                    <label key={field.key} className={`settings-field ${field.type === "price-select" ? "price-settings-field" : ""}`}>
+                    <label key={field.key} className={`settings-field ${["price-select", "textarea"].includes(field.type) ? "wide-settings-field" : ""}`}>
                       <span>{field.label}</span>
                       {field.type === "price-select" ? (
                         <div className="price-select-row">
@@ -676,6 +788,16 @@ function App() {
                             {smsOptionsLoading ? "查询中" : "查询价格"}
                           </button>
                         </div>
+                      ) : field.type === "textarea" ? (
+                        <textarea
+                          className="settings-textarea"
+                          value={draftSmsProvider.config[field.key] || ""}
+                          onChange={(event) => updateSmsProviderConfig(draftSmsProvider.id, { [field.key]: event.target.value })}
+                          placeholder={field.placeholder}
+                          rows="8"
+                          autoComplete="off"
+                          spellCheck="false"
+                        />
                       ) : (
                         <div>
                           {field.type === "password" ? <KeyRound size={15} /> : <Settings2 size={15} />}
@@ -701,6 +823,123 @@ function App() {
               <button type="submit" className="primary-button" disabled={!draftSmsProvider.definition}>
                 <Check size={17} />保存配置
               </button>
+            </div>
+          </form>
+        </div>
+      )}
+      {sub2apiSettingsOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setSub2apiSettingsOpen(false);
+        }}>
+          <form className="batch-dialog sub2api-settings-dialog" onSubmit={saveSub2ApiSettings} role="dialog" aria-modal="true" aria-labelledby="sub2api-settings-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="sub2api-settings-title">Sub2API 上传配置</h2>
+                <span>配置只保存在当前浏览器，管理员 Key 不写入任务文件</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setSub2apiSettingsOpen(false)} title="关闭"><X size={18} /></button>
+            </div>
+            <div className="provider-config-grid sub2api-config-grid">
+              <label className="settings-field wide-settings-field">
+                <span>Sub2API 后端地址</span>
+                <input
+                  type="url"
+                  value={sub2apiSettingsDraft.baseUrl}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, baseUrl: event.target.value }))}
+                  placeholder="例如 http://127.0.0.1:8080"
+                  autoComplete="url"
+                />
+              </label>
+              <label className="settings-field wide-settings-field">
+                <span>管理员 API Key</span>
+                <input
+                  type="password"
+                  value={sub2apiSettingsDraft.adminApiKey}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, adminApiKey: event.target.value }))}
+                  placeholder="输入 sub2api 管理员 API Key"
+                  autoComplete="off"
+                />
+              </label>
+              <label className="settings-field wide-settings-field">
+                <span>目标号池（可多选）</span>
+                <select
+                  multiple
+                  value={sub2apiSettingsDraft.groupIds}
+                  onChange={(event) => {
+                    const values = [...event.target.selectedOptions].map((option) => option.value);
+                    setSub2apiSettingsDraft((current) => ({ ...current, groupIds: values }));
+                  }}
+                >
+                  {sub2apiGroups.map((group) => <option key={group.id} value={String(group.id)}>{group.name}（ID: {group.id}）</option>)}
+                </select>
+              </label>
+              <label className="settings-field wide-settings-field">
+                <span>代理 IP</span>
+                <select
+                  value={sub2apiSettingsDraft.proxyId}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, proxyId: event.target.value }))}
+                >
+                  <option value="">使用账号原配置</option>
+                  {sub2apiProxies.map((proxy) => <option key={proxy.id} value={String(proxy.id)}>{formatSub2ApiProxy(proxy)}</option>)}
+                </select>
+              </label>
+              <label className="settings-field">
+                <span>并发数</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="10000"
+                  step="1"
+                  value={sub2apiSettingsDraft.concurrency}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, concurrency: event.target.value }))}
+                  placeholder="留空使用账号原值"
+                />
+              </label>
+              <label className="settings-field">
+                <span>负载因子</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="10000"
+                  step="1"
+                  value={sub2apiSettingsDraft.loadFactor}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, loadFactor: event.target.value }))}
+                  placeholder="留空使用账号原值"
+                />
+              </label>
+              <label className="settings-field">
+                <span>优先级</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="10000"
+                  step="1"
+                  value={sub2apiSettingsDraft.priority}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, priority: event.target.value }))}
+                  placeholder="留空使用账号原值"
+                />
+              </label>
+              <label className="settings-field wide-settings-field">
+                <span>允许使用的模型</span>
+                <textarea
+                  className="sub2api-model-textarea"
+                  value={sub2apiSettingsDraft.modelWhitelist}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, modelWhitelist: event.target.value }))}
+                  placeholder={"每行一个模型，也支持逗号分隔，例如：\ngpt-5\ngpt-5-mini\ngpt-4.1"}
+                  rows="5"
+                  spellCheck="false"
+                />
+              </label>
+            </div>
+            <div className="dialog-hint">分组为空表示使用 Sub2API 默认号池；其他参数为空表示保留账号原配置。代理和号池列表需要点击“读取配置”获取。</div>
+            {sub2apiSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{sub2apiSettingsError}</div>}
+            <div className="dialog-actions sub2api-dialog-actions">
+              <button type="button" className="secondary-button" onClick={() => loadSub2ApiOptions()} disabled={sub2apiGroupsLoading || !token}>
+                {sub2apiGroupsLoading ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}读取配置
+              </button>
+              <span className="dialog-actions-spacer" />
+              <button type="button" className="cancel-button" onClick={() => setSub2apiSettingsOpen(false)}>取消</button>
+              <button type="submit" className="primary-button">保存配置</button>
             </div>
           </form>
         </div>
@@ -790,7 +1029,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -978,6 +1217,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               <Download size={16} />下载
             </button>
           )}
+          {job.canDownload && sub2apiUploadAvailable && (
+            <button type="button" className="secondary-button" onClick={onUpload} disabled={submitting} title="上传到已配置的 Sub2API 号池">
+              <Send size={16} />上传
+            </button>
+          )}
           {job.canRegenerate && (
             <button type="button" className="regenerate-button" onClick={regenerate} disabled={submitting} title="优先使用刷新令牌直接生成新授权">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
@@ -1117,6 +1361,7 @@ function smsStatusText(job) {
     submitting: `${providerName}：已收到验证码，正在自动提交`,
     submitted: `${providerName}：验证码已自动提交`,
     manual_submitted: `${providerName}：已停止自动读取，正在验证手动输入的验证码`,
+    completed: `${providerName}：手机验证已通过，订单已完成`,
   }[job.smsStatus] || `${providerName}：处理中`;
 }
 
@@ -1246,6 +1491,42 @@ function readSmsProviderSettings() {
   };
 }
 
+function normalizeSub2ApiSettings(value) {
+  const stored = value && typeof value === "object" ? value : {};
+  const rawGroupIds = Array.isArray(stored.groupIds)
+    ? stored.groupIds
+    : String(stored.groupId || "").trim()
+      ? [stored.groupId]
+      : [];
+  return {
+    baseUrl: String(stored.baseUrl || ""),
+    adminApiKey: String(stored.adminApiKey || ""),
+    groupIds: [...new Set(rawGroupIds.map((id) => String(id).trim()).filter(Boolean))],
+    proxyId: String(stored.proxyId || ""),
+    concurrency: String(stored.concurrency ?? ""),
+    loadFactor: String(stored.loadFactor ?? ""),
+    priority: String(stored.priority ?? ""),
+    modelWhitelist: String(stored.modelWhitelist || ""),
+  };
+}
+
+function readSub2ApiSettings(value) {
+  try {
+    const stored = value || JSON.parse(window.localStorage.getItem(SUB2API_UPLOAD_SETTINGS_KEY) || "null");
+    if (stored && typeof stored === "object") return normalizeSub2ApiSettings(stored);
+  } catch {}
+  return normalizeSub2ApiSettings({});
+}
+
+function formatSub2ApiProxy(proxy) {
+  const protocol = String(proxy.protocol || "http").replace(/:\/\/$/, "");
+  const host = String(proxy.host || "");
+  const port = proxy.port ? `:${proxy.port}` : "";
+  const endpoint = host ? `${protocol}://${host}${port}` : "地址未知";
+  const ip = String(proxy.ipAddress || "").trim();
+  return `${proxy.name || `代理 ${proxy.id}`} | ${endpoint}${ip ? ` | 出口 IP：${ip}` : ""}`;
+}
+
 function withSmsProviderDefaults(definitions, settings) {
   const configs = { ...(settings?.configs || {}) };
   definitions.forEach((provider) => {
@@ -1265,10 +1546,14 @@ function resolveSmsProvider(definitions, settings) {
   const normalized = withSmsProviderDefaults(definitions, settings || {});
   const definition = definitions.find((provider) => provider.id === normalized.selectedProviderId) || null;
   const config = definition ? normalized.configs[definition.id] || {} : {};
-  const ready = Boolean(definition) && definition.fields.every((field) => (
+  const requiredFieldsReady = Boolean(definition) && definition.fields.every((field) => (
     field.required === false || String(config[field.key] || "").trim()
   ));
-  const summary = definition
+  const customEntries = definition?.id === "custom" ? inspectCustomSmsEntries(config.entries) : null;
+  const ready = requiredFieldsReady && !customEntries?.error;
+  const summary = definition?.id === "custom"
+    ? (customEntries?.count ? `${customEntries.count} 个号码` : "")
+    : definition
     ? definition.fields
       .filter((field) => field.summary || field.summaryKey)
       .map((field) => config[field.summaryKey || field.key])
@@ -1283,6 +1568,30 @@ function resolveSmsProvider(definitions, settings) {
     ready,
     summary,
   };
+}
+
+function inspectCustomSmsEntries(value) {
+  const lines = String(value || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return { count: 0, error: "请粘贴至少一条手机号和接码 API" };
+  if (lines.length > 500) return { count: 0, error: "自定义接码一次最多导入 500 条" };
+  const phones = new Set();
+  for (let index = 0; index < lines.length; index += 1) {
+    const delimiterAt = lines[index].indexOf("----");
+    if (delimiterAt < 0) return { count: 0, error: `第 ${index + 1} 行格式错误，请使用 手机号----接码API` };
+    const phone = lines[index].slice(0, delimiterAt).trim();
+    const apiUrl = lines[index].slice(delimiterAt + 4).trim();
+    if (!/^\+[1-9]\d{6,14}$/.test(phone)) {
+      return { count: 0, error: `第 ${index + 1} 行手机号必须使用 +861871291167 这种国际格式` };
+    }
+    try {
+      const parsed = new URL(apiUrl);
+      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("invalid protocol");
+    } catch {
+      return { count: 0, error: `第 ${index + 1} 行接码 API 必须是有效的 HTTP 或 HTTPS 地址` };
+    }
+    phones.add(phone);
+  }
+  return { count: phones.size, error: "" };
 }
 
 function formatSmsCountryName(option) {

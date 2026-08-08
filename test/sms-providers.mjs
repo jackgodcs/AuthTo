@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 
 import { createSmsProvider, publicSmsProviderDefinitions } from "../src/sms-providers.mjs";
 import { createSmsBowerClient, SmsBowerError } from "../src/smsbower.mjs";
+import { createCustomSmsClient, parseCustomSmsEntries } from "../src/custom-sms.mjs";
 
 const requests = [];
 let smsChecks = 0;
@@ -66,7 +67,7 @@ await assert.rejects(
 );
 
 const definitions = publicSmsProviderDefinitions();
-assert.deepEqual(definitions.map((provider) => provider.id), ["luban", "smsbower"]);
+assert.deepEqual(definitions.map((provider) => provider.id), ["luban", "smsbower", "custom"]);
 const provider = createSmsProvider("smsbower", {
   apiKey: "test-api-key",
   service: "dr",
@@ -79,6 +80,40 @@ assert.equal(provider.serviceLabel, "日本");
 assert.deepEqual(await provider.getNumber(), { requestId: "activation-1", number: "+60123456789" });
 assert.equal((await provider.listNumberOptions())[0].country, "12");
 assert.throws(() => createSmsProvider("smsbower", { apiKey: "short", service: "dr", country: "1001" }), /API Key/);
+assert.deepEqual(parseCustomSmsEntries([
+  "+8613711111111----https://sms.example/first",
+  "+8613822222222----https://sms.example/second",
+  "+8613711111111----https://sms.example/updated",
+].join("\n")), [
+  { phone: "+8613711111111", apiUrl: "https://sms.example/updated" },
+  { phone: "+8613822222222", apiUrl: "https://sms.example/second" },
+]);
+assert.throws(() => parseCustomSmsEntries("8613711111111----https://sms.example/code"), /E\.164/);
+assert.throws(() => parseCustomSmsEntries("+8613711111111----ftp://sms.example/code"), /HTTP 或 HTTPS/);
+
+let customInboxChecks = 0;
+const customFetch = async () => {
+  customInboxChecks += 1;
+  return new Response(JSON.stringify({ messages: customInboxChecks === 1
+    ? [{ id: "old-message", text: "OpenAI code\n111111\n" }]
+    : [
+        { id: "new-message", text: "OpenAI code\n654321\n" },
+        { id: "old-message", text: "OpenAI code\n111111\n" },
+      ] }), { status: 200 });
+};
+const customClient = createCustomSmsClient({
+  entries: [
+    "+8613711111111----https://sms.example/first",
+    "+8613822222222----https://sms.example/second",
+  ].join("\n"),
+  fetchImpl: customFetch,
+  acquireEntry: (entries) => entries[1],
+});
+assert.equal(customClient.entryCount, 2);
+const customOrder = await customClient.getNumber();
+assert.equal(customOrder.number, "+8613822222222");
+assert.deepEqual(await customClient.getSms(customOrder.requestId), { status: "received", code: "654321" });
+assert.equal(await customClient.release(customOrder.requestId), true);
 assert.throws(() => createSmsProvider("unknown", {}), /受支持/);
 
 console.log("sms provider tests passed");

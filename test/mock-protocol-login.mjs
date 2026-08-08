@@ -98,11 +98,24 @@ try {
     return;
   }
 
-  if (["luban@example.com", "sms-provider@example.com"].includes(args.email)) {
+  if (["luban@example.com", "sms-provider@example.com", "custom-sms@example.com"].includes(args.email)) {
     await rl.question("Phone number, E.164 format (p=quit): ");
     console.log("Phone OTP (r=resend, p=change phone, q=quit): ");
     await rl.question("");
+    console.log("[ok] Phone OTP validated");
     await writeCompleted(args.sub2apiOut, args.email);
+    return;
+  }
+
+  if (args.email === "sms-recently-used@example.com") {
+    await rl.question("Phone number, E.164 format (p=quit): ");
+    console.log("Phone OTP (r=resend, p=change phone, q=quit): ");
+    await rl.question("");
+    console.log('[warn] Phone OTP validation failed: HTTP 429: { "error": { "message": "This phone number was recently used. Please try again later.", "code": "phone_recently_used" } }');
+    const action = await rl.question("Phone OTP (r=resend, p=change phone, q=quit): ");
+    if (action !== "p") throw new Error(`expected automatic phone change, received ${action}`);
+    console.log("[info] Change phone number.");
+    await rl.question("Phone number, E.164 format (p=quit): ");
     return;
   }
 

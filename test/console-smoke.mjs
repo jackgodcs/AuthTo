@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,41 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-console-"));
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
+const sub2apiPort = await findAvailablePort();
+const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
+let uploadedAccounts = [];
+const sub2api = http.createServer(async (req, res) => {
+  if (req.headers["x-api-key"] !== "test-admin-key") {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ message: "invalid admin key" }));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/api/v1/admin/groups/all?platform=openai") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify([
+      { id: 7, name: "测试号池", status: "active" },
+      { id: 8, name: "备用号池", status: "active" },
+    ]));
+    return;
+  }
+  if (req.method === "GET" && req.url === "/api/v1/admin/proxies/all") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify([{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ip_address: "203.0.113.10", status: "active" }]));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/api/v1/admin/accounts/batch") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    uploadedAccounts = body.accounts || [];
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0, results: [] }));
+    return;
+  }
+  res.writeHead(404, { "content-type": "application/json" });
+  res.end(JSON.stringify({ message: "not found" }));
+});
+await new Promise((resolve) => sub2api.listen(sub2apiPort, "127.0.0.1", resolve));
 const child = spawn(process.execPath, [
   path.join(projectRoot, "src", "console-server.mjs"),
   "--host",
@@ -85,6 +121,51 @@ try {
   const profileJob = await waitForJob(headers, profileCreated.job.id, (value) => value.status === "completed");
   assert.equal(profileJob.canDownload, true);
 
+  const groupsResponse = await fetch(`${baseUrl}/api/sub2api/options`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key" } }),
+  });
+  assert.equal(groupsResponse.status, 200);
+  assert.deepEqual(await groupsResponse.json(), {
+    groups: [
+      { id: 7, name: "测试号池", status: "active" },
+      { id: 8, name: "备用号池", status: "active" },
+    ],
+    proxies: [{ id: 3, name: "测试代理", protocol: "http", host: "proxy.example", port: 8080, ipAddress: "203.0.113.10", status: "active" }],
+  });
+
+  const uploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id, "missing-job-is-filtered-by-selection-limit"],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini" },
+    }),
+  });
+  assert.equal(uploadResponse.status, 404);
+
+  const validUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini" },
+    }),
+  });
+  const validUploadText = await validUploadResponse.text();
+  assert.equal(validUploadResponse.status, 200, validUploadText);
+  const uploadResult = JSON.parse(validUploadText);
+  assert.equal(uploadResult.uploaded, 1);
+  assert.equal(uploadResult.result.success, 1);
+  assert.deepEqual(uploadedAccounts[0].group_ids, [7, 8]);
+  assert.equal(uploadedAccounts[0].proxy_id, 3);
+  assert.equal(uploadedAccounts[0].concurrency, 10);
+  assert.equal(uploadedAccounts[0].load_factor, 100);
+  assert.equal(uploadedAccounts[0].priority, 1);
+  assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
+  assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
+
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [
     `password-mail@example.com---test-password----${mailApiUrl}`,
@@ -139,6 +220,7 @@ try {
 } finally {
   if (isRunning(child)) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);
+  await new Promise((resolve) => sub2api.close(resolve));
   await fs.rm(outputRoot, { recursive: true, force: true });
 }
 

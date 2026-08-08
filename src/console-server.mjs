@@ -36,6 +36,7 @@ const OUTPUT_ROOT = path.resolve(
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
+const customSmsPoolPositions = new Map();
 let outputSyncPromise = null;
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
@@ -157,6 +158,7 @@ async function handleApi(req, res, requestUrl) {
         queue: true,
         sourceExport: true,
         cancelAll: true,
+        sub2apiUpload: true,
       },
     });
     return;
@@ -259,6 +261,92 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/cancel-all") {
     const canceled = await cancelAllJobs();
     sendJson(res, 200, { canceled });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/groups") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config);
+    const payload = await requestSub2Api(config, "/api/v1/admin/groups/all?platform=openai");
+    const groups = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [];
+    sendJson(res, 200, {
+      groups: groups
+        .filter((group) => group && Number.isInteger(Number(group.id)))
+        .map((group) => ({
+          id: Number(group.id),
+          name: String(group.name || `号池 ${group.id}`),
+          status: String(group.status || "active"),
+        })),
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/options") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config);
+    const [groupPayload, proxyPayload] = await Promise.all([
+      requestSub2Api(config, "/api/v1/admin/groups/all?platform=openai"),
+      requestSub2Api(config, "/api/v1/admin/proxies/all"),
+    ]);
+    const groups = Array.isArray(groupPayload) ? groupPayload : Array.isArray(groupPayload?.data) ? groupPayload.data : [];
+    const proxies = Array.isArray(proxyPayload) ? proxyPayload : Array.isArray(proxyPayload?.data) ? proxyPayload.data : [];
+    sendJson(res, 200, {
+      groups: groups
+        .filter((group) => group && Number.isInteger(Number(group.id)))
+        .map((group) => ({ id: Number(group.id), name: String(group.name || `号池 ${group.id}`), status: String(group.status || "active") })),
+      proxies: proxies
+        .filter((proxy) => proxy && Number.isInteger(Number(proxy.id)))
+        .map((proxy) => ({
+          id: Number(proxy.id),
+          name: String(proxy.name || `代理 ${proxy.id}`),
+          protocol: String(proxy.protocol || ""),
+          host: String(proxy.host || ""),
+          port: Number(proxy.port || 0),
+          ipAddress: String(proxy.ip_address || ""),
+          status: String(proxy.status || "active"),
+        })),
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/upload") {
+    const body = await readJson(req);
+    const config = normalizeSub2ApiConfig(body.config);
+    const selected = resolveSelectedJobs(body.ids);
+    const downloadable = selected.filter((job) => job.status === "completed" && job.resultSaved);
+    if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
+    const payload = await buildSub2ApiUploadPayload(downloadable);
+    const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
+
+    const accounts = payload.accounts.map((account) => {
+      const { proxy_key: _proxyKey, ...accountData } = account;
+      const credentials = { ...(account.credentials || {}) };
+      if (config.modelWhitelist.length) {
+        credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
+      }
+      return {
+        ...accountData,
+        credentials,
+        group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
+        ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
+        ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
+        ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
+        ...(config.priority !== null ? { priority: config.priority } : {}),
+      };
+    });
+    const result = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ accounts }),
+    });
+
+    sendJson(res, 200, {
+      selected: selected.length,
+      uploaded: downloadable.length,
+      skipped: selected.length - downloadable.length,
+      groupIds: config.groupIds,
+      result,
+    });
     return;
   }
 
@@ -676,12 +764,13 @@ function consumeOutput(job, rawText) {
   if (scan.includes("[mfa] TOTP 2FA challenge reached.")) {
     setStage(job, "working", job.totpSecret ? "正在自动完成 2FA 验证" : "正在准备 2FA 验证");
   }
-  if (scan.includes("Phone number, E.164 format")) {
+  const phoneNumberPromptIndex = scan.lastIndexOf("Phone number, E.164 format");
+  const phoneOtpPromptIndex = scan.lastIndexOf("Phone OTP (r=resend, p=change phone, q=quit):");
+  if (phoneNumberPromptIndex > phoneOtpPromptIndex) {
     stopMailPolling(job);
     setStage(job, "phone", "请输入需要绑定的手机号");
-  }
-  if (scan.includes("Phone OTP (r=resend, p=change phone, q=quit):")) {
-    job.phoneError = null;
+  } else if (phoneOtpPromptIndex > phoneNumberPromptIndex) {
+    if (job.smsStatus !== "error") job.phoneError = null;
     setStage(
       job,
       "phone_otp",
@@ -703,7 +792,9 @@ function consumeOutput(job, rawText) {
 
   const validationFailures = [...scan.matchAll(/\[warn\] Phone OTP validation failed:\s*([^\r\n]+)/g)];
   if (validationFailures.length) {
-    job.phoneError = friendlyPhoneOtpError(validationFailures.at(-1)[1]);
+    const validationMessage = validationFailures.at(-1)[1];
+    job.phoneError = friendlyPhoneOtpError(validationMessage);
+    stopSmsPolling(job);
     if (job.smsStatus === "submitted") {
       job.smsStatus = "error";
       job.smsError = "平台返回的验证码未通过验证，请重新发送或更换手机号";
@@ -713,6 +804,20 @@ function consumeOutput(job, rawText) {
       "phone_otp",
       job.currentPhone ? `请重新输入发送至 ${job.currentPhone} 的验证码` : "请重新输入手机验证码",
     );
+    if (shouldChangePhoneAfterOtpFailure(validationMessage)) {
+      job.smsError = job.phoneError;
+      appendJobLog(job, "[sms] 当前手机号已被服务端拒绝，停止提交旧验证码并自动返回换号步骤。\n");
+      void submitJobInput(job, { action: "change_phone", value: "" }, {
+        preservePhoneError: true,
+      }).catch((error) => {
+        failJob(job, `无法自动返回换号步骤：${error.message}`);
+      });
+      touch(job);
+      return;
+    }
+  }
+  if (scan.includes("[ok] Phone OTP validated")) {
+    completeSmsNumber(job);
   }
   if (scan.includes("[5/5] Select workspace") || scan.includes("[6/6] Convert OAuth callback")) {
     setStage(job, "finalizing", "正在完成授权并生成文件");
@@ -827,9 +932,32 @@ function extractResponseMessage(value) {
 
 function friendlyPhoneOtpError(message) {
   const text = String(message || "");
+  if (/phone_recently_used|phone number was recently used/i.test(text)) {
+    return "该手机号近期已被使用，已停止重复提交，请更换手机号";
+  }
+  if (/phone_number_in_use|phone number already in use/i.test(text)) {
+    return "该手机号已绑定其他账号，请更换手机号";
+  }
   if (/expired/i.test(text)) return "手机验证码已过期，请重新发送或更换手机号";
-  if (/too many|rate.?limit|HTTP 429/i.test(text)) return "验证次数过多，请重新发送或更换手机号";
+  if (/too many|rate.?limit|HTTP 429/i.test(text)) {
+    return "验证次数过多，已停止自动提交，请稍后更换手机号";
+  }
   return "手机验证码不正确，请重新输入；也可以重新发送或更换手机号";
+}
+
+function shouldChangePhoneAfterOtpFailure(message) {
+  return /phone_recently_used|phone number was recently used|phone_number_in_use|phone number already in use|too many|rate.?limit|HTTP 429/i
+    .test(String(message || ""));
+}
+
+function acquireCustomSmsEntry(entries) {
+  const poolKey = crypto.createHash("sha256")
+    .update(JSON.stringify(entries))
+    .digest("base64url");
+  const nextIndex = customSmsPoolPositions.get(poolKey) || 0;
+  if (nextIndex >= entries.length) return null;
+  customSmsPoolPositions.set(poolKey, nextIndex + 1);
+  return entries[nextIndex];
 }
 
 async function acquireSmsNumber(job, providerId, config) {
@@ -841,6 +969,7 @@ async function acquireSmsNumber(job, providerId, config) {
     smsClient = createSmsProvider(providerId, config, {
       lubanApiBase: process.env.LUBAN_SMS_API_BASE,
       smsBowerApiBase: process.env.SMSBOWER_API_BASE,
+      acquireCustomSmsEntry,
     });
   } catch (error) {
     throw httpError(400, safeSmsProviderError(error, config?.apiKey));
@@ -883,7 +1012,13 @@ async function acquireSmsNumber(job, providerId, config) {
 }
 
 async function beginSmsPolling(job) {
-  if (!job.smsClient || !job.smsOrderId || job.smsPollToken || job.status !== "phone_otp") return;
+  if (
+    !job.smsClient
+    || !job.smsOrderId
+    || job.smsPollToken
+    || job.status !== "phone_otp"
+    || !["number_acquired", "waiting_sms"].includes(job.smsStatus)
+  ) return;
   const pollToken = crypto.randomUUID();
   const requestId = job.smsOrderId;
   const smsClient = job.smsClient;
@@ -910,15 +1045,18 @@ async function beginSmsPolling(job) {
         const result = await smsClient.getSms(requestId);
         if (job.smsPollToken !== pollToken || job.status !== "phone_otp" || !job.child) return;
         if (result.status === "received") {
+          if (job.smsLastSubmittedCode === result.code) {
+            job.smsStatus = "error";
+            job.smsError = "接码平台仍返回已提交过的验证码，已停止重复提交";
+            appendJobLog(job, `[sms] ${smsClient.name} 返回了已提交过的验证码，已停止本次自动轮询。\n`);
+            touch(job);
+            return;
+          }
+          job.smsLastSubmittedCode = result.code;
           job.smsStatus = "submitting";
           job.smsError = null;
           appendJobLog(job, `[sms] 已从 ${smsClient.name} 获取短信验证码并自动提交。\n`);
           await submitJobInput(job, { action: "phone_otp", value: result.code }, { source: "sms-provider" });
-          if (smsClient.complete) {
-            await smsClient.complete(requestId).catch((error) => {
-              appendJobLog(job, `[sms] ${smsClient.name} 完成订单失败：${safeSmsProviderError(error)}\n`);
-            });
-          }
           return;
         }
         job.smsStatus = "waiting_sms";
@@ -963,6 +1101,7 @@ function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null) {
   job.smsOrderId = null;
   job.smsNumber = null;
   job.smsClient = null;
+  job.smsLastSubmittedCode = null;
   job.smsStatus = nextStatus;
   job.smsError = errorMessage;
   if (nextStatus === "idle") {
@@ -978,6 +1117,27 @@ function releaseSmsNumber(job, nextStatus = "idle", errorMessage = null) {
   if (job.outputPath) void saveJobMetadata(job).catch(() => {});
 }
 
+function completeSmsNumber(job) {
+  const requestId = job.smsOrderId;
+  const smsClient = job.smsClient;
+  if (!requestId || !smsClient) return;
+  stopSmsPolling(job);
+  job.smsOrderId = null;
+  job.smsClient = null;
+  job.smsLastSubmittedCode = null;
+  job.smsStatus = "completed";
+  job.smsError = null;
+  appendJobLog(job, `[sms] 手机验证码已通过，正在完成 ${smsClient.name} 订单。\n`);
+  if (smsClient.complete) {
+    void smsClient.complete(requestId).catch((error) => {
+      appendJobLog(job, `[sms] ${smsClient.name} 完成订单失败：${safeSmsProviderError(error)}\n`);
+      touch(job);
+    });
+  }
+  touch(job);
+  if (job.outputPath) void saveJobMetadata(job).catch(() => {});
+}
+
 function newSmsState() {
   return {
     smsProviderId: null,
@@ -989,6 +1149,7 @@ function newSmsState() {
     smsStatus: "idle",
     smsError: null,
     smsPollToken: null,
+    smsLastSubmittedCode: null,
   };
 }
 
@@ -1006,6 +1167,7 @@ function restoredSmsState(metadata = {}) {
     smsStatus: "error",
     smsError: "服务重启后已停止自动收短信，可手动输入验证码或换号",
     smsPollToken: null,
+    smsLastSubmittedCode: null,
   };
 }
 
@@ -1080,11 +1242,20 @@ async function submitJobInput(job, body, options = {}) {
     setStage(job, "working", job.currentPhone ? `正在向 ${job.currentPhone} 重新发送验证码` : "正在重新发送手机验证码");
   } else if (action === "change_phone") {
     requireStage(job, "phone_otp");
-    releaseSmsNumber(job, "idle");
+    const preservedPhoneError = options.preservePhoneError ? job.phoneError : null;
+    releaseSmsNumber(
+      job,
+      options.preservePhoneError ? "error" : "idle",
+      options.preservePhoneError ? preservedPhoneError : null,
+    );
     job.currentPhone = null;
-    job.phoneError = null;
+    job.phoneError = preservedPhoneError;
     inputValue = "p";
-    setStage(job, "working", "正在返回手机号输入");
+    setStage(
+      job,
+      "working",
+      options.preservePhoneError ? "当前手机号不可用，正在返回换号步骤" : "正在返回手机号输入",
+    );
   } else {
     throw httpError(400, "Unsupported input action");
   }
@@ -1177,6 +1348,127 @@ async function downloadBatchResult(res, ids) {
     "x-content-type-options": "nosniff",
   });
   res.end(payload);
+}
+
+async function buildSub2ApiUploadPayload(downloadable) {
+  const accounts = [];
+  const proxies = [];
+  for (const job of downloadable) {
+    if (!(await fileExists(job.outputPath))) throw httpError(409, `${job.email} 的导入文件不存在`);
+    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+    if (data.type !== "sub2api-data" || !Array.isArray(data.accounts)) {
+      throw httpError(409, `${job.email} 的导入文件格式不正确`);
+    }
+    accounts.push(...data.accounts);
+    if (Array.isArray(data.proxies)) proxies.push(...data.proxies);
+  }
+  return {
+    type: "sub2api-data",
+    version: 1,
+    exported_at: new Date().toISOString(),
+    proxies: uniqueByJson(proxies),
+    accounts,
+  };
+}
+
+function normalizeSub2ApiConfig(value) {
+  const config = value && typeof value === "object" ? value : {};
+  const baseUrl = String(config.baseUrl || "").trim().replace(/\/+$/, "");
+  const adminApiKey = String(config.adminApiKey || "").trim();
+  if (!baseUrl) throw httpError(400, "请填写 Sub2API 后端地址");
+  let parsed;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw httpError(400, "Sub2API 后端地址格式不正确");
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw httpError(400, "Sub2API 后端地址必须使用 HTTP 或 HTTPS");
+  }
+  if (!adminApiKey || adminApiKey.length > 512 || /[\r\n]/.test(adminApiKey)) {
+    throw httpError(400, "请填写有效的 Sub2API 管理员 API Key");
+  }
+  const rawGroupIds = Array.isArray(config.groupIds)
+    ? config.groupIds
+    : String(config.groupId || "").trim() ? [config.groupId] : [];
+  const groupIds = [...new Set(rawGroupIds.map((value) => String(value).trim()).filter(Boolean))].map((value) => {
+    if (!/^\d+$/.test(value) || Number(value) <= 0 || Number(value) > Number.MAX_SAFE_INTEGER) {
+      throw httpError(400, "目标号池 ID 无效");
+    }
+    return Number(value);
+  });
+  const proxyText = String(config.proxyId || "").trim();
+  if (proxyText && (!/^\d+$/.test(proxyText) || Number(proxyText) <= 0 || Number(proxyText) > Number.MAX_SAFE_INTEGER)) {
+    throw httpError(400, "代理 ID 无效");
+  }
+  const proxyId = proxyText ? Number(proxyText) : 0;
+  const concurrency = parseOptionalSub2ApiInteger(config.concurrency, "并发数", 0, 10000);
+  const loadFactor = parseOptionalSub2ApiInteger(config.loadFactor, "负载因子", 0, 10000);
+  const priority = parseOptionalSub2ApiInteger(config.priority, "优先级", 0, 10000);
+  const modelWhitelist = parseSub2ApiModelWhitelist(config.modelWhitelist);
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist };
+}
+
+function parseOptionalSub2ApiInteger(value, label, min, max) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (!/^\d+$/.test(text)) throw httpError(400, `${label}必须是数字`);
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) throw httpError(400, `${label}范围必须是 ${min} 到 ${max}`);
+  return parsed;
+}
+
+function parseSub2ApiModelWhitelist(value) {
+  const models = String(value || "")
+    .split(/[\r\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (models.length > 200) throw httpError(400, "支持模型最多填写 200 个");
+  if (models.some((model) => model.length > 200 || /[\r\n]/.test(model))) throw httpError(400, "支持模型名称格式不正确");
+  return [...new Set(models)];
+}
+
+async function requestSub2Api(config, endpoint, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120_000);
+  try {
+    const response = await fetch(`${config.baseUrl}${endpoint}`, {
+      ...options,
+      redirect: "manual",
+      signal: controller.signal,
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "x-api-key": config.adminApiKey,
+        ...(options.headers || {}),
+      },
+    });
+    const text = await response.text();
+    let payload = null;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      payload = null;
+    }
+    if (!response.ok) {
+      const message = sub2ApiResponseMessage(payload, text).slice(0, 500);
+      throw httpError(502, `Sub2API 返回 HTTP ${response.status}${message ? `：${message}` : ""}`);
+    }
+    return payload;
+  } catch (error) {
+    if (error?.status) throw error;
+    if (error?.name === "AbortError") throw httpError(504, "Sub2API 请求超时");
+    throw httpError(502, `无法连接 Sub2API 后端：${error.message}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function sub2ApiResponseMessage(payload, text) {
+  const message = payload?.error?.message || payload?.message || payload?.error || "";
+  return typeof message === "string" && message.trim()
+    ? message.trim()
+    : extractResponseMessage(text);
 }
 
 async function exportSourceAccounts(res, ids) {

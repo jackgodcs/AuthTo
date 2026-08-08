@@ -1,5 +1,6 @@
 import { createLubanSmsClient } from "./luban-sms.mjs";
 import { createSmsBowerClient } from "./smsbower.mjs";
+import { createCustomSmsClient } from "./custom-sms.mjs";
 
 export const SMS_PROVIDER_DEFINITIONS = [
   {
@@ -22,6 +23,19 @@ export const SMS_PROVIDER_DEFINITIONS = [
       { key: "country", label: "国家与价格", type: "price-select", defaultValue: "1001", summaryKey: "countryLabel" },
       { key: "maxPrice", label: "最高价格", type: "hidden", required: false },
       { key: "countryLabel", label: "国家名称", type: "hidden", required: false },
+    ],
+  },
+  {
+    id: "custom",
+    name: "自定义接码",
+    description: "批量粘贴手机号和对应的接码 API",
+    fields: [
+      {
+        key: "entries",
+        label: "手机号与接码 API",
+        type: "textarea",
+        placeholder: "+861871291167----https://example.com/messages/1871291167",
+      },
     ],
   },
 ];
@@ -74,6 +88,23 @@ export function createSmsProvider(providerIdValue, configValue = {}, options = {
       getSms: (requestId) => client.getSms(requestId),
       markReady: (requestId) => client.markReady(requestId),
       complete: (requestId) => client.complete(requestId),
+      release: (requestId) => client.release(requestId),
+    };
+  }
+
+  if (providerId === "custom") {
+    const client = createCustomSmsClient({
+      entries: config.entries,
+      fetchImpl: options.fetchImpl,
+      acquireEntry: options.acquireCustomSmsEntry,
+    });
+    return {
+      id: "custom",
+      name: "自定义接码",
+      apiKey: "",
+      serviceLabel: `${client.entryCount} 个号码`,
+      getNumber: () => client.getNumber(),
+      getSms: (requestId) => client.getSms(requestId),
       release: (requestId) => client.release(requestId),
     };
   }
