@@ -54,15 +54,22 @@ try {
     assert.deepEqual(await realStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
   }
 
-  let macPayload = "";
+  let macKey = "";
   const macStore = createCredentialStore({
     platform: "darwin",
-    securityRunner: async (args, input) => {
+    macRoot: path.join(tempRoot, "mac"),
+    securityRunner: async (args, input = "") => {
       if (args[0] === "add-generic-password") {
-        macPayload = input.trim().split("\n")[0];
+        assert.equal(args.at(-1), "-w");
+        assert.equal(args.some((value) => value.includes(credentials.password)), false);
+        const enteredKeys = input.trim().split(/\r?\n/);
+        assert.equal(enteredKeys.length, 2);
+        assert.equal(enteredKeys[0], enteredKeys[1]);
+        macKey = enteredKeys[0];
+        assert.equal(Buffer.from(macKey, "base64").length, 32);
         return { code: 0, stdout: "", stderr: "" };
       }
-      if (args[0] === "find-generic-password") return { code: 0, stdout: macPayload, stderr: "" };
+      if (args[0] === "find-generic-password") return { code: 0, stdout: macKey, stderr: "" };
       if (args[0] === "delete-generic-password") return { code: 0, stdout: "", stderr: "" };
       return { code: 1, stdout: "", stderr: "unexpected command" };
     },
@@ -70,6 +77,27 @@ try {
   await macStore.save(email, credentials);
   assert.deepEqual(await macStore.load(email), credentials);
   await macStore.delete(email);
+
+  const truncatedPayload = JSON.stringify({
+    version: 2,
+    password: credentials.password,
+    totpSecret: credentials.totpSecret,
+    proxyUrl: credentials.proxyUrl.repeat(5),
+  }).slice(0, 128);
+  const legacyMacStore = createCredentialStore({
+    platform: "darwin",
+    macRoot: path.join(tempRoot, "legacy-mac"),
+    securityRunner: async (args) => (
+      args[0] === "find-generic-password"
+        ? { code: 0, stdout: truncatedPayload, stderr: "" }
+        : { code: 0, stdout: "", stderr: "" }
+    ),
+  });
+  assert.deepEqual(await legacyMacStore.load(email), {
+    password: credentials.password,
+    totpSecret: credentials.totpSecret,
+    proxyUrl: "",
+  });
 
   const unsupportedStore = createCredentialStore({ platform: "linux" });
   await assert.rejects(

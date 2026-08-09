@@ -30,6 +30,7 @@ const child = spawn(process.execPath, [
   env: {
     ...process.env,
     ONBOARDING_OUTPUT_ROOT: outputRoot,
+    TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-queue-protocol.mjs"),
   },
   stdio: ["ignore", "pipe", "pipe"],

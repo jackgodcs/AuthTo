@@ -58,6 +58,8 @@ const child = spawn(process.execPath, [
     ...process.env,
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
+    PROXY_CONNECTION_RETRY_BASE_MS: "1",
+    TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
   },
   stdio: ["ignore", "pipe", "pipe"],
   windowsHide: true,
@@ -120,6 +122,104 @@ try {
   const profileCreated = await profileResponse.json();
   const profileJob = await waitForJob(headers, profileCreated.job.id, (value) => value.status === "completed");
   assert.equal(profileJob.canDownload, true);
+
+  const setupTotpResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/setup-2fa`, {
+    method: "POST",
+    headers,
+    body: "{}",
+  });
+  assert.equal(setupTotpResponse.status, 200, await setupTotpResponse.text());
+  const totpCompleted = await waitForJob(
+    headers,
+    profileJob.id,
+    (value) => value.status === "completed" && value.hasTotpKey,
+  );
+  assert.equal(totpCompleted.canDownload, true);
+  assert.equal(totpCompleted.totpSetupSecret, null);
+  const setupLogs = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/logs`, { headers }).then((response) => response.json());
+  assert.match(setupLogs.logs, /Generated a current 6-digit activation code/);
+  assert.doesNotMatch(setupLogs.logs, /NB2W45DFOIZAQWER/);
+  const downloadAfterTotp = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/download`, { headers });
+  assert.equal(downloadAfterTotp.status, 200);
+
+  const batchTotpResponse = await fetch(`${baseUrl}/api/jobs/setup-2fa-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId, profileJob.id] }),
+  });
+  const batchTotpText = await batchTotpResponse.text();
+  assert.equal(batchTotpResponse.status, 200, batchTotpText);
+  const batchTotp = JSON.parse(batchTotpText);
+  assert.equal(batchTotp.started, 1);
+  assert.equal(batchTotp.skipped, 1);
+  await waitForJob(headers, jobId, (value) => value.status === "completed" && value.hasTotpKey);
+  const updatedSourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId] }),
+  });
+  assert.equal(updatedSourceResponse.status, 200);
+  assert.equal(
+    (await updatedSourceResponse.text()).replace(/^\uFEFF/, "").trim(),
+    "cross-platform@example.com--------NB2W45DFOIZAQWER",
+  );
+  const reimportUpdatedSourceResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ text: "cross-platform@example.com--------NB2W45DFOIZAQWER" }),
+  });
+  const reimportUpdatedSourceText = await reimportUpdatedSourceResponse.text();
+  assert.equal(reimportUpdatedSourceResponse.status, 201, reimportUpdatedSourceText);
+  const reimportUpdatedSource = JSON.parse(reimportUpdatedSourceText);
+  assert.equal(reimportUpdatedSource.created, 0);
+  assert.equal(reimportUpdatedSource.updated, 1);
+  assert.equal(reimportUpdatedSource.jobs[0].hasTotpKey, true);
+
+  const reloginResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/relogin`, {
+    method: "POST",
+    headers,
+    body: "{}",
+  });
+  assert.equal(reloginResponse.status, 200, await reloginResponse.text());
+  const reloggedJob = await waitForJob(
+    headers,
+    jobId,
+    (value) => value.status === "completed" && value.canForceRelogin,
+  );
+  assert.equal(reloggedJob.hasTotpKey, true);
+  const reloginLogs = await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers }).then((response) => response.json());
+  assert.match(reloginLogs.logs, /\[relogin\].*跳过刷新令牌并强制重新登录/);
+
+  const mfaPromptResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "mfa-prompt@example.com" }),
+  });
+  assert.equal(mfaPromptResponse.status, 201);
+  const mfaPromptJobId = (await mfaPromptResponse.json()).job.id;
+  const mfaPromptJob = await waitForJob(headers, mfaPromptJobId, (value) => value.status === "mfa_otp");
+  assert.equal(mfaPromptJob.prompt, "请输入 6 位 2FA 验证码");
+  const mfaInputResponse = await fetch(`${baseUrl}/api/jobs/${mfaPromptJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "mfa_otp", value: "123456" }),
+  });
+  assert.equal(mfaInputResponse.status, 200, await mfaInputResponse.text());
+  await waitForJob(headers, mfaPromptJobId, (value) => value.status === "completed");
+
+  const batchReloginResponse = await fetch(`${baseUrl}/api/jobs/relogin-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId, profileJob.id] }),
+  });
+  const batchReloginText = await batchReloginResponse.text();
+  assert.equal(batchReloginResponse.status, 200, batchReloginText);
+  const batchRelogin = JSON.parse(batchReloginText);
+  assert.equal(batchRelogin.started, 2);
+  assert.equal(batchRelogin.skipped, 0);
+  await Promise.all([jobId, profileJob.id].map((id) => (
+    waitForJob(headers, id, (value) => value.status === "completed" && value.canForceRelogin)
+  )));
 
   const groupsResponse = await fetch(`${baseUrl}/api/sub2api/options`, {
     method: "POST",
@@ -200,16 +300,104 @@ try {
     `password-mail@example.com----test-password----${mailApiUrl}`,
   ]);
 
+  const preserveCredentialsResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ text: "password-mail-totp@example.com" }),
+  });
+  assert.equal(preserveCredentialsResponse.status, 201, await preserveCredentialsResponse.text());
+  const preservedSourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [batch.jobs[1].id] }),
+  });
+  assert.equal(preservedSourceResponse.status, 200);
+  assert.match(
+    (await preservedSourceResponse.text()).replace(/^\uFEFF/, ""),
+    new RegExp(`password-mail-totp@example\\.com----test-password-2----.*----JBSWY3DPEHPK3PXP`),
+  );
+
+  const rotatingProxy = "socks5h://account-region-JP-sid-initial-t-20:password@proxy.example:5000";
+  const proxyRetryResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "proxy-risk-retry@example.com", proxyUrl: rotatingProxy }),
+  });
+  assert.equal(proxyRetryResponse.status, 201);
+  const proxyRetryCreated = await proxyRetryResponse.json();
+  const proxyRetryCompleted = await waitForJob(
+    headers,
+    proxyRetryCreated.job.id,
+    (value) => value.status === "completed",
+  );
+  assert.equal(proxyRetryCompleted.canDownload, true);
+  const proxyRetryLogs = await fetch(`${baseUrl}/api/jobs/${proxyRetryCreated.job.id}/logs`, { headers }).then((response) => response.json());
+  assert.match(proxyRetryLogs.logs, /正在检测第 1\/10 个新代理会话/);
+  assert.match(proxyRetryLogs.logs, /正在检测第 3\/10 个新代理会话/);
+
+  const proxyAlwaysResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "proxy-risk-always@example.com", proxyUrl: rotatingProxy }),
+  });
+  assert.equal(proxyAlwaysResponse.status, 201);
+  const proxyAlwaysCreated = await proxyAlwaysResponse.json();
+  const proxyAlwaysFailed = await waitForJob(
+    headers,
+    proxyAlwaysCreated.job.id,
+    (value) => value.status === "failed",
+  );
+  assert.match(proxyAlwaysFailed.lastError || "", /自动更换 10 次/);
+  const proxyAlwaysLogs = await fetch(`${baseUrl}/api/jobs/${proxyAlwaysCreated.job.id}/logs`, { headers }).then((response) => response.json());
+  assert.equal((proxyAlwaysLogs.logs.match(/个新代理会话/g) || []).length, 10);
+  assert.doesNotMatch(proxyAlwaysLogs.logs, /正在检测第 11\//);
+
+  const proxyConnectionResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "proxy-connection-retry@example.com", proxyUrl: rotatingProxy }),
+  });
+  assert.equal(proxyConnectionResponse.status, 201);
+  const proxyConnectionCreated = await proxyConnectionResponse.json();
+  await waitForJob(headers, proxyConnectionCreated.job.id, (value) => value.status === "completed");
+  const proxyConnectionLogs = await fetch(`${baseUrl}/api/jobs/${proxyConnectionCreated.job.id}/logs`, { headers })
+    .then((response) => response.json());
+  assert.match(proxyConnectionLogs.logs, /HTTP 检测次数仍为 0\/10；连接失败 1\/20/);
+  assert.equal((proxyConnectionLogs.logs.match(/个新代理会话/g) || []).length, 1);
+
+  const proxyConnectionAlwaysResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "proxy-connection-always@example.com", proxyUrl: rotatingProxy }),
+  });
+  assert.equal(proxyConnectionAlwaysResponse.status, 201);
+  const proxyConnectionAlwaysCreated = await proxyConnectionAlwaysResponse.json();
+  const proxyConnectionAlwaysFailed = await waitForJob(
+    headers,
+    proxyConnectionAlwaysCreated.job.id,
+    (value) => value.status === "failed",
+  );
+  assert.match(proxyConnectionAlwaysFailed.lastError || "", /连续失败 20 次/);
+
   const deleteResponse = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ ids: [jobId, profileJob.id, ...batch.jobs.map((item) => item.id)] }),
+    body: JSON.stringify({ ids: [
+      jobId,
+      profileJob.id,
+      mfaPromptJobId,
+      ...batch.jobs.map((item) => item.id),
+      proxyRetryCreated.job.id,
+      proxyAlwaysCreated.job.id,
+      proxyConnectionCreated.job.id,
+      proxyConnectionAlwaysCreated.job.id,
+    ] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 4);
+  assert.equal(deleted.deleted, 9);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
@@ -20,6 +21,60 @@ try {
       return;
     }
     await writeCompleted(args.sub2apiOut || args.refreshSub2api, email, "refreshed");
+    return;
+  }
+
+  if (args.setupTotp) {
+    const secret = "NB2W45DFOIZAQWER";
+    await fs.mkdir(path.dirname(args.totpResult), { recursive: true });
+    await fs.writeFile(args.totpResult, `${JSON.stringify({
+      version: 1,
+      already_enabled: false,
+      activation_mode: "automatic",
+      activation_succeeded: true,
+      email: args.email,
+      secret,
+      otpauth_uri: `otpauth://totp/OpenAI%3A${encodeURIComponent(args.email)}?secret=${secret}&issuer=OpenAI`,
+    }, null, 2)}\n`, { mode: 0o600 });
+    console.log("[2fa-setup-ready] 2FA key created; activating it automatically.");
+    console.log("[2fa] Generated a current 6-digit activation code from the new 2FA key.");
+    console.log("[ok] 2FA setup activated");
+    return;
+  }
+
+  if (["proxy-risk-retry@example.com", "proxy-risk-always@example.com"].includes(args.email)) {
+    console.log(`[proxy-session-attempt] ${crypto.randomUUID()}`);
+    const attemptPath = `${args.sub2apiOut}.proxy-risk-attempt`;
+    let attempt = 0;
+    try {
+      attempt = Number(await fs.readFile(attemptPath, "utf8")) || 0;
+    } catch {}
+    attempt += 1;
+    await fs.writeFile(attemptPath, String(attempt));
+    if (args.email === "proxy-risk-always@example.com" || attempt <= 2) {
+      console.error("[proxy-risk-retry] PROXY_RISK_CONTROL: simulated security-check page");
+      process.exitCode = 1;
+      return;
+    }
+    await writeCompleted(args.sub2apiOut, args.email, "proxy-retried");
+    return;
+  }
+
+  if (["proxy-connection-retry@example.com", "proxy-connection-always@example.com"].includes(args.email)) {
+    const attemptPath = `${args.sub2apiOut}.proxy-connection-attempt`;
+    let attempt = 0;
+    try {
+      attempt = Number(await fs.readFile(attemptPath, "utf8")) || 0;
+    } catch {}
+    attempt += 1;
+    await fs.writeFile(attemptPath, String(attempt));
+    if (args.email === "proxy-connection-always@example.com" || attempt === 1) {
+      console.error("[proxy-risk-retry] PROXY_CONNECTION_RETRY: simulated TLS connection failure");
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`[proxy-session-attempt] ${crypto.randomUUID()}`);
+    await writeCompleted(args.sub2apiOut, args.email, "proxy-connected");
     return;
   }
 
@@ -125,6 +180,13 @@ try {
     return;
   }
 
+  if (args.email === "mfa-prompt@example.com") {
+    process.stdout.write("[mfa] TOTP 2FA challenge reached.\n2FA OTP (6 digits, q=quit): ");
+    await rl.question("");
+    await writeCompleted(args.sub2apiOut, args.email, "mfa-login");
+    return;
+  }
+
   await writeCompleted(args.sub2apiOut, args.email);
 } finally {
   rl.close();
@@ -168,6 +230,8 @@ function parseArgs(argv) {
     else if (argv[index] === "--refresh-sub2api") parsed.refreshSub2api = argv[++index];
     else if (argv[index] === "--checkpoint") parsed.checkpoint = argv[++index];
     else if (argv[index] === "--resume-checkpoint") parsed.resumeCheckpoint = argv[++index];
+    else if (argv[index] === "--setup-totp") parsed.setupTotp = true;
+    else if (argv[index] === "--totp-result") parsed.totpResult = argv[++index];
   }
   return parsed;
 }

@@ -56,6 +56,10 @@ try {
   assert.match(decodeURIComponent(rotated.username), /^account-region-JP-sid-[A-Za-z0-9]{8}-t-20$/);
   assert.notEqual(decodeURIComponent(rotated.username), "account-region-JP-sid-oldValue-t-20");
   assert.equal(rotated.password, "password");
+  const rotatedSessions = new Set(Array.from({ length: 10 }, () => (
+    decodeURIComponent(new URL(rotateProxySession(original)).username)
+  )));
+  assert.equal(rotatedSessions.size, 10);
 
   const kookeey = "socks5h://account-id:proxy-secret-JP-91977332-20m@proxy.example.com:1000";
   assert.equal(proxySupportsSessionRotation(kookeey), true);

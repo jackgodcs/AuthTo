@@ -46,12 +46,14 @@ try {
     checkpointPath,
     "--verbose",
   ], [
+    { pattern: /Email OTP \(r=resend/, value: "r" },
     { pattern: /Email OTP \(r=resend/, value: "123456" },
     { pattern: /Phone number, E\.164 format/, value: "+60123456789" },
     { pattern: /Phone OTP \(r=resend/, value: "654321" },
   ]);
   assert.equal(login.code, 0, processFailure("protocol login", login));
-  assert.equal(login.completedInputSteps, 3, processFailure("protocol input", login));
+  assert.equal(login.completedInputSteps, 4, processFailure("protocol input", login));
+  assert.match(login.output, /Resend request accepted/);
   assert.match(login.output, /Saved sub2api import/);
   assert.equal(await fileExists(checkpointPath), false);
 
@@ -74,6 +76,90 @@ try {
   const refreshedExport = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(refreshedExport.type, "sub2api-data");
   assert.equal(refreshedExport.accounts?.[0]?.credentials?.refresh_token, "mock-refresh-token");
+
+  const riskOutputPath = path.join(tempRoot, "risk-sub2api.json");
+  const riskLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "risk-control@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    riskOutputPath,
+    "--verbose",
+  ]);
+  assert.equal(riskLogin.code, 1, processFailure("risk-control detection", riskLogin));
+  assert.match(riskLogin.output, /\[proxy-risk-retry\]/);
+  assert.doesNotMatch(riskLogin.output, /Email OTP \(r=resend/);
+  assert.equal(await fileExists(riskOutputPath), false);
+
+  const unexpectedPageOutputPath = path.join(tempRoot, "unexpected-page-sub2api.json");
+  const unexpectedPageLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "unexpected-page@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    unexpectedPageOutputPath,
+    "--verbose",
+  ]);
+  assert.equal(unexpectedPageLogin.code, 1, processFailure("unexpected login page", unexpectedPageLogin));
+  assert.match(unexpectedPageLogin.output, /UNEXPECTED_LOGIN_PAGE/);
+  assert.doesNotMatch(unexpectedPageLogin.output, /Email OTP \(r=resend/);
+  assert.equal(await fileExists(unexpectedPageOutputPath), false);
+
+  const bannedOutputPath = path.join(tempRoot, "banned-sub2api.json");
+  const bannedLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "banned@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    bannedOutputPath,
+    "--verbose",
+  ]);
+  assert.equal(bannedLogin.code, 1, processFailure("deactivated account", bannedLogin));
+  assert.match(bannedLogin.output, /Your account has been deactivated/);
+  assert.doesNotMatch(bannedLogin.output, /\[proxy-risk-retry\]/);
+  assert.doesNotMatch(bannedLogin.output, /Email OTP \(r=resend/);
+  assert.equal(await fileExists(bannedOutputPath), false);
+
+  const securityCheckOutputPath = path.join(tempRoot, "security-check-sub2api.json");
+  const securityCheckLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "security-check@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    securityCheckOutputPath,
+    "--verbose",
+  ], [
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+    { pattern: /Phone number, E\.164 format/, value: "+60123456789" },
+  ]);
+  assert.equal(securityCheckLogin.code, 1, processFailure("phone security check", securityCheckLogin));
+  assert.match(securityCheckLogin.output, /\[security-check-required\]/);
+  assert.doesNotMatch(securityCheckLogin.output, /\[proxy-risk-retry\]/);
+  assert.equal(await fileExists(securityCheckOutputPath), false);
 
   const profileCheckpointPath = path.join(tempRoot, "profile-checkpoint.json");
   const profileOutputPath = path.join(tempRoot, "profile-sub2api.json");

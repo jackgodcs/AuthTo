@@ -31,7 +31,24 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, { url: `${publicBase}/api/accounts/authorize` });
   }
   if (req.method === "GET" && url.pathname === "/api/accounts/authorize") {
+    if (lastLoginHint === "risk-control@example.com") {
+      return sendText(res, 403, "<html><title>Just a moment...</title><div id=\"challenge-platform\"></div></html>", "text/html");
+    }
+    if (lastLoginHint === "unexpected-page@example.com") {
+      return redirect(res, `${publicBase}/device-confirmation`);
+    }
+    if (lastLoginHint === "banned@example.com") {
+      return sendJson(res, 403, {
+        error: {
+          message: "Your account has been deactivated.",
+          code: "account_deactivated",
+        },
+      });
+    }
     return redirect(res, `${publicBase}/email-verification`);
+  }
+  if (req.method === "GET" && url.pathname === "/device-confirmation") {
+    return sendText(res, 200, "<html><title>Confirm this device</title></html>", "text/html");
   }
   if (req.method === "GET" && url.pathname === "/email-verification") {
     return sendText(res, 200, "<html><title>Check your inbox</title></html>", "text/html");
@@ -48,6 +65,12 @@ const server = http.createServer(async (req, res) => {
       continue_url: `${publicBase}/web-callback`,
       "oai-client-auth-session": { email_verified: true },
     });
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/resend") {
+    if (!/^application\/json\b/i.test(String(req.headers["content-type"] || "")) || JSON.stringify(parseJson(body)) !== "{}") {
+      return sendJson(res, 400, { error: { message: "resend must use an empty JSON body" } });
+    }
+    return sendJson(res, 200, { success: true });
   }
   if (req.method === "POST" && url.pathname === "/backend-api/sentinel/req") {
     const payload = JSON.parse(body || "{}");
@@ -102,6 +125,14 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/add-phone/send") {
     const payload = JSON.parse(body || "{}");
+    if (lastLoginHint === "security-check@example.com") {
+      return sendJson(res, 409, {
+        error: {
+          message: "Your sign-in session is no longer valid. Please start over to continue.",
+          code: "invalid_state",
+        },
+      });
+    }
     if (!/\badd_phone_ready=1\b/.test(req.headers.cookie || "")) {
       return sendJson(res, 409, { error: { message: "missing add-phone page state", code: "invalid_state" } });
     }

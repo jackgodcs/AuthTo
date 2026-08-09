@@ -8,6 +8,7 @@ import {
   ChevronDown,
   ChevronUp,
   CircleAlert,
+  Copy,
   Download,
   FileText,
   Filter,
@@ -15,6 +16,7 @@ import {
   KeyRound,
   ListPlus,
   LoaderCircle,
+  LogIn,
   Mail,
   MailCheck,
   Plus,
@@ -151,7 +153,13 @@ function App() {
     && downloadableSelectedCount > 0;
   const canReauthorizeSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && selectedJobs.every((job) => job.canRegenerate || job.canRetry);
+  const forceReloginSelectedCount = selectedJobs.filter((job) => job.canForceRelogin).length;
+  const canForceReloginSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && forceReloginSelectedCount > 0;
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
+  const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
+  const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && totpSetupSelectedCount > 0;
 
   function openSmsSettings() {
     const draft = withSmsProviderDefaults(smsProviderDefinitions, smsSettings);
@@ -449,6 +457,48 @@ function App() {
     }
   }
 
+  async function setupTotpSelected() {
+    if (!canSetupTotpSelected || batchAction) return;
+    const skipped = selectedJobIds.size - totpSetupSelectedCount;
+    const message = `确定为选中的 ${totpSetupSelectedCount} 个账号设置 2FA 吗？${skipped ? `另有 ${skipped} 个账号不符合条件，将自动跳过。` : ""}`;
+    if (!window.confirm(message)) return;
+    setBatchAction("setup-2fa");
+    try {
+      const data = await apiFetch(token, "/api/jobs/setup-2fa-batch", {
+        method: "POST",
+        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+      });
+      setUploadNotice(`已开始为 ${data.started} 个账号设置 2FA${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function forceReloginSelected() {
+    if (!canForceReloginSelected || batchAction) return;
+    const skipped = selectedJobIds.size - forceReloginSelectedCount;
+    const message = `确定让选中的 ${forceReloginSelectedCount} 个账号跳过刷新令牌，重新登录并授权吗？${skipped ? `另有 ${skipped} 个进行中账号将自动跳过。` : ""}`;
+    if (!window.confirm(message)) return;
+    setBatchAction("relogin");
+    try {
+      const data = await apiFetch(token, "/api/jobs/relogin-batch", {
+        method: "POST",
+        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+      });
+      setUploadNotice(`已开始重新登录并授权 ${data.started} 个账号${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function exportSelectedSource() {
     if (!selectedJobIds.size || batchAction) return;
     setBatchAction("source");
@@ -672,6 +722,18 @@ function App() {
                 {batchAction === "reauthorize" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
                 批量重新授权
               </button>
+              {features.forceRelogin && (
+                <button type="button" className="relogin-button bulk-button" onClick={forceReloginSelected} disabled={!canForceReloginSelected || Boolean(batchAction)}>
+                  {batchAction === "relogin" ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
+                  批量重新登录并授权
+                </button>
+              )}
+              {features.totpSetup && (
+                <button type="button" className="secondary-button bulk-button" onClick={setupTotpSelected} disabled={!canSetupTotpSelected || Boolean(batchAction)}>
+                  {batchAction === "setup-2fa" ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+                  批量设置 2FA
+                </button>
+              )}
               <button type="button" className="delete-button" onClick={deleteSelected} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                 {batchAction === "delete" ? <LoaderCircle className="spin" size={16} /> : <Trash2 size={16} />}
                 批量删除
@@ -717,6 +779,8 @@ function App() {
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
+                    totpSetupAvailable={Boolean(features.totpSetup)}
+                    forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
                   />
                   {expandedJobId === job.id && (
@@ -1086,7 +1150,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, forceReloginAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1149,6 +1213,45 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
+  async function forceRelogin() {
+    setSubmitting(true);
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/relogin`, {
+        method: "POST",
+        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+      });
+      onError("");
+    } catch (requestError) {
+      onError(requestError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function setupTotp() {
+    setSubmitting(true);
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/setup-2fa`, {
+        method: "POST",
+        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+      });
+      onError("");
+    } catch (requestError) {
+      onError(requestError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function copyTotpSecret() {
+    try {
+      await navigator.clipboard.writeText(job.totpSetupSecret || "");
+      onError("");
+    } catch {
+      onError("无法自动复制，请手动选择 2FA 密钥");
+    }
+  }
+
   async function requestSmsNumber() {
     if (!smsProvider.ready) return;
     setSubmitting(true);
@@ -1202,6 +1305,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       <td className="step-cell">
         <div className="prompt-line">{job.prompt}</div>
         {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
+        {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
           <div className="phone-target"><Smartphone size={13} />当前手机号：<strong>{job.currentPhone}</strong></div>
@@ -1211,6 +1315,15 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <div className={`sms-status ${job.smsStatus === "error" ? "error" : ""}`}>
             {job.smsStatus === "error" ? <CircleAlert size={13} /> : <PhoneIncoming size={13} />}
             <span>{smsStatusText(job)}</span>
+          </div>
+        )}
+        {job.status === "totp_setup_otp" && job.totpSetupSecret && (
+          <div className="totp-setup-secret">
+            <span>2FA 密钥</span>
+            <code>{job.totpSetupSecret}</code>
+            <button type="button" className="icon-button" onClick={copyTotpSecret} title="复制 2FA 密钥">
+              <Copy size={15} />
+            </button>
           </div>
         )}
         {inputConfig && (
@@ -1286,9 +1399,20 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
             </button>
           )}
           {job.canRegenerate && (
-            <button type="button" className="regenerate-button" onClick={regenerate} disabled={submitting} title="优先使用刷新令牌直接生成新授权">
+            <button type="button" className="regenerate-button" onClick={regenerate} disabled={submitting} title="重新授权：优先使用刷新令牌，失效后自动重新登录">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}
-              重新生成
+              重新授权
+            </button>
+          )}
+          {forceReloginAvailable && job.canForceRelogin && (
+            <button type="button" className="relogin-button" onClick={forceRelogin} disabled={submitting} title="跳过刷新令牌和旧检查点，完整重新登录后自动授权">
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <LogIn size={16} />}
+              重新登录并授权
+            </button>
+          )}
+          {totpSetupAvailable && job.canSetupTotp && (
+            <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
             </button>
           )}
           {job.canRetry && (
@@ -1348,6 +1472,8 @@ function StatusBadge({ status }) {
     working: ["处理中", <LoaderCircle className="spin" size={14} />],
     password: ["待密码", <KeyRound size={14} />],
     mfa_otp: ["待 2FA", <ShieldCheck size={14} />],
+    totp_starting: ["准备 2FA", <LoaderCircle className="spin" size={14} />],
+    totp_setup_otp: ["激活 2FA", <ShieldCheck size={14} />],
     email_otp: ["待邮箱码", <Mail size={14} />],
     phone: ["待手机号", <Smartphone size={14} />],
     phone_otp: ["待手机码", <Smartphone size={14} />],
@@ -1401,6 +1527,9 @@ function getInputConfig(status, currentPhone) {
   }
   if (status === "mfa_otp") {
     return { action: "mfa_otp", placeholder: "6 位 2FA 验证码", submitLabel: "提交 2FA 验证码", inputMode: "numeric", icon: <ShieldCheck size={15} /> };
+  }
+  if (status === "totp_setup_otp") {
+    return { action: "totp_setup_otp", placeholder: "新 2FA 的 6 位验证码", submitLabel: "激活新的 2FA", inputMode: "numeric", icon: <ShieldCheck size={15} /> };
   }
   if (status === "email_otp") {
     return { action: "email_otp", placeholder: "6 位邮箱验证码", submitLabel: "提交邮箱验证码", inputMode: "numeric", icon: <Mail size={15} /> };

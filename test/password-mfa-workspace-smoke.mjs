@@ -18,6 +18,7 @@ const skipOutputPath = path.join(tempRoot, "skip-sub2api-import-oauth.json");
 const skipCheckpointPath = path.join(tempRoot, "skip-login-checkpoint.json");
 const directOutputPath = path.join(tempRoot, "direct-sub2api-import-oauth.json");
 const directCheckpointPath = path.join(tempRoot, "direct-login-checkpoint.json");
+const totpResultPath = path.join(tempRoot, "totp-setup-result.json");
 const mockServer = spawn(process.execPath, [
   path.join(projectRoot, "test", "mock-password-mfa-server.mjs"),
   String(port),
@@ -139,6 +140,29 @@ try {
 
   const directExport = JSON.parse(await fs.readFile(directOutputPath, "utf8"));
   assert.equal(directExport.accounts?.[0]?.credentials?.email, "direct-codex-callback@example.com");
+
+  const setupTotp = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email", "setup-totp@example.com",
+    "--setup-totp",
+    "--totp-result", totpResultPath,
+    "--chatgpt-base", baseUrl,
+    "--auth-base", baseUrl,
+    "--verbose",
+  ], {
+    CHATGPT_LOGIN_PASSWORD: "local-test-password",
+  });
+  assert.equal(setupTotp.code, 0, processFailure(setupTotp));
+  assert.match(setupTotp.output, /\[2fa-setup-ready\]/);
+  assert.match(setupTotp.output, /Generated a current 6-digit activation code/);
+  assert.doesNotMatch(setupTotp.output, /2FA setup OTP \(6 digits/);
+  assert.match(setupTotp.output, /\[ok\] 2FA setup activated/);
+  assert.match(setupTotp.output, /follow-up status check failed/);
+  assert.doesNotMatch(setupTotp.output, /NB2W45DFOIZAQWER/);
+  const setupResult = JSON.parse(await fs.readFile(totpResultPath, "utf8"));
+  assert.equal(setupResult.secret, "NB2W45DFOIZAQWER");
+  assert.equal(setupResult.activation_mode, "automatic");
+  assert.equal(setupResult.activation_succeeded, true);
   console.log("password/email OTP + 2FA workspace smoke tests passed");
 } catch (error) {
   error.message = `${error.message}\nMock server output:\n${serverLogs}`;

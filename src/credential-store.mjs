@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 const KEYCHAIN_SERVICE = "com.local.chatgpt-onboarding.credentials";
+const MAC_CREDENTIAL_ROOT = path.join(os.homedir(), "Library", "Application Support", "toSub2", "credentials");
 const WINDOWS_ENTROPY = "toSub2.credentials.v1";
 
 const WINDOWS_PROTECT_SCRIPT = String.raw`
@@ -42,6 +43,7 @@ $plainBytes = [Security.Cryptography.ProtectedData]::Unprotect(
 export function createCredentialStore(options = {}) {
   const platform = options.platform || process.platform;
   const windowsRoot = path.resolve(options.windowsRoot || defaultWindowsCredentialRoot());
+  const macRoot = path.resolve(options.macRoot || process.env.TOSUB2_MAC_CREDENTIAL_ROOT || MAC_CREDENTIAL_ROOT);
   const securityRunner = options.securityRunner || runSecurity;
   const powerShellRunner = options.powerShellRunner || runPowerShell;
 
@@ -54,18 +56,7 @@ export function createCredentialStore(options = {}) {
         proxyUrl: typeof credentials.proxyUrl === "string" ? credentials.proxyUrl : "",
       });
       if (platform === "darwin") {
-        const result = await securityRunner([
-          "add-generic-password",
-          "-a",
-          credentialAccount(email),
-          "-s",
-          KEYCHAIN_SERVICE,
-          "-U",
-          "-w",
-        ], `${payload}\n${payload}\n`);
-        if (result.code !== 0) {
-          throw credentialError(500, "无法将登录凭据和代理配置保存到 macOS Keychain（钥匙串），请先解锁登录钥匙串");
-        }
+        await saveMacCredential(macRoot, email, payload, securityRunner);
         return;
       }
       if (platform === "win32") {
@@ -88,15 +79,7 @@ export function createCredentialStore(options = {}) {
 
     async load(email) {
       if (platform === "darwin") {
-        const result = await securityRunner([
-          "find-generic-password",
-          "-a",
-          credentialAccount(email),
-          "-s",
-          KEYCHAIN_SERVICE,
-          "-w",
-        ]);
-        return result.code === 0 ? parseCredentialPayload(result.stdout) : emptyCredentials();
+        return loadMacCredential(macRoot, email, securityRunner);
       }
       if (platform === "win32") {
         let cipherText;
@@ -128,6 +111,7 @@ export function createCredentialStore(options = {}) {
         if (![0, 44].includes(result.code)) {
           throw credentialError(500, "无法从 macOS Keychain（钥匙串）删除该邮箱的登录凭据");
         }
+        await fs.rm(macCredentialPath(macRoot, email), { force: true });
         return;
       }
       if (platform === "win32") {
@@ -153,20 +137,150 @@ function windowsCredentialPath(root, email) {
   return path.join(root, `${id}.dpapi`);
 }
 
+function macCredentialPath(root, email) {
+  const id = crypto.createHash("sha256").update(credentialAccount(email)).digest("hex");
+  return path.join(root, `${id}.enc`);
+}
+
+async function saveMacCredential(root, email, payload, securityRunner) {
+  const filePath = macCredentialPath(root, email);
+  const existingFile = await fileExists(filePath);
+  const keychainValue = await readMacKeychainValue(email, securityRunner);
+  let key = keychainValue.key;
+  if (!key) {
+    if (existingFile) {
+      throw credentialError(500, "macOS Keychain（钥匙串）中的加密密钥无法读取，已保留现有凭据文件");
+    }
+    key = crypto.randomBytes(32);
+    const keyResult = await securityRunner([
+      "add-generic-password",
+      "-a",
+      credentialAccount(email),
+      "-s",
+      KEYCHAIN_SERVICE,
+      "-U",
+      "-w",
+    ], `${key.toString("base64")}\n${key.toString("base64")}\n`);
+    if (keyResult.code !== 0) {
+      throw credentialError(500, "无法将登录凭据密钥保存到 macOS Keychain（钥匙串），请先解锁登录钥匙串");
+    }
+  }
+  const encrypted = encryptCredentialPayload(key, payload);
+  await fs.mkdir(root, { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, `${JSON.stringify(encrypted)}\n`, { mode: 0o600 });
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw credentialError(500, `无法写入 macOS 凭据文件：${error.message}`);
+  }
+}
+
+async function loadMacCredential(root, email, securityRunner) {
+  let encrypted;
+  try {
+    encrypted = JSON.parse(await fs.readFile(macCredentialPath(root, email), "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") return emptyCredentials();
+    const legacy = await readMacKeychainValue(email, securityRunner);
+    return legacy.payload ? parseCredentialPayload(legacy.payload) : emptyCredentials();
+  }
+  const keychainValue = await readMacKeychainValue(email, securityRunner);
+  if (!keychainValue.key) return emptyCredentials();
+  try {
+    return parseCredentialPayload(decryptCredentialPayload(keychainValue.key, encrypted));
+  } catch {
+    return emptyCredentials();
+  }
+}
+
+async function readMacKeychainValue(email, securityRunner) {
+  const result = await securityRunner([
+    "find-generic-password",
+    "-a",
+    credentialAccount(email),
+    "-s",
+    KEYCHAIN_SERVICE,
+    "-w",
+  ]);
+  if (result.code !== 0) return { key: null, payload: null };
+  const value = String(result.stdout || "").trim();
+  if (/^[A-Za-z0-9+/]{40,}={0,2}$/.test(value)) {
+    try {
+      const key = Buffer.from(value, "base64");
+      if (key.length === 32) return { key, payload: null };
+    } catch {}
+  }
+  return { key: null, payload: value };
+}
+
+function encryptCredentialPayload(key, payload) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(payload, "utf8"), cipher.final()]);
+  return {
+    version: 1,
+    iv: iv.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64"),
+    data: ciphertext.toString("base64"),
+  };
+}
+
+function decryptCredentialPayload(key, encrypted) {
+  if (encrypted?.version !== 1) throw new Error("Unsupported encrypted credential version");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(encrypted.iv, "base64"));
+  decipher.setAuthTag(Buffer.from(encrypted.tag, "base64"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(encrypted.data, "base64")),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
+async function fileExists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function credentialAccount(email) {
   return String(email || "").trim().toLowerCase();
 }
 
 function parseCredentialPayload(value) {
+  const raw = String(value || "").trim();
   try {
-    const data = JSON.parse(String(value || "").trim());
+    const data = JSON.parse(raw);
     return {
       password: typeof data.password === "string" ? data.password : "",
       totpSecret: typeof data.totpSecret === "string" ? data.totpSecret : "",
       proxyUrl: typeof data.proxyUrl === "string" ? data.proxyUrl : "",
     };
   } catch {
-    return emptyCredentials();
+    // Older macOS writes used the interactive `security -w` prompt, which
+    // truncated long payloads at 128 bytes. Recover fields that were fully
+    // written before the truncated tail so users do not lose passwords or
+    // TOTP keys after upgrading.
+    return {
+      password: extractCompleteJsonString(raw, "password"),
+      totpSecret: extractCompleteJsonString(raw, "totpSecret"),
+      proxyUrl: extractCompleteJsonString(raw, "proxyUrl"),
+    };
+  }
+}
+
+function extractCompleteJsonString(raw, key) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`"${escapedKey}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`).exec(raw);
+  if (!match) return "";
+  try {
+    const value = JSON.parse(match[1]);
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
   }
 }
 

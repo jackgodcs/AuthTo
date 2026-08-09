@@ -13,6 +13,7 @@ const DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const DEFAULT_OUT = "tmp/chatgpt-protocol-session.json";
 const DEFAULT_SUB2API_OUT = "tmp/sub2api-import-oauth.json";
+const DEFAULT_TOTP_RESULT = "tmp/chatgpt-totp-setup.json";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PROFILE_MIN_AGE = 20;
 const PROFILE_MAX_AGE = 50;
@@ -217,6 +218,12 @@ class ProtocolClient {
       console.error(`< ${method} ${safeUrl(url)} ${res.status}${suffix}`);
     }
 
+    if (isRiskControlResponse(res, text)) {
+      throw new Error(
+        `PROXY_RISK_CONTROL: ${method} ${safeUrl(url)} returned HTTP ${res.status} with a security-check page`,
+      );
+    }
+
     return { res, text, location: location ? new URL(location, url).toString() : null, url };
   }
 
@@ -230,6 +237,7 @@ class ProtocolClient {
           "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         referer: options.referer,
       });
+      if (last.res.status >= 400) assertOk(last, `GET ${current}`);
       if (![301, 302, 303, 307, 308].includes(last.res.status) || !last.location) {
         return { finalUrl: current, last };
       }
@@ -268,10 +276,44 @@ async function run() {
     enabled: shouldUseTlsTransport({ chatgptBase, authBase, nativeHttp: args.nativeHttp }),
     profile: args.tlsProfile || process.env.TOSUB2_TLS_PROFILE || "chrome146",
     verbose: Boolean(args.verbose),
+    maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
   });
   const proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
   try {
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    if (args.setupTotp) {
+      const resultPath = path.resolve(args.totpResult || DEFAULT_TOTP_RESULT);
+      const rl = readline.createInterface({ input, output });
+      try {
+        const client = new ProtocolClient({ verbose: args.verbose, transport });
+        const email = args.email || (await ask(rl, "Email: "));
+        if (!email) throw new Error("Email is required");
+        console.log("[1/3] Sign in to verify the account before setting 2FA");
+        const web = await loginChatgptWeb(client, {
+          chatgptBase,
+          authBase,
+          email,
+          rl,
+          password: process.env.CHATGPT_LOGIN_PASSWORD || "",
+          totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
+        });
+        console.log(
+          client.jar.has("__Secure-next-auth.session-token")
+            ? "[ok] ChatGPT web session cookie received"
+            : "[warn] ChatGPT session cookie not found; continue with auth cookies",
+        );
+        await setupChatgptTotp(client, {
+          chatgptBase,
+          email,
+          rl,
+          deviceId: web.deviceId,
+          resultPath,
+        });
+      } finally {
+        rl.close();
+      }
+      return;
+    }
     if (args.refreshSub2api) {
       const sourcePath = path.resolve(args.refreshSub2api);
       const targetPath = path.resolve(args.sub2apiOut || sourcePath);
@@ -393,23 +435,15 @@ async function run() {
     }
 
     if (outputMode !== "sub2api") {
-      await fs.mkdir(path.dirname(outPath), { recursive: true });
-      await fs.writeFile(
-        outPath,
-        JSON.stringify(
-          {
-            generated_at: new Date().toISOString(),
-            chatgpt_base: chatgptBase,
-            auth_base: authBase,
-            warning: "This file contains login cookies and OAuth data. Do not share it.",
-            cookies: client.jar.toJSON(),
-            web,
-            codex,
-          },
-          null,
-          2,
-        ),
-      );
+      await writeJsonAtomic(outPath, {
+        generated_at: new Date().toISOString(),
+        chatgpt_base: chatgptBase,
+        auth_base: authBase,
+        warning: "This file contains login cookies and OAuth data. Do not share it.",
+        cookies: client.jar.toJSON(),
+        web,
+        codex,
+      });
       console.log(`[ok] Saved session data: ${outPath}`);
     }
 
@@ -432,8 +466,7 @@ async function run() {
         transport,
         cookie: client.jar.headerFor(authBase),
       });
-      await fs.mkdir(path.dirname(sub2apiOutPath), { recursive: true });
-      await fs.writeFile(sub2apiOutPath, `${JSON.stringify(sub2apiExport.data, null, 2)}\n`);
+      await writeJsonAtomic(sub2apiOutPath, sub2apiExport.data);
       await removeProtocolCheckpoint(checkpointPath);
       console.log(`[ok] Saved sub2api import: ${sub2apiOutPath}`);
       console.log(`[ok] Account: ${sub2apiExport.account.name}`);
@@ -451,6 +484,170 @@ async function run() {
     }
   } finally {
     await transport.close();
+  }
+}
+
+async function setupChatgptTotp(client, { chatgptBase, email, rl, deviceId, resultPath }) {
+  console.log("[2/3] Check current 2FA status");
+  const enablePage = await client.follow(`${chatgptBase}/?action=enable&factor=totp`, {
+    referer: `${chatgptBase}/`,
+  });
+  const accessToken = extractChatgptAccessToken(enablePage.last?.text || "");
+  if (!accessToken) {
+    throw new Error("TOTP_ACCESS_TOKEN_MISSING: Could not read the current ChatGPT access token");
+  }
+
+  const infoUrl = `${chatgptBase}/backend-api/accounts/mfa_info`;
+  const { data: currentInfo } = await client.getJson("GET", infoUrl, {
+    headers: chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, "/backend-api/accounts/mfa_info"),
+    referer: `${chatgptBase}/`,
+  });
+  if (hasEnabledTotp(currentInfo)) {
+    await writePrivateJson(resultPath, { version: 1, already_enabled: true, email });
+    console.log("[2fa-already-enabled] This account already has TOTP 2FA enabled.");
+    return;
+  }
+
+  const { data: enrollment } = await client.getJson(
+    "POST",
+    `${chatgptBase}/backend-api/accounts/mfa/enroll`,
+    {
+      headers: chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, "/backend-api/accounts/mfa/enroll"),
+      origin: chatgptBase,
+      referer: `${chatgptBase}/`,
+      json: { factor_type: "totp" },
+    },
+  );
+  const secret = normalizeEnrolledTotpSecret(enrollment?.secret);
+  const sessionId = typeof enrollment?.session_id === "string" ? enrollment.session_id : "";
+  if (!secret || !sessionId) {
+    throw new Error("TOTP_ENROLL_INVALID: The 2FA enrollment response did not include a valid key and session ID");
+  }
+  const otpauthUri = buildTotpUri(email, secret);
+  await writePrivateJson(resultPath, {
+    version: 1,
+    already_enabled: false,
+    activation_mode: "automatic",
+    activation_succeeded: false,
+    email,
+    secret,
+    otpauth_uri: otpauthUri,
+  });
+  console.log("[2fa-setup-ready] 2FA key created; activating it automatically.");
+
+  console.log("[3/3] Activate TOTP 2FA");
+  let code = generateTotp(secret);
+  let generatedFromSecret = true;
+  console.log("[2fa] Generated a current 6-digit activation code from the new 2FA key.");
+  for (;;) {
+    try {
+      const { data: activation } = await client.getJson(
+        "POST",
+        `${chatgptBase}/backend-api/accounts/mfa/user/activate_enrollment`,
+        {
+          headers: chatgptMfaHeaders({
+            chatgptBase,
+            accessToken,
+            deviceId,
+          }, "/backend-api/accounts/mfa/user/activate_enrollment"),
+          origin: chatgptBase,
+          referer: `${chatgptBase}/`,
+          json: { code, factor_type: "totp", session_id: sessionId },
+        },
+      );
+      if (activation?.success === true) {
+        await writePrivateJson(resultPath, {
+          version: 1,
+          already_enabled: false,
+          activation_mode: "automatic",
+          activation_succeeded: true,
+          activated_at: new Date().toISOString(),
+          email,
+          secret,
+          otpauth_uri: otpauthUri,
+        });
+        break;
+      }
+      console.log(
+        generatedFromSecret
+          ? "[warn] The automatically generated 2FA setup code was rejected; enter a current code manually."
+          : "[warn] 2FA setup code was rejected; enter a new code or type q to quit.",
+      );
+    } catch (error) {
+      if (!/activate_enrollment failed with HTTP 400/i.test(String(error?.message || ""))) throw error;
+      console.log(
+        generatedFromSecret
+          ? "[warn] The automatically generated 2FA setup code was rejected; enter a current code manually."
+          : "[warn] 2FA setup code was rejected; enter a new code or type q to quit.",
+      );
+    }
+    generatedFromSecret = false;
+    code = await askSetupTotpOtp(rl);
+  }
+  try {
+    const { data: confirmedInfo } = await client.getJson("GET", infoUrl, {
+      headers: chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, "/backend-api/accounts/mfa_info"),
+      referer: `${chatgptBase}/`,
+    });
+    if (!hasEnabledTotp(confirmedInfo)) {
+      console.log("[warn] 2FA activation succeeded, but the follow-up status response did not confirm it.");
+    }
+  } catch (error) {
+    console.log(`[warn] 2FA activation succeeded, but the follow-up status check failed: ${error.message}`);
+  }
+  console.log("[ok] 2FA setup activated");
+}
+
+function chatgptMfaHeaders({ chatgptBase, accessToken, deviceId }, targetPath) {
+  return {
+    authorization: `Bearer ${accessToken}`,
+    "oai-device-id": deviceId,
+    "oai-session-id": crypto.randomUUID(),
+    "oai-language": "zh-CN",
+    "x-openai-target-path": targetPath,
+    "x-openai-target-route": targetPath,
+    origin: chatgptBase,
+  };
+}
+
+function extractChatgptAccessToken(html) {
+  const sources = [String(html || ""), decodeHtml(String(html || ""))];
+  for (const source of sources) {
+    const match = /["']accessToken["']\s*:\s*"((?:\\.|[^"\\])+)"/.exec(source);
+    if (!match) continue;
+    try {
+      const value = JSON.parse(`"${match[1]}"`);
+      if (typeof value === "string" && value.length >= 20) return value;
+    } catch {}
+  }
+  return null;
+}
+
+function normalizeEnrolledTotpSecret(value) {
+  const normalized = String(value || "").toUpperCase().replace(/[\s=]/g, "");
+  return /^[A-Z2-7]{16,128}$/.test(normalized) ? normalized : "";
+}
+
+function buildTotpUri(email, secret) {
+  const label = encodeURIComponent(`OpenAI:${email}`);
+  const query = new URLSearchParams({ secret, issuer: "OpenAI", algorithm: "SHA1", digits: "6", period: "30" });
+  return `otpauth://totp/${label}?${query.toString()}`;
+}
+
+function hasEnabledTotp(info) {
+  return Boolean(
+    info?.mfa_enabled_v2
+    && Array.isArray(info?.factors?.totp)
+    && info.factors.totp.some((factor) => factor?.factor_type === "totp" || factor?.id),
+  );
+}
+
+async function askSetupTotpOtp(rl) {
+  for (;;) {
+    const value = await ask(rl, "2FA setup OTP (6 digits, q=quit): ");
+    if (value.toLowerCase() === "q") throw new Error("Stopped before 2FA setup activation");
+    if (/^\d{6}$/.test(value)) return value;
+    console.log("[warn] 2FA setup OTP should be exactly 6 digits.");
   }
 }
 
@@ -508,7 +705,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
       password,
       referer: authPage.finalUrl,
     });
-  } else {
+  } else if (isEmailVerificationPage(authPage.finalUrl)) {
     loginMethod = "email_otp";
     console.log("[3/5] Email OTP page reached. Enter code, or type r to resend.");
     const emailCode = await askEmailOtp(rl, client, authBase);
@@ -516,6 +713,16 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
       code: emailCode,
     }, { referer: authPage.finalUrl });
     authenticated = data;
+  } else if (isCompletedChatgptLoginPage(authPage.finalUrl, chatgptBase, client)) {
+    loginMethod = "existing_session";
+    authenticated = { continue_url: authPage.finalUrl };
+    console.log("[3/5] Existing ChatGPT web session accepted.");
+  } else {
+    let pathname = authPage.finalUrl;
+    try {
+      pathname = new URL(authPage.finalUrl).pathname;
+    } catch {}
+    throw new Error(`UNEXPECTED_LOGIN_PAGE: Expected password or email verification, received ${pathname}`);
   }
 
   const mfaRequired = isMfaChallengePayload(authenticated);
@@ -548,8 +755,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
 
 async function selectChatgptLoginWorkspaceIfNeeded(client, { authBase, payload }) {
   if (!isWorkspaceSelectionPayload(payload)) return payload;
-  const workspaces = payload?.["oai-client-auth-session"]?.workspaces;
-  const workspaceId = Array.isArray(workspaces) ? workspaces.find((item) => item?.id)?.id : null;
+  const workspaceId = pickWorkspaceId(payload);
   if (!workspaceId) {
     console.log("[web] Workspace page did not include a selectable workspace; skipping selection.");
     return payload;
@@ -628,6 +834,26 @@ async function completeTotpMfaIfNeeded(client, { authBase, rl, payload, totpSecr
 function isPasswordLoginPage(url) {
   try {
     return new URL(url).pathname === "/log-in/password";
+  } catch {
+    return false;
+  }
+}
+
+function isEmailVerificationPage(url) {
+  try {
+    return new URL(url).pathname === "/email-verification";
+  } catch {
+    return false;
+  }
+}
+
+function isCompletedChatgptLoginPage(url, chatgptBase, client) {
+  try {
+    const current = new URL(url);
+    const expected = new URL(chatgptBase);
+    return current.origin === expected.origin
+      && current.pathname === "/"
+      && client.jar.has("__Secure-next-auth.session-token");
   } catch {
     return false;
   }
@@ -1246,10 +1472,7 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
   data.version = 1;
   data.exported_at = new Date().toISOString();
   if (!Array.isArray(data.proxies)) data.proxies = [];
-  await fs.mkdir(path.dirname(targetPath), { recursive: true });
-  const tempPath = `${targetPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`);
-  await fs.rename(tempPath, targetPath);
+  await writeJsonAtomic(targetPath, data);
   return { email: credentials.email || "" };
 }
 
@@ -1317,6 +1540,7 @@ async function resendEmailOtp(client, authBase) {
     headers: {
       accept: "application/json, text/plain, */*",
     },
+    json: {},
   });
   if (result.res.status === 429) {
     throw new Error("Too many email OTP resend attempts. Wait a while before retrying.");
@@ -1382,8 +1606,9 @@ function buildAccountName(email) {
 function pickWorkspaceId(payload) {
   const workspaces = payload?.["oai-client-auth-session"]?.workspaces;
   if (!Array.isArray(workspaces) || workspaces.length === 0) return null;
-  const personal = workspaces.find((item) => item.kind === "personal");
-  return (personal || workspaces[0]).id || null;
+  const organization = workspaces.find((item) => item?.kind === "organization" && item?.id);
+  const firstAvailable = workspaces.find((item) => item?.id);
+  return (organization || firstAvailable)?.id || null;
 }
 
 function hasWorkspace(payload) {
@@ -1420,6 +1645,15 @@ function assertOk(result, label) {
   if (res.status >= 200 && res.status < 300) return;
   const body = text.replace(/\s+/g, " ").slice(0, 220);
   throw new Error(`${label} failed with HTTP ${res.status}: ${body}`);
+}
+
+function isRiskControlResponse(res, text) {
+  const mitigated = res?.headers?.get?.("cf-mitigated") || res?.headers?.get?.("x-cf-mitigated");
+  if (mitigated) return true;
+  const contentType = String(res?.headers?.get?.("content-type") || "");
+  const body = String(text || "");
+  return res?.status === 403
+    && (/text\/html/i.test(contentType) || /Just a moment|cdn-cgi|challenge-platform|cf-challenge/i.test(body));
 }
 
 function getSetCookie(headers) {
@@ -1515,11 +1749,25 @@ async function readProtocolCheckpoint(checkpointPath) {
 }
 
 async function writePrivateJson(filePath, data) {
+  await writeJsonAtomic(filePath, data, { mode: 0o600 });
+  await fs.chmod(filePath, 0o600);
+}
+
+async function writeJsonAtomic(filePath, data, options = {}) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(tempPath, filePath);
-  await fs.chmod(filePath, 0o600);
+  try {
+    await fs.writeFile(
+      tempPath,
+      `${JSON.stringify(data, null, 2)}\n`,
+      options.mode ? { mode: options.mode } : undefined,
+    );
+    JSON.parse(await fs.readFile(tempPath, "utf8"));
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 async function removeProtocolCheckpoint(checkpointPath) {
@@ -1573,6 +1821,9 @@ function parseArgs(argv) {
     else if (item === "--verbose" || item === "-v") args.verbose = true;
     else if (item === "--debug-auth") args.debugAuth = true;
     else if (item === "--web-only") args.webOnly = true;
+    else if (item === "--setup-totp") args.setupTotp = true;
+    else if (item.startsWith("--totp-result=")) args.totpResult = item.slice("--totp-result=".length);
+    else if (item === "--totp-result") args.totpResult = argv[++i];
     else if (item.startsWith("--email=")) args.email = item.slice("--email=".length);
     else if (item === "--email") args.email = argv[++i];
     else if (item.startsWith("--phone=")) args.phone = item.slice("--phone=".length);
@@ -1709,6 +1960,8 @@ Options:
   --email <email>                 Email address. If omitted, prompt manually.
   --phone <phone>                 Phone number in E.164 format. If omitted, prompt when needed.
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
+  --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
+  --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
   --out <file>                    Output JSON path. Default: ${DEFAULT_OUT}
   --sub2api-out <file>            sub2api import JSON path. Default: ${DEFAULT_SUB2API_OUT}
   --output-mode <mode>            both, session, or sub2api. Default: both
@@ -1740,6 +1993,14 @@ Notes:
 }
 
 run().catch((error) => {
-  console.error(`[error] ${error.message}`);
+  if (isProxyRiskControlError(error)) {
+    console.error(`[proxy-risk-retry] ${String(error.message || "Proxy security check").slice(0, 320)}`);
+  } else {
+    console.error(`[error] ${error.message}`);
+  }
   process.exitCode = 1;
 });
+
+function isProxyRiskControlError(error) {
+  return /PROXY_RISK_CONTROL|PROXY_CONNECTION_RETRY/i.test(String(error?.message || ""));
+}

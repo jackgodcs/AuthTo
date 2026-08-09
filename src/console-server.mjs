@@ -12,15 +12,21 @@ import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import { fetchMailboxOtpCandidates, validateMailApiUrl } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
+import { proxySupportsSessionRotation } from "./tls-transport.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
 const MAX_BATCH_JOBS = 500;
+const MAX_PROXY_RISK_RETRIES = 10;
+const MAX_PROXY_CONNECTION_FAILURES = 20;
+const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
+const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 20;
 const MAX_LOG_CHARS = 80_000;
 const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
+const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
 const SMS_POLL_INTERVAL_MS = Number(process.env.SMS_POLL_INTERVAL_MS || process.env.LUBAN_SMS_POLL_INTERVAL_MS || 3_000);
@@ -42,6 +48,7 @@ let outputSyncPromise = null;
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
 let queueSchedulingPaused = false;
+let shutdownPromise = null;
 
 const hostArg = process.argv.find((item) => item.startsWith("--host="));
 const hostIndex = process.argv.indexOf("--host");
@@ -161,6 +168,8 @@ async function handleApi(req, res, requestUrl) {
         cancelAll: true,
         sub2apiUpload: true,
         tlsFingerprint: true,
+        totpSetup: true,
+        forceRelogin: true,
       },
     });
     return;
@@ -264,6 +273,34 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/relogin-batch") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const eligible = selected.filter(canForceRelogin);
+    if (!eligible.length) throw httpError(409, "选中的账号当前都不能重新登录");
+    await Promise.all(eligible.map((job) => forceReloginJob(job, body)));
+    sendJson(res, 200, {
+      jobs: eligible.map(publicJob),
+      started: eligible.length,
+      skipped: selected.length - eligible.length,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/setup-2fa-batch") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const eligible = selected.filter(canSetupTotp);
+    if (!eligible.length) throw httpError(409, "选中的账号都不能设置 2FA");
+    await Promise.all(eligible.map((job) => startTotpSetup(job, body)));
+    sendJson(res, 200, {
+      jobs: eligible.map(publicJob),
+      started: eligible.length,
+      skipped: selected.length - eligible.length,
+    });
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/cancel-all") {
     const canceled = await cancelAllJobs();
     sendJson(res, 200, { canceled });
@@ -319,7 +356,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const config = normalizeSub2ApiConfig(body.config);
     const selected = resolveSelectedJobs(body.ids);
-    const downloadable = selected.filter((job) => job.status === "completed" && job.resultSaved);
+    const downloadable = selected.filter((job) => job.resultSaved);
     if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
     const payload = await buildSub2ApiUploadPayload(downloadable);
     const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
@@ -375,7 +412,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -407,7 +444,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
   if (req.method === "POST" && action === "cancel") {
-    cancelJob(job);
+    await cancelJob(job);
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
@@ -420,6 +457,18 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && action === "regenerate") {
     const body = await readJson(req);
     await regenerateJob(job, body);
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && action === "relogin") {
+    const body = await readJson(req);
+    await forceReloginJob(job, body);
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && action === "setup-2fa") {
+    const body = await readJson(req);
+    await startTotpSetup(job, body);
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
@@ -476,6 +525,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
   const outputDir = path.join(OUTPUT_ROOT, id);
   const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
   const checkpointPath = path.join(outputDir, LOGIN_CHECKPOINT_FILENAME);
+  const totpResultPath = path.join(outputDir, TOTP_SETUP_RESULT_FILENAME);
   await fs.mkdir(outputDir, { recursive: true });
 
   const job = {
@@ -488,6 +538,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     completedAt: null,
     outputPath,
     checkpointPath,
+    totpResultPath,
     logs: "",
     lastError: null,
     child: null,
@@ -516,6 +567,17 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     queuedAt: new Date().toISOString(),
     queuedStartPrompt: "正在建立登录会话",
     fallbackInProgress: false,
+    totpSetupSecret: null,
+    totpSetupUri: null,
+    totpSetupError: null,
+    totpKnownEnabled: false,
+    totpSetupAttempt: 0,
+    totpResultLoading: false,
+    proxyRiskRetryCount: 0,
+    proxyConnectionFailureCount: 0,
+    proxyRiskRestarting: false,
+    proxySessionAttemptIds: new Set(),
+    proxyAttemptParserTail: "",
     queueRunId: null,
     ...newSmsState(),
   };
@@ -536,10 +598,10 @@ function scheduleQueuedJobs() {
     const mode = job.queuedMode || "full";
     const queueRunId = crypto.randomUUID();
     job.queueRunId = queueRunId;
-    job.status = mode === "refresh" ? "refreshing" : "starting";
+    job.status = mode === "refresh" ? "refreshing" : mode === "totp_setup" ? "totp_starting" : "starting";
     job.prompt = job.queuedStartPrompt || (mode === "refresh"
       ? "正在使用已有刷新令牌直接生成新授权"
-      : "正在建立登录会话");
+      : mode === "totp_setup" ? "正在重新验证账号并准备设置 2FA" : "正在建立登录会话");
     job.queuedAt = null;
     touch(job);
     void saveJobMetadata(job).catch(() => {});
@@ -551,11 +613,15 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
-    if (mode === "full" && job.mailApiUrl) await loadMailboxBaseline(job);
+    if (["full", "totp_setup"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
-    failJob(job, `准备登录任务失败：${error.message}`);
+    if (mode === "totp_setup") {
+      restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
+    } else {
+      failJob(job, `准备登录任务失败：${error.message}`);
+    }
     scheduleQueuedJobs();
   }
 }
@@ -586,6 +652,16 @@ function launchJob(job, options = {}) {
         job.outputPath,
         "--verbose",
       ]
+    : mode === "totp_setup"
+      ? [
+          PROTOCOL_SCRIPT,
+          "--email",
+          job.email,
+          "--setup-totp",
+          "--totp-result",
+          job.totpResultPath,
+          "--verbose",
+        ]
     : [
         PROTOCOL_SCRIPT,
         "--email",
@@ -607,6 +683,7 @@ function launchJob(job, options = {}) {
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_PROXY_URL: job.proxyUrl || "",
+      CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -619,34 +696,64 @@ function launchJob(job, options = {}) {
     if (job.runId === runId) consumeOutput(job, chunk.toString("utf8"));
   });
   child.on("error", (error) => {
-    if (job.runId === runId) failJob(job, `无法启动登录进程：${error.message}`);
-  });
-  child.on("close", async (code, signal) => {
     if (job.runId !== runId) return;
-    stopMailPolling(job);
-    job.child = null;
-    if (["canceled", "reauth_required"].includes(job.status)) {
-      scheduleQueuedJobs();
-      return;
-    }
-    if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
-      job.status = "completed";
-      job.prompt = "授权完成，可以下载导入文件";
-      job.completedAt = new Date().toISOString();
-      touch(job);
-      void saveJobMetadata(job).catch(() => {});
-      scheduleQueuedJobs();
-      return;
-    }
-    if (job.status !== "failed") {
-      if (await fileExists(job.checkpointPath)) {
-        markResumeAvailable(job, signal ? `登录进程被 ${signal} 终止` : "登录流程中断");
-      } else {
-        failJob(job, signal ? `登录进程被 ${signal} 终止` : `登录进程退出，代码 ${code ?? "未知"}`);
-      }
-    }
-    scheduleQueuedJobs();
+    if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
+    else failJob(job, `无法启动登录进程：${error.message}`);
   });
+  child.on("close", (code, signal) => {
+    void handleChildClose(job, { code, signal, mode, runId }).catch((error) => {
+      handleChildCloseFailure(job, mode, runId, error);
+    });
+  });
+}
+
+async function handleChildClose(job, { code, signal, mode, runId }) {
+  if (job.runId !== runId) return;
+  stopMailPolling(job);
+  job.child = null;
+  if (mode === "totp_setup") {
+    await finishTotpSetup(job, code, signal);
+    scheduleQueuedJobs();
+    return;
+  }
+  if (["canceled", "reauth_required"].includes(job.status)) {
+    scheduleQueuedJobs();
+    return;
+  }
+  if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+    job.status = "completed";
+    job.prompt = "授权完成，可以下载导入文件";
+    job.completedAt = new Date().toISOString();
+    touch(job);
+    await saveJobMetadata(job);
+    scheduleQueuedJobs();
+    return;
+  }
+  if (job.status !== "failed") {
+    if (await fileExists(job.checkpointPath)) {
+      markResumeAvailable(job, signal ? `登录进程被 ${signal} 终止` : "登录流程中断");
+    } else {
+      failJob(job, signal ? `登录进程被 ${signal} 终止` : `登录进程退出，代码 ${code ?? "未知"}`);
+    }
+  }
+  scheduleQueuedJobs();
+}
+
+function handleChildCloseFailure(job, mode, runId, error) {
+  if (job.runId !== runId && !(mode === "totp_setup" && job.runId === null)) return;
+  const message = `收尾处理失败：${error.message}`;
+  if (mode === "totp_setup") {
+    job.status = "completed";
+    job.prompt = "原授权文件仍然可用，2FA 密钥尚未完成安全保存";
+    job.totpSetupError = `${message}；已保留 2FA 结果文件，请重试保存`;
+    job.runMode = null;
+    job.runId = null;
+  } else {
+    failJob(job, message);
+  }
+  touch(job);
+  void saveJobMetadata(job).catch(() => {});
+  scheduleQueuedJobs();
 }
 
 async function retryJob(job, options = {}) {
@@ -656,7 +763,7 @@ async function retryJob(job, options = {}) {
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
   if (Object.hasOwn(options, "proxyUrl")) {
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
-    await saveStoredLoginCredentials(job.email, job);
+    const persisted = await saveStoredLoginCredentials(job.email, job);
   }
   const resumingCheckpoint = job.status === "resume_available"
     || (retryingSecurityCheck && await fileExists(job.checkpointPath));
@@ -671,13 +778,17 @@ async function retryJob(job, options = {}) {
     : "正在重新建立登录会话";
   job.lastError = null;
   job.parserTail = "";
-  job.resultSaved = false;
   job.completedAt = null;
   job.currentPhone = resumingCheckpoint ? (job.currentPhone || job.smsNumber) : null;
   job.phoneError = null;
   job.securityCheckRequired = false;
   job.restartRequired = false;
   job.attempt += 1;
+  job.proxyRiskRetryCount = 0;
+  job.proxyConnectionFailureCount = 0;
+  job.proxyRiskRestarting = false;
+  job.proxySessionAttemptIds.clear();
+  job.proxyAttemptParserTail = "";
   job.mailCandidateCounts.clear();
   appendJobLog(
     job,
@@ -704,8 +815,200 @@ async function regenerateJob(job, options = {}) {
   job.restartRequired = false;
   job.completedAt = null;
   job.attempt += 1;
+  job.proxyRiskRetryCount = 0;
+  job.proxyConnectionFailureCount = 0;
+  job.proxyRiskRestarting = false;
+  job.proxySessionAttemptIds.clear();
+  job.proxyAttemptParserTail = "";
   appendJobLog(job, `\n[refresh] 第 ${job.attempt} 次生成：优先使用已有刷新令牌。\n`);
   enqueueJob(job, "refresh", "正在使用已有刷新令牌直接生成新授权");
+}
+
+async function forceReloginJob(job, options = {}) {
+  if (!canForceRelogin(job)) {
+    throw httpError(409, "当前任务正在进行中，不能重新登录");
+  }
+  await reloadMissingJobCredentials(job);
+  if (Object.hasOwn(options, "proxyUrl")) {
+    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    await saveStoredLoginCredentials(job.email, job);
+  }
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.queueRunId = null;
+  job.runId = crypto.randomUUID();
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  await Promise.all([
+    removePrivateFile(job.checkpointPath),
+    removePrivateFile(job.totpResultPath),
+  ]);
+  job.lastError = null;
+  job.parserTail = "";
+  job.completedAt = null;
+  job.currentPhone = null;
+  job.phoneError = null;
+  job.securityCheckRequired = false;
+  job.restartRequired = false;
+  job.totpSetupSecret = null;
+  job.totpSetupUri = null;
+  job.totpSetupError = null;
+  job.proxyRiskRetryCount = 0;
+  job.proxyConnectionFailureCount = 0;
+  job.proxyRiskRestarting = false;
+  job.proxySessionAttemptIds.clear();
+  job.proxyAttemptParserTail = "";
+  job.mailCandidateCounts.clear();
+  job.attempt += 1;
+  appendJobLog(job, `\n[relogin] 第 ${job.attempt} 次授权：跳过刷新令牌并强制重新登录。\n`);
+  if (job.hasTotpCredential && !job.totpSecret) {
+    appendJobLog(job, "[mfa] 本地未能读取已记录的 2FA 密钥，遇到 2FA 时需要手动输入验证码。\n");
+  }
+  enqueueJob(job, "full", "正在强制重新登录并完成授权");
+}
+
+async function reloadMissingJobCredentials(job) {
+  if (
+    (job.password || !job.hasPasswordCredential)
+    && (job.totpSecret || !job.hasTotpCredential)
+    && job.proxyUrl
+  ) return;
+  const stored = await loadStoredLoginCredentials(job.email);
+  job.password ||= stored.password;
+  job.totpSecret ||= stored.totpSecret;
+  job.proxyUrl ||= stored.proxyUrl;
+  if (job.password) job.hasPasswordCredential = true;
+  if (job.totpSecret) job.hasTotpCredential = true;
+  if (stored.password || stored.totpSecret || stored.proxyUrl) {
+    await saveStoredLoginCredentials(job.email, job);
+  }
+}
+
+async function startTotpSetup(job, options = {}) {
+  if (job.status !== "completed" || !job.resultSaved) {
+    throw httpError(409, "只能为已经完成授权的账号设置 2FA");
+  }
+  if (job.totpSecret || job.hasTotpCredential) {
+    throw httpError(409, "该账号已经保存了 2FA 密钥，无需重复设置");
+  }
+  if (job.totpKnownEnabled) {
+    throw httpError(409, "该账号已经启用 2FA，但本地没有它的原始密钥，无法重复创建");
+  }
+  if (Object.hasOwn(options, "proxyUrl")) {
+    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    await saveStoredLoginCredentials(job.email, job);
+  }
+  await removePrivateFile(job.totpResultPath);
+  job.totpSetupSecret = null;
+  job.totpSetupUri = null;
+  job.totpSetupError = null;
+  job.totpSetupAttempt = (job.totpSetupAttempt || 0) + 1;
+  job.proxyRiskRetryCount = 0;
+  job.proxyConnectionFailureCount = 0;
+  job.proxyRiskRestarting = false;
+  job.proxySessionAttemptIds.clear();
+  job.proxyAttemptParserTail = "";
+  job.lastError = null;
+  job.parserTail = "";
+  appendJobLog(job, `\n[2fa] 开始第 ${job.totpSetupAttempt} 次 2FA 设置，原授权文件保持不变。\n`);
+  enqueueJob(job, "totp_setup", "正在重新验证账号并准备设置 2FA");
+}
+
+async function loadTotpSetupResult(job) {
+  const data = JSON.parse(await fs.readFile(job.totpResultPath, "utf8"));
+  if (data?.version !== 1) throw new Error("2FA 设置结果文件格式不正确");
+  if (data.already_enabled) {
+    job.totpKnownEnabled = true;
+    job.totpSetupSecret = null;
+    job.totpSetupUri = null;
+    return data;
+  }
+  const secret = normalizeTotpSecret(data.secret);
+  const uri = String(data.otpauth_uri || "");
+  if (!uri.startsWith("otpauth://totp/")) throw new Error("2FA 设置地址格式不正确");
+  job.totpSetupSecret = secret;
+  job.totpSetupUri = uri;
+  if (data.activation_mode === "automatic") {
+    if (job.status !== "totp_setup_otp") setStage(job, "working", "2FA 密钥已生成，正在自动激活");
+  } else {
+    setStage(job, "totp_setup_otp", "密钥已生成，请添加到验证器后输入当前 6 位验证码");
+  }
+  return data;
+}
+
+async function finishTotpSetup(job, code, signal) {
+  let result = null;
+  try {
+    result = await loadTotpSetupResult(job);
+  } catch (error) {
+    if (error?.code !== "ENOENT" && !job.totpSetupError) job.totpSetupError = error.message;
+  }
+
+  const activationSucceeded = result?.activation_succeeded === true;
+  let removeResult = false;
+  if (code === 0 && result?.already_enabled) {
+    job.totpKnownEnabled = true;
+    job.prompt = "账号已经启用 2FA，但服务端不会返回原始密钥";
+    job.totpSetupError = "如需自动登录，请重新导入这个账号原有的 2FA 密钥";
+    removeResult = true;
+  } else if ((code === 0 || activationSucceeded) && result?.secret) {
+    const secret = normalizeTotpSecret(result.secret);
+    job.totpSecret = secret;
+    job.hasTotpCredential = true;
+    job.totpKnownEnabled = true;
+    const persisted = await saveStoredLoginCredentials(job.email, job);
+    job.prompt = activationSucceeded && code !== 0
+      ? "2FA 已激活并保存，但最终状态确认未完成"
+      : "2FA 已设置并安全保存，可以继续下载或重新授权";
+    job.totpSetupError = !persisted
+      ? "当前系统不支持持久凭据存储，2FA 密钥已保留在私有结果文件中，请不要删除该任务目录"
+      : activationSucceeded && code !== 0
+      ? "激活接口已返回成功，但后续确认请求失败；密钥已保留"
+      : null;
+    appendJobLog(job, persisted
+      ? "[2fa] 2FA 设置成功，密钥已写入系统凭据存储，未写入协议日志。\n"
+      : "[2fa] 2FA 设置成功，但当前系统不支持持久凭据存储；密钥已保留在私有结果文件中。\n");
+    removeResult = persisted;
+  } else {
+    job.prompt = "授权文件仍然可用，本次 2FA 设置未完成";
+    job.totpSetupError ||= signal
+      ? `2FA 设置进程被 ${signal} 终止`
+      : `2FA 设置进程退出，代码 ${code ?? "未知"}`;
+  }
+
+  job.status = "completed";
+  job.runMode = null;
+  job.runId = null;
+  job.totpSetupSecret = null;
+  job.totpSetupUri = null;
+  if (removeResult || !result?.secret || result?.activation_succeeded === false) {
+    await removePrivateFile(job.totpResultPath);
+  }
+  touch(job);
+  await saveJobMetadata(job);
+}
+
+async function removePrivateFile(filePath) {
+  if (!filePath) return;
+  try {
+    await fs.unlink(filePath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+function restoreTotpSetupFailure(job, message) {
+  job.status = "completed";
+  job.prompt = "授权文件仍然可用，本次 2FA 设置未完成";
+  job.totpSetupError = message;
+  job.totpSetupSecret = null;
+  job.totpSetupUri = null;
+  job.runMode = null;
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  void removePrivateFile(job.totpResultPath).catch(() => {});
+  touch(job);
+  void saveJobMetadata(job).catch(() => {});
 }
 
 async function fallbackFromRefresh(job) {
@@ -730,22 +1033,77 @@ async function fallbackFromRefresh(job) {
 }
 
 function consumeOutput(job, rawText) {
-  const text = sanitizeLog(rawText);
+  const proxyAttemptScan = `${job.proxyAttemptParserTail || ""}${rawText}`;
+  job.proxyAttemptParserTail = proxyAttemptScan.slice(-160);
+  let proxyAttemptNotices = "";
+  for (const match of proxyAttemptScan.matchAll(/\[proxy-session-attempt\]\s+([a-f0-9-]{36})/gi)) {
+    const attemptId = match[1].toLowerCase();
+    if (job.proxySessionAttemptIds.has(attemptId)) continue;
+    job.proxySessionAttemptIds.add(attemptId);
+    job.proxyRiskRetryCount = Math.min(MAX_PROXY_RISK_RETRIES, (job.proxyRiskRetryCount || 0) + 1);
+    job.proxyConnectionFailureCount = 0;
+    proxyAttemptNotices += `[proxy] 正在检测第 ${job.proxyRiskRetryCount}/${MAX_PROXY_RISK_RETRIES} 个新代理会话。\n`;
+    void saveJobMetadata(job).catch(() => {});
+  }
+  const text = `${proxyAttemptNotices}${sanitizeLog(rawText)}`
+    .replace(/^\[proxy-session-attempt\][^\r\n]*(?:\r?\n)?/gim, "");
   job.logs = `${job.logs}${text}`.slice(-MAX_LOG_CHARS);
   const scan = `${job.parserTail}${text}`;
   job.parserTail = scan.slice(-2_000);
+
+  if (scan.includes("[proxy-risk-retry]")) {
+    void restartAfterProxyRisk(job, {
+      connectionFailure: scan.includes("PROXY_CONNECTION_RETRY"),
+    }).catch((error) => {
+      finishProxyRiskRetries(job, `自动更换代理会话失败：${error.message}`);
+    });
+    return;
+  }
 
   if (job.runMode === "refresh" && scan.includes("REFRESH_TOKEN_INVALID")) {
     void fallbackFromRefresh(job);
     return;
   }
 
+  if (job.runMode === "totp_setup" && scan.includes("[2fa-setup-ready]") && !job.totpResultLoading && !job.totpSetupSecret) {
+    job.totpResultLoading = true;
+    setStage(job, "working", "2FA 密钥已经生成，正在安全读取");
+    void loadTotpSetupResult(job)
+      .catch((error) => {
+        job.totpSetupError = `无法读取 2FA 密钥：${error.message}`;
+        job.child?.kill("SIGTERM");
+        touch(job);
+      })
+      .finally(() => {
+        job.totpResultLoading = false;
+      });
+  }
+
+  if (job.runMode === "totp_setup" && scan.includes("[2fa-already-enabled]")) {
+    job.totpKnownEnabled = true;
+    setStage(job, "working", "账号已经启用 2FA，正在收尾");
+  }
+
+  if (job.runMode === "totp_setup" && scan.includes("[ok] 2FA setup activated")) {
+    setStage(job, "working", "2FA 已激活，正在安全保存密钥");
+  }
+
   if (scan.includes("[security-check-required]")) {
+    if (job.runMode === "totp_setup") {
+      job.totpSetupError = "本次登录需要浏览器安全校验，2FA 尚未设置";
+      touch(job);
+      return;
+    }
     requireBrowserSecurityCheck(job);
     return;
   }
 
   if (scan.includes("[profile-security-check-required]")) {
+    if (job.runMode === "totp_setup") {
+      job.totpSetupError = "账号资料校验未通过，2FA 尚未设置";
+      touch(job);
+      return;
+    }
     requireProfileSecurityCheck(job);
     return;
   }
@@ -756,6 +1114,11 @@ function consumeOutput(job, rawText) {
   }
 
   if (/Your sign-in session is no longer valid|["']code["']\s*:\s*["']invalid_state["']/i.test(scan)) {
+    if (job.runMode === "totp_setup") {
+      job.totpSetupError = "设置 2FA 时登录状态失效，请稍后重试";
+      touch(job);
+      return;
+    }
     requireReauthorization(job, "当前登录状态已经失效，继续更换手机号也无法发送验证码");
     return;
   }
@@ -780,11 +1143,15 @@ function consumeOutput(job, rawText) {
     stopMailPolling(job);
     setStage(job, "password", "请输入账号密码");
   }
-  if (scan.includes("2FA OTP (6 digits, q=quit):")) {
-    setStage(job, "mfa_otp", "请输入 6 位 2FA 验证码");
+  if (scan.includes("2FA setup OTP (6 digits, q=quit):")) {
+    setStage(job, "totp_setup_otp", "请将密钥添加到验证器后输入当前 6 位验证码");
   }
-  if (scan.includes("[mfa] TOTP 2FA challenge reached.")) {
+  const mfaReachedIndex = scan.lastIndexOf("[mfa] TOTP 2FA challenge reached.");
+  const mfaPromptIndex = scan.lastIndexOf("2FA OTP (6 digits, q=quit):");
+  if (mfaReachedIndex > mfaPromptIndex) {
     setStage(job, "working", job.totpSecret ? "正在自动完成 2FA 验证" : "正在准备 2FA 验证");
+  } else if (mfaPromptIndex > mfaReachedIndex) {
+    setStage(job, "mfa_otp", "请输入 6 位 2FA 验证码");
   }
   const phoneNumberPromptIndex = scan.lastIndexOf("Phone number, E.164 format");
   const phoneOtpPromptIndex = scan.lastIndexOf("Phone OTP (r=resend, p=change phone, q=quit):");
@@ -854,9 +1221,112 @@ function consumeOutput(job, rawText) {
 
   const errorMatches = [...scan.matchAll(/\[error\]\s*([^\r\n]+)/g)];
   if (errorMatches.length) {
-    failJob(job, extractResponseMessage(errorMatches.at(-1)[1]));
+    if (job.runMode === "totp_setup") {
+      job.totpSetupError = extractResponseMessage(errorMatches.at(-1)[1]);
+    } else {
+      failJob(job, extractResponseMessage(errorMatches.at(-1)[1]));
+    }
   }
   touch(job);
+}
+
+async function restartAfterProxyRisk(job, options = {}) {
+  if (job.proxyRiskRestarting || isTerminalStatus(job.status)) return;
+  job.proxyRiskRestarting = true;
+  const mode = job.runMode || job.queuedMode || "full";
+  try {
+    if (!job.proxyUrl || !proxySupportsSessionRotation(job.proxyUrl)) {
+      finishProxyRiskRetries(
+        job,
+        job.proxyUrl
+          ? "当前代理没有可识别的会话编号，无法自动轮换；请更换代理配置后重试"
+          : "当前使用本地 IP，无法自动更换出口；请配置可轮换代理后重试",
+      );
+      return;
+    }
+    if ((job.proxyRiskRetryCount || 0) >= MAX_PROXY_RISK_RETRIES) {
+      finishProxyRiskRetries(job, `代理会话已自动更换 ${MAX_PROXY_RISK_RETRIES} 次，仍然触发安全校验`);
+      return;
+    }
+    if (options.connectionFailure) {
+      job.proxyConnectionFailureCount = (job.proxyConnectionFailureCount || 0) + 1;
+      if (job.proxyConnectionFailureCount >= MAX_PROXY_CONNECTION_FAILURES) {
+        finishProxyRiskRetries(
+          job,
+          `代理连接连续失败 ${MAX_PROXY_CONNECTION_FAILURES} 次，已停止自动重试`,
+        );
+        return;
+      }
+    }
+
+    stopMailPolling(job);
+    stopSmsPolling(job);
+    releaseSmsNumber(job, "idle");
+    job.queueRunId = null;
+    job.runId = crypto.randomUUID();
+    const restartRunId = job.runId;
+    job.child?.kill("SIGTERM");
+    job.child = null;
+    if (mode === "full") await removePrivateFile(job.checkpointPath);
+    job.parserTail = "";
+    job.lastError = null;
+    job.currentPhone = null;
+    job.phoneError = null;
+    job.securityCheckRequired = false;
+    job.restartRequired = false;
+    appendJobLog(
+      job,
+      options.connectionFailure
+        ? `[proxy] 代理连接失败，HTTP 检测次数仍为 ${job.proxyRiskRetryCount}/${MAX_PROXY_RISK_RETRIES}；连接失败 ${job.proxyConnectionFailureCount}/${MAX_PROXY_CONNECTION_FAILURES}。\n`
+        : `[proxy] 登录阶段触发安全校验，已使用 ${job.proxyRiskRetryCount}/${MAX_PROXY_RISK_RETRIES} 个代理会话，正在继续更换。\n`,
+    );
+    if (options.connectionFailure) {
+      const retryDelay = Math.min(
+        PROXY_CONNECTION_RETRY_MAX_MS,
+        PROXY_CONNECTION_RETRY_BASE_MS * (2 ** Math.min(job.proxyConnectionFailureCount - 1, 4)),
+      );
+      job.status = "starting";
+      job.prompt = `代理连接失败，${Math.ceil(retryDelay / 1_000)} 秒后更换会话`;
+      touch(job);
+      await saveJobMetadata(job);
+      await delay(retryDelay);
+      if (job.runId !== restartRunId || isTerminalStatus(job.status)) return;
+    }
+    job.proxyRiskRestarting = false;
+    enqueueJob(
+      job,
+      mode,
+      options.connectionFailure
+        ? `代理连接失败，正在更换会话；HTTP 检测次数仍为 ${job.proxyRiskRetryCount}/${MAX_PROXY_RISK_RETRIES}`
+        : `代理触发安全校验，已使用 ${job.proxyRiskRetryCount}/${MAX_PROXY_RISK_RETRIES} 个代理会话`,
+    );
+  } finally {
+    job.proxyRiskRestarting = false;
+  }
+}
+
+function finishProxyRiskRetries(job, message) {
+  job.proxyRiskRestarting = false;
+  if (job.runMode === "totp_setup" || job.queuedMode === "totp_setup") {
+    restoreTotpSetupFailure(job, message);
+    return;
+  }
+  if (job.resultSaved) {
+    job.status = "completed";
+    job.prompt = "原授权文件仍然可用，自动更换代理未能完成本次操作";
+    job.lastError = message;
+    job.runMode = null;
+    job.child?.kill("SIGTERM");
+    job.child = null;
+    touch(job);
+    void saveJobMetadata(job).catch(() => {});
+    scheduleQueuedJobs();
+    return;
+  }
+  failJob(job, message);
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  scheduleQueuedJobs();
 }
 
 function requireReauthorization(job, message) {
@@ -1232,6 +1702,11 @@ async function submitJobInput(job, body, options = {}) {
     if (!/^\d{6}$/.test(value)) throw httpError(400, "2FA 验证码必须是 6 位数字");
     inputValue = value;
     setStage(job, "working", "正在验证 2FA 验证码");
+  } else if (action === "totp_setup_otp") {
+    requireStage(job, "totp_setup_otp");
+    if (!/^\d{6}$/.test(value)) throw httpError(400, "设置 2FA 的验证码必须是 6 位数字");
+    inputValue = value;
+    setStage(job, "working", "正在激活新的 2FA");
   } else if (action === "email_otp") {
     requireStage(job, "email_otp");
     if (!/^\d{6}$/.test(value)) throw httpError(400, "Email code must be 6 digits");
@@ -1291,8 +1766,23 @@ async function submitJobInput(job, body, options = {}) {
   touch(job);
 }
 
-function cancelJob(job) {
+async function cancelJob(job) {
   if (!isActive(job.status)) return;
+  if (job.runMode === "totp_setup" || job.queuedMode === "totp_setup") {
+    stopMailPolling(job);
+    job.runId = crypto.randomUUID();
+    job.child?.kill("SIGTERM");
+    job.child = null;
+    await finishTotpSetup(job, 1, "SIGTERM");
+    if (!job.totpKnownEnabled) {
+      job.prompt = "授权文件仍然可用，2FA 设置已取消";
+      job.totpSetupError = "用户取消了本次 2FA 设置";
+      touch(job);
+      await saveJobMetadata(job);
+    }
+    scheduleQueuedJobs();
+    return;
+  }
   stopMailPolling(job);
   releaseSmsNumber(job, "idle");
   job.status = "canceled";
@@ -1309,7 +1799,7 @@ async function cancelAllJobs() {
   if (!activeJobs.length) return 0;
   queueSchedulingPaused = true;
   try {
-    activeJobs.forEach(cancelJob);
+    await Promise.all(activeJobs.map((job) => cancelJob(job)));
     await Promise.all(activeJobs.map((job) => saveJobMetadata(job)));
   } finally {
     queueSchedulingPaused = false;
@@ -1319,7 +1809,7 @@ async function cancelAllJobs() {
 }
 
 async function downloadResult(res, job) {
-  if (job.status !== "completed" || !(await fileExists(job.outputPath))) {
+  if (!job.resultSaved || !(await fileExists(job.outputPath))) {
     sendJson(res, 409, { error: "The sub2api import file is not ready" });
     return;
   }
@@ -1344,7 +1834,7 @@ async function downloadBatchResult(res, ids) {
 
   const selected = uniqueIds.map((id) => jobs.get(id));
   if (selected.some((job) => !job)) throw httpError(404, "部分任务不存在，请刷新页面后重试");
-  const downloadable = selected.filter((job) => job.status === "completed" && job.resultSaved);
+  const downloadable = selected.filter((job) => job.resultSaved);
   if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
 
   const accounts = [];
@@ -1530,7 +2020,7 @@ async function exportSourceAccounts(res, ids) {
     if (job.loginMode === "manual") {
       throw httpError(409, `${job.email} 是旧版本任务，原始登录资料未保存，请重新导入该账号资料后再导出`);
     }
-    lines.push(job.email);
+    lines.push(totpSecret ? `${job.email}--------${totpSecret}` : job.email);
   }
   const payload = Buffer.from(`\uFEFF${lines.join("\n")}\n`, "utf8");
   res.writeHead(200, {
@@ -1555,7 +2045,7 @@ function publicJob(job) {
     updatedAt: job.updatedAt,
     completedAt: job.completedAt,
     lastError: job.lastError,
-    canDownload: job.status === "completed" && job.resultSaved,
+    canDownload: Boolean(job.resultSaved),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
     autoEmailOtp: Boolean(job.mailApiUrl),
@@ -1563,6 +2053,9 @@ function publicJob(job) {
     mailApiError: job.mailApiError,
     currentPhone: job.currentPhone,
     phoneError: job.phoneError,
+    totpSetupSecret: job.status === "totp_setup_otp" ? job.totpSetupSecret : null,
+    totpSetupUri: job.status === "totp_setup_otp" ? job.totpSetupUri : null,
+    totpSetupError: job.totpSetupError || null,
     smsProviderId: job.smsProviderId,
     smsProviderName: job.smsProviderName,
     smsServiceLabel: job.smsServiceLabel,
@@ -1572,6 +2065,8 @@ function publicJob(job) {
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canResume: job.status === "resume_available",
     canRegenerate: job.status === "completed" && job.resultSaved,
+    canForceRelogin: canForceRelogin(job),
+    canSetupTotp: canSetupTotp(job),
     restartRequired: job.restartRequired,
     proxyConfigured: Boolean(job.proxyUrl),
     attempt: job.attempt,
@@ -1584,10 +2079,24 @@ function publicSelectionJob(job) {
     id: job.id,
     email: job.email,
     status: job.status,
-    canDownload: job.status === "completed" && job.resultSaved,
+    canDownload: Boolean(job.resultSaved),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,
+    canForceRelogin: canForceRelogin(job),
+    canSetupTotp: canSetupTotp(job),
   };
+}
+
+function canForceRelogin(job) {
+  return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
+}
+
+function canSetupTotp(job) {
+  return job.status === "completed"
+    && job.resultSaved
+    && !job.totpSecret
+    && !job.hasTotpCredential
+    && !job.totpKnownEnabled;
 }
 
 function setStage(job, status, prompt) {
@@ -1738,6 +2247,7 @@ async function syncCompletedOutputs(force = false) {
       const outputDir = path.join(OUTPUT_ROOT, entry.name);
       const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
       const checkpointPath = path.join(outputDir, LOGIN_CHECKPOINT_FILENAME);
+      const totpResultPath = path.join(outputDir, TOTP_SETUP_RESULT_FILENAME);
       let metadata = {};
       try {
         metadata = JSON.parse(await fs.readFile(path.join(outputDir, JOB_META_FILENAME), "utf8"));
@@ -1750,21 +2260,29 @@ async function syncCompletedOutputs(force = false) {
         const account = data.accounts[0];
         const email = metadata.email || account?.credentials?.email || account?.extra?.email || account?.name || `restored-${entry.name}`;
         const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
-        const storedCredentials = await loadStoredLoginCredentials(email);
+        let storedCredentials = await loadStoredLoginCredentials(email);
         const completedAt = stat.mtime.toISOString();
         const updatedAt = metadata.updated_at || completedAt;
+        const totpRecovery = await recoverActivatedTotpCredential({
+          email,
+          resultPath: totpResultPath,
+          credentials: storedCredentials,
+        });
+        storedCredentials = totpRecovery.credentials;
+        const restoredOperation = restoredOutputOperationState(metadata, completedAt, totpRecovery);
         jobs.set(entry.name, {
           id: entry.name,
           email,
-          status: "completed",
-          prompt: "已从本地输出目录恢复，可以下载导入文件",
+          status: restoredOperation.status,
+          prompt: restoredOperation.prompt,
           createdAt: metadata.created_at || completedAt,
           updatedAt,
-          completedAt,
+          completedAt: metadata.completed_at || completedAt,
           outputPath,
           checkpointPath,
-          logs: "[restore] 已从本地输出目录恢复完成任务。\n",
-          lastError: null,
+          totpResultPath,
+          logs: restoredOperation.log,
+          lastError: restoredOperation.lastError,
           child: null,
           parserTail: "",
           resultSaved: true,
@@ -1783,10 +2301,14 @@ async function syncCompletedOutputs(force = false) {
           currentPhone: metadata.sms_number || metadata.luban_number || null,
           phoneError: null,
           restartRequired: false,
-          attempt: 1,
+          attempt: Math.max(1, Number(metadata.attempt || 1)),
           runId: null,
           runMode: null,
           fallbackInProgress: false,
+          ...restoredTotpSetupState(metadata, storedCredentials),
+          ...restoredProxyRiskState(metadata),
+          totpSetupError: restoredOperation.totpSetupError,
+          securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
         });
         return;
@@ -1800,18 +2322,25 @@ async function syncCompletedOutputs(force = false) {
         const email = metadata.email || checkpoint.email;
         const storedCredentials = await loadStoredLoginCredentials(email);
         const restoredAt = stat.mtime.toISOString();
+        const savedStatus = String(metadata.status || "");
+        const restoredStatus = isTerminalStatus(savedStatus) ? savedStatus : "resume_available";
         jobs.set(entry.name, {
           id: entry.name,
           email,
-          status: "resume_available",
-          prompt: "检测到邮箱登录检查点，可以继续手机号绑定",
+          status: restoredStatus,
+          prompt: metadata.prompt || (restoredStatus === "resume_available"
+            ? "检测到邮箱登录检查点，可以继续手机号绑定"
+            : "已恢复上次操作状态，登录检查点仍然保留"),
           createdAt: metadata.created_at || restoredAt,
           updatedAt: metadata.updated_at || restoredAt,
           completedAt: null,
           outputPath,
           checkpointPath,
+          totpResultPath,
           logs: `[restore] 已恢复 ${checkpoint.stage || "unknown"} 阶段的登录检查点。\n`,
-          lastError: "上次流程在生成授权文件前中断",
+          lastError: metadata.last_error || (restoredStatus === "resume_available"
+            ? "上次流程在生成授权文件前中断"
+            : null),
           child: null,
           parserTail: "",
           resultSaved: false,
@@ -1830,39 +2359,66 @@ async function syncCompletedOutputs(force = false) {
           currentPhone: checkpoint.oauth?.phone || metadata.sms_number || metadata.luban_number || null,
           phoneError: null,
           restartRequired: false,
-          attempt: 1,
+          attempt: Math.max(1, Number(metadata.attempt || 1)),
           runId: null,
           runMode: null,
           fallbackInProgress: false,
+          ...restoredTotpSetupState(metadata, storedCredentials),
+          ...restoredProxyRiskState(metadata),
+          securityCheckRequired: Boolean(metadata.security_check_required),
           ...restoredSmsState(metadata),
         });
       } catch {
         if (
           !metadata.email
           || !isEmail(metadata.email)
-          || !["queued", "starting", "refreshing"].includes(metadata.status)
         ) return;
         const storedCredentials = await loadStoredLoginCredentials(metadata.email);
         const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
         const restoredAt = metadata.updated_at || new Date().toISOString();
         const missingStoredCredentials = restoredMissingCredentials(metadata, storedCredentials);
         const storedCredentialsMissing = missingStoredCredentials.length > 0;
+        const savedStatus = String(metadata.status || "");
+        const restartable = ["queued", "starting"].includes(savedStatus);
+        const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
+        const restoredStatus = storedCredentialsMissing && restartable
+          ? "reauth_required"
+          : restartable
+            ? "queued"
+            : interrupted || !savedStatus
+              ? "failed"
+              : savedStatus;
+        const restoredPrompt = storedCredentialsMissing && restartable
+          ? "登录资料需要重新确认"
+          : restartable
+            ? "服务重启后已恢复，等待任务槽位"
+            : interrupted || !savedStatus
+              ? "上次流程因服务重启中断，可以重新授权"
+              : metadata.prompt || "已恢复上次任务状态";
+        const restoredError = storedCredentialsMissing && restartable
+          ? `请重新导入或填写${missingStoredCredentials.join("、")}后重试，任务不会使用缺失的资料自动登录`
+          : interrupted || !savedStatus
+            ? metadata.last_error || `上次 ${savedStatus || "未知"} 阶段未完成`
+            : metadata.last_error || null;
         jobs.set(entry.name, {
           id: entry.name,
           email: metadata.email,
-          status: storedCredentialsMissing ? "reauth_required" : "queued",
-          prompt: storedCredentialsMissing ? "登录资料需要重新确认" : "服务重启后已恢复，等待任务槽位",
+          status: restoredStatus,
+          prompt: restoredPrompt,
           createdAt: metadata.created_at || restoredAt,
           updatedAt: restoredAt,
-          completedAt: null,
+          completedAt: metadata.completed_at || null,
           outputPath,
           checkpointPath,
-          logs: storedCredentialsMissing
+          totpResultPath,
+          logs: storedCredentialsMissing && restartable
             ? `[restore] 系统安全凭据存储中无法恢复${missingStoredCredentials.join("、")}，已停止自动启动。\n`
-            : "[restore] 已恢复排队任务，等待可用任务槽位。\n",
-          lastError: storedCredentialsMissing
-            ? `请重新导入或填写${missingStoredCredentials.join("、")}后重试，任务不会使用缺失的资料自动登录`
-            : null,
+            : restartable
+              ? "[restore] 已恢复排队任务，等待可用任务槽位。\n"
+              : interrupted || !savedStatus
+                ? "[restore] 上次任务在生成授权文件前中断，已恢复为可重试状态。\n"
+                : "[restore] 已恢复上次任务状态。\n",
+          lastError: restoredError,
           child: null,
           parserTail: "",
           resultSaved: false,
@@ -1878,16 +2434,21 @@ async function syncCompletedOutputs(force = false) {
           mailApiError: null,
           mailPollRunning: false,
           mailPollToken: null,
-          currentPhone: null,
+          currentPhone: metadata.sms_number || null,
           phoneError: null,
-          restartRequired: false,
-          attempt: 1,
+          restartRequired: restoredStatus === "reauth_required",
+          attempt: Math.max(1, Number(metadata.attempt || 1)),
           runId: null,
           runMode: null,
-          queuedMode: metadata.queued_mode === "refresh" ? "refresh" : "full",
-          queuedAt: storedCredentialsMissing ? null : metadata.queued_at || restoredAt,
-          queuedStartPrompt: "正在建立登录会话",
+          queuedMode: restoredStatus === "queued" && metadata.queued_mode === "refresh" ? "refresh" : "full",
+          queuedAt: restoredStatus === "queued" ? metadata.queued_at || restoredAt : null,
+          queuedStartPrompt: metadata.queued_mode === "refresh"
+            ? "正在使用已有刷新令牌直接生成新授权"
+            : "正在建立登录会话",
           fallbackInProgress: false,
+          ...restoredTotpSetupState(metadata, storedCredentials),
+          ...restoredProxyRiskState(metadata),
+          securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
         });
       }
@@ -1896,6 +2457,83 @@ async function syncCompletedOutputs(force = false) {
     outputSyncPromise = null;
   });
   return outputSyncPromise;
+}
+
+async function recoverActivatedTotpCredential({ email, resultPath, credentials }) {
+  let result;
+  try {
+    result = JSON.parse(await fs.readFile(resultPath, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return { credentials, recovered: false, error: null };
+    return { credentials, recovered: false, error: `2FA 结果文件无法读取：${error.message}` };
+  }
+  if (result?.activation_succeeded !== true || !result?.secret) {
+    return { credentials, recovered: false, error: null };
+  }
+  try {
+    const secret = normalizeTotpSecret(result.secret);
+    const nextCredentials = { ...credentials, totpSecret: secret };
+    const persisted = await saveStoredLoginCredentials(email, nextCredentials);
+    if (!persisted) {
+      return {
+        credentials: nextCredentials,
+        recovered: false,
+        error: "2FA 已激活，但当前系统不支持持久凭据存储；结果文件已保留",
+      };
+    }
+    await removePrivateFile(resultPath);
+    return { credentials: nextCredentials, recovered: true, error: null };
+  } catch (error) {
+    return {
+      credentials,
+      recovered: false,
+      error: `2FA 已激活，但密钥恢复失败：${error.message}；结果文件已保留`,
+    };
+  }
+}
+
+function restoredOutputOperationState(metadata, completedAt, totpRecovery) {
+  const savedStatus = String(metadata.status || "");
+  const interrupted = savedStatus && !isTerminalStatus(savedStatus);
+  const status = !savedStatus || savedStatus === "completed"
+    ? "completed"
+    : interrupted ? "failed" : savedStatus;
+  if (totpRecovery.recovered) {
+    return {
+      status: "completed",
+      prompt: "已恢复上次成功激活的 2FA 密钥，原授权文件仍可下载",
+      lastError: null,
+      totpSetupError: null,
+      log: "[restore] 已从中断的 2FA 设置流程恢复并安全保存密钥。\n",
+    };
+  }
+  if (totpRecovery.error) {
+    return {
+      status: "completed",
+      prompt: "原授权文件仍可下载，2FA 密钥需要重试恢复",
+      lastError: metadata.last_error || null,
+      totpSetupError: totpRecovery.error,
+      log: `[restore] ${totpRecovery.error}\n`,
+    };
+  }
+  if (interrupted) {
+    return {
+      status,
+      prompt: "上次操作因服务重启中断，旧授权文件仍可下载",
+      lastError: metadata.last_error || `上次 ${savedStatus} 阶段未完成`,
+      totpSetupError: savedStatus.startsWith("totp_") ? "服务重启时 2FA 设置未完成" : null,
+      log: "[restore] 检测到旧授权文件，同时保留了上次中断的操作状态。\n",
+    };
+  }
+  return {
+    status,
+    prompt: metadata.prompt || (status === "completed"
+      ? "已从本地输出目录恢复，可以下载导入文件"
+      : "旧授权文件仍可下载，已恢复最近一次操作状态"),
+    lastError: metadata.last_error || null,
+    totpSetupError: savedStatus.startsWith("totp_") ? "服务重启时 2FA 设置未完成" : null,
+    log: `[restore] 已恢复任务状态，旧授权文件时间 ${completedAt}。\n`,
+  };
 }
 
 function isEmail(value) {
@@ -1940,6 +2578,31 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
   };
 }
 
+function restoredTotpSetupState(metadata = {}, credentials = {}) {
+  return {
+    totpSetupSecret: null,
+    totpSetupUri: null,
+    totpSetupError: null,
+    totpKnownEnabled: Boolean(metadata.totp_known_enabled || credentials.totpSecret),
+    totpSetupAttempt: 0,
+    totpResultLoading: false,
+  };
+}
+
+function restoredProxyRiskState(metadata = {}) {
+  const count = Number(metadata.proxy_risk_retry_count || 0);
+  const connectionFailures = Number(metadata.proxy_connection_failure_count || 0);
+  return {
+    proxyRiskRetryCount: Number.isInteger(count) && count >= 0 ? Math.min(count, MAX_PROXY_RISK_RETRIES) : 0,
+    proxyConnectionFailureCount: Number.isInteger(connectionFailures) && connectionFailures >= 0
+      ? Math.min(connectionFailures, MAX_PROXY_CONNECTION_FAILURES)
+      : 0,
+    proxyRiskRestarting: false,
+    proxySessionAttemptIds: new Set(),
+    proxyAttemptParserTail: "",
+  };
+}
+
 function restoredMissingCredentials(metadata = {}, credentials = {}) {
   const missing = [];
   const passwordRequired = Object.hasOwn(metadata, "has_password")
@@ -1975,7 +2638,14 @@ function parseBatchEntries(value) {
     const split = splitAccountLine(line);
     if (!split) {
       if (!isEmail(line)) throw httpError(400, `第 ${index + 1} 行邮箱格式错误`);
-      return { email: line, loginMode: "email_otp", mailApiUrl: null, password: "", totpSecret: "" };
+      return {
+        email: line,
+        loginMode: "email_otp",
+        mailApiUrl: null,
+        password: "",
+        totpSecret: "",
+        preserveExistingCredentials: true,
+      };
     }
     const { email, remainder } = split;
     if (!isEmail(email)) throw httpError(400, `第 ${index + 1} 行邮箱格式错误`);
@@ -2009,6 +2679,11 @@ function parseBatchEntries(value) {
       return { email, loginMode: "password", mailApiUrl: null, password: loginValue, totpSecret: "" };
     }
 
+    if (lastDelimiterAt === 0) {
+      const totpSecret = normalizeTotpSecret(remainder.slice(4), index + 1);
+      return { email, loginMode: "email_otp", mailApiUrl: null, password: "", totpSecret };
+    }
+
     const loginValue = remainder.slice(0, lastDelimiterAt).trim();
     const totpSecret = normalizeTotpSecret(remainder.slice(lastDelimiterAt + 4), index + 1);
     if (!loginValue) throw httpError(400, `第 ${index + 1} 行密码或收码接口不能为空`);
@@ -2037,7 +2712,14 @@ function splitAccountLine(line) {
 }
 
 async function updateJobCredentials(job, credentials, options = {}) {
-  const normalized = normalizeLoginCredentials(credentials);
+  if (credentials.preserveExistingCredentials) await reloadMissingJobCredentials(job);
+  const normalized = credentials.preserveExistingCredentials
+    ? normalizeLoginCredentials({
+        password: job.password,
+        mailApiUrl: job.mailApiUrl,
+        totpSecret: job.totpSecret,
+      })
+    : normalizeLoginCredentials(credentials);
   const nextProxyUrl = options.hasProxyUpdate ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl;
   const changed = job.loginMode !== normalized.loginMode
     || job.mailApiUrl !== normalized.mailApiUrl
@@ -2109,6 +2791,12 @@ async function saveJobMetadata(job) {
         version: 1,
         email: job.email,
         status: job.status,
+        prompt: job.prompt || null,
+        last_error: job.lastError || null,
+        result_saved: Boolean(job.resultSaved),
+        completed_at: job.completedAt || null,
+        attempt: Number(job.attempt || 1),
+        security_check_required: Boolean(job.securityCheckRequired),
         queued_mode: job.queuedMode || null,
         queued_at: job.queuedAt || null,
         created_at: job.createdAt,
@@ -2116,6 +2804,9 @@ async function saveJobMetadata(job) {
         has_stored_credentials: Boolean(job.password || job.totpSecret),
         has_password: Boolean(job.password || job.hasPasswordCredential),
         has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
+        totp_known_enabled: Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential),
+        proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
+        proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
         proxy_configured: Boolean(job.proxyUrl),
         mail_api_url: job.mailApiUrl || null,
         sms_provider_id: job.smsProviderId || null,
@@ -2139,14 +2830,15 @@ async function saveStoredLoginCredentials(email, credentials = {}) {
   const proxyUrl = credentials.proxyUrl ? normalizeProxyUrl(credentials.proxyUrl) : "";
   if (!password && !totpSecret && !proxyUrl) {
     await deleteStoredLoginCredentials(email);
-    return;
+    return true;
   }
   try {
     await credentialStore.save(email, { password, totpSecret, proxyUrl });
   } catch (error) {
-    if (error?.status === 501) return;
+    if (error?.status === 501) return false;
     throw error;
   }
+  return true;
 }
 
 async function loadStoredLoginCredentials(email) {
@@ -2308,14 +3000,60 @@ function httpError(status, message) {
   return error;
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => void shutdown().catch(reportShutdownFailure));
+process.on("SIGTERM", () => void shutdown().catch(reportShutdownFailure));
 
 async function shutdown() {
-  shuttingDown = true;
-  for (const job of jobs.values()) {
-    if (isActive(job.status)) cancelJob(job);
-  }
-  await vite.close();
-  server.close(() => process.exit(0));
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = (async () => {
+    shuttingDown = true;
+    queueSchedulingPaused = true;
+    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
+    const childWaits = activeJobs
+      .map((job) => job.child)
+      .filter(Boolean)
+      .map((child) => waitForChildExit(child, 3_000));
+    await Promise.allSettled(activeJobs.map((job) => cancelJob(job)));
+    await Promise.allSettled([
+      ...childWaits,
+      ...[...jobs.values()].map((job) => job.metadataWritePromise).filter(Boolean),
+    ]);
+    await vite.close();
+    await closeHttpServer(server);
+  })();
+  return shutdownPromise;
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    child.once("close", finish);
+    timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish();
+    }, timeoutMs);
+  });
+}
+
+function closeHttpServer(httpServer) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      httpServer.closeAllConnections?.();
+      resolve();
+    }, 3_000);
+    httpServer.close(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+function reportShutdownFailure(error) {
+  console.error(`[shutdown] ${error.message}`);
+  process.exitCode = 1;
 }

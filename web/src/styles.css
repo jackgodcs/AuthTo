@@ -247,7 +247,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .stop-all-button:hover:not(:disabled) { color: #fff; background: var(--danger); border-color: var(--danger); }
 
 .table-frame { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; }
-table { width: 100%; min-width: 1080px; border-collapse: collapse; table-layout: fixed; }
+table { width: 100%; min-width: 1600px; border-collapse: collapse; table-layout: fixed; }
 th {
   height: 42px;
   padding: 0 16px;
@@ -261,11 +261,11 @@ th {
   letter-spacing: 0;
 }
 th:nth-child(1) { width: 4%; }
-th:nth-child(2) { width: 21%; }
-th:nth-child(3) { width: 12%; }
-th:nth-child(4) { width: 33%; }
-th:nth-child(5) { width: 10%; }
-th:nth-child(6) { width: 20%; }
+th:nth-child(2) { width: 19%; }
+th:nth-child(3) { width: 11%; }
+th:nth-child(4) { width: 27%; }
+th:nth-child(5) { width: 9%; }
+th:nth-child(6) { width: 30%; }
 .actions-heading { text-align: right; }
 .select-heading, .select-cell { text-align: center; }
 .select-heading input, .select-cell input { width: 15px; height: 15px; margin: 0; accent-color: var(--green); cursor: pointer; }
@@ -324,7 +324,7 @@ tbody tr:last-child td { border-bottom: 0; }
   font-weight: 700;
   white-space: nowrap;
 }
-.status-badge.email_otp, .status-badge.password, .status-badge.mfa_otp, .status-badge.phone, .status-badge.phone_otp { color: var(--amber); background: var(--amber-soft); }
+.status-badge.email_otp, .status-badge.password, .status-badge.mfa_otp, .status-badge.totp_setup_otp, .status-badge.phone, .status-badge.phone_otp { color: var(--amber); background: var(--amber-soft); }
 .status-badge.queued { color: var(--blue); background: var(--blue-soft); }
 .status-badge.completed { color: var(--green-strong); background: var(--green-soft); }
 .status-badge.failed { color: var(--danger); background: var(--danger-soft); }
@@ -332,6 +332,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-badge.reauth_required { color: var(--danger); background: var(--danger-soft); }
 .status-badge.resume_available { color: var(--amber); background: var(--amber-soft); }
 .status-badge.refreshing { color: var(--blue); background: var(--blue-soft); }
+.status-badge.totp_starting { color: var(--blue); background: var(--blue-soft); }
 
 .step-cell { padding-top: 10px; padding-bottom: 10px; }
 .prompt-line { color: #44504c; font-size: 12px; }
@@ -352,6 +353,26 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .sms-status.error { color: var(--danger); }
 .sms-status svg { flex: 0 0 auto; margin-top: 1px; }
+.totp-setup-secret {
+  width: min(100%, 440px);
+  margin-top: 7px;
+  padding: 6px 7px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 7px;
+  color: #596660;
+  background: #f7faf8;
+  border: 1px solid #d7e1dc;
+  border-radius: 5px;
+  font-size: 10px;
+}
+.totp-setup-secret code {
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
 .inline-entry { margin-top: 8px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .compact-input {
   width: 178px;
@@ -418,7 +439,8 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .text-action:hover { color: var(--green); }
 .time-cell { color: #727d79; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+.row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; white-space: nowrap; }
+.row-actions > button { flex: 0 0 auto; white-space: nowrap; }
 .download-button { height: 32px; padding: 0 11px; font-size: 12px; }
 .retry-button {
   height: 32px;
@@ -452,6 +474,23 @@ tbody tr:last-child td { border-bottom: 0; }
   cursor: pointer;
 }
 .regenerate-button:hover { color: #fff; background: var(--green); border-color: var(--green); }
+.relogin-button {
+  height: 32px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  border: 1px solid #bfd2e7;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.relogin-button:hover:not(:disabled) { color: #fff; background: var(--blue); border-color: var(--blue); }
 
 .log-row td { padding: 0 16px 16px; background: #fbfcfb; }
 .log-panel { border: 1px solid #dbe1de; border-radius: 6px; overflow: hidden; background: #101815; }

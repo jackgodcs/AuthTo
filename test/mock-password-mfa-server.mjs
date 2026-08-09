@@ -13,11 +13,18 @@ let chatgptWorkspaceSelected = false;
 let chatgptLoginComplete = false;
 let workspaceSelectionCount = 0;
 let selectedEmail = "mfa-test@example.com";
+let totpEnabled = false;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
   const body = await readBody(req);
 
+  if (req.method === "GET" && url.pathname === "/" && url.searchParams.get("action") === "enable") {
+    res.setHeader("set-cookie", [
+      "__Secure-next-auth.session-token=mock-session; Path=/",
+    ]);
+    return sendText(res, 200, '<html><script>window.__INITIAL_STATE__={"accessToken":"mock-chatgpt-access-token-1234567890"}</script></html>', "text/html");
+  }
   if (req.method === "GET" && url.pathname === "/") {
     res.setHeader("set-cookie", [
       "__Host-next-auth.csrf-token=mock-csrf; Path=/",
@@ -48,6 +55,7 @@ const server = http.createServer(async (req, res) => {
     if (payload.password !== password || Object.keys(payload).length !== 1) {
       return sendJson(res, 401, { error: { message: "invalid password" } });
     }
+    if (selectedEmail === "setup-totp@example.com") return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "external_url" } });
     return sendJson(res, 200, mfaPayload());
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/validate") {
@@ -56,6 +64,33 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 400, { error: { message: "invalid email code" } });
     }
     return sendJson(res, 200, mfaPayload());
+  }
+  if (req.method === "GET" && url.pathname === "/backend-api/accounts/mfa_info") {
+    if (selectedEmail === "setup-totp@example.com" && totpEnabled) {
+      return sendJson(res, 503, { error: { message: "simulated confirmation failure" } });
+    }
+    return sendJson(res, 200, {
+      mfa_enabled: totpEnabled,
+      mfa_enabled_v2: totpEnabled,
+      factors: { totp: totpEnabled ? [{ id: "setup-factor", factor_type: "totp" }] : [], push_auth: null, passkeys: [], sms: [] },
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/backend-api/accounts/mfa/enroll") {
+    if (selectedEmail !== "setup-totp@example.com" || totpEnabled) return sendJson(res, 409, { error: { message: "already enabled" } });
+    return sendJson(res, 200, {
+      secret: "NB2W45DFOIZAQWER",
+      session_id: "mock-enroll-session",
+      factor: { id: "setup-factor", factor_type: "totp", is_recovery: false },
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/backend-api/accounts/mfa/user/activate_enrollment") {
+    const payload = parseJson(body);
+    const acceptedCodes = [-1, 0, 1].map((offset) => generateTotp("NB2W45DFOIZAQWER", Date.now() + offset * 30_000));
+    if (!acceptedCodes.includes(payload.code) || payload.factor_type !== "totp" || payload.session_id !== "mock-enroll-session") {
+      return sendJson(res, 400, { error: { message: "invalid setup code" } });
+    }
+    totpEnabled = true;
+    return sendJson(res, 200, { success: true });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/mfa/issue_challenge") {
     const payload = parseJson(body);
@@ -108,7 +143,12 @@ const server = http.createServer(async (req, res) => {
       });
     }
     return sendJson(res, 200, {
-      "oai-client-auth-session": { workspaces: [{ id: personalWorkspaceId, kind: "personal" }] },
+      "oai-client-auth-session": {
+        workspaces: [
+          { id: personalWorkspaceId, kind: "personal" },
+          { id: organizationWorkspaceId, kind: "organization" },
+        ],
+      },
     });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/workspace/select") {
@@ -121,7 +161,7 @@ const server = http.createServer(async (req, res) => {
       workspaceSelectionCount += 1;
       return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "external_url" } });
     }
-    if (payload.workspace_id !== personalWorkspaceId) {
+    if (payload.workspace_id !== organizationWorkspaceId) {
       return sendJson(res, 400, { error: { message: "unexpected Codex workspace" } });
     }
     workspaceSelectionCount += 1;

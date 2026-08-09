@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,7 +10,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const UNCONFIGURED = Symbol("unconfigured");
 
 export class TlsFingerprintTransport {
-  constructor({ enabled = true, profile = DEFAULT_PROFILE, verbose = false } = {}) {
+  constructor({ enabled = true, profile = DEFAULT_PROFILE, verbose = false, maxProxySessionAttempts = 10 } = {}) {
     this.enabled = Boolean(enabled);
     this.profile = profile || DEFAULT_PROFILE;
     this.verbose = Boolean(verbose);
@@ -21,6 +22,7 @@ export class TlsFingerprintTransport {
     this.configuredProxy = UNCONFIGURED;
     this.configuredProfile = null;
     this.closed = false;
+    this.remainingProxySessionAttempts = normalizeProxyAttemptLimit(maxProxySessionAttempts);
   }
 
   async configure(proxy, { force = false } = {}) {
@@ -45,19 +47,26 @@ export class TlsFingerprintTransport {
     }
 
     const canRotate = proxySupportsSessionRotation(template);
-    const maxAttempts = canRotate ? 10 : 1;
+    if (canRotate && this.remainingProxySessionAttempts <= 0) {
+      throw new Error("PROXY_RISK_CONTROL: 代理会话检测额度已用尽");
+    }
+    const maxAttempts = 1;
     if (!canRotate) {
       console.log("[proxy] 未检测到可轮换的会话编号，仅检测当前代理 1 次");
     }
     let lastError = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const proxy = canRotate ? rotateProxySession(template) : template;
+      if (canRotate) {
+        this.remainingProxySessionAttempts -= 1;
+      }
       try {
         await this.configure(proxy, { force: true });
         const response = await this.request("GET", validationUrl, {
           timeoutMs: DEFAULT_TIMEOUT_MS,
           discardBody: true,
         });
+        if (canRotate) console.log(`[proxy-session-attempt] ${randomUUID()}`);
         const challenge = response.headers.get("cf-mitigated") || response.headers.get("x-cf-mitigated");
         if (response.status >= 200 && response.status < 400 && !challenge) {
           console.log(`[proxy] 代理检测通过（第 ${attempt} 次，出口会话 ${maskSession(proxy)}）`);
@@ -65,14 +74,15 @@ export class TlsFingerprintTransport {
         }
         lastError = new Error(`HTTP ${response.status}${challenge ? "，返回安全校验页面" : ""}`);
         if (canRotate) {
-          console.log(`[proxy] 第 ${attempt} 次代理检测失败：${lastError.message}，准备更换会话`);
+          console.log(`[proxy] 本次代理检测失败：${lastError.message}，等待更换会话`);
         } else {
           console.log(`[proxy] 代理检测失败：${lastError.message}`);
         }
       } catch (error) {
         lastError = error;
         if (canRotate) {
-          console.log(`[proxy] 第 ${attempt} 次代理连接失败：${redactProxyError(error.message)}，准备更换会话`);
+          console.log(`[proxy] 本次代理连接失败：${redactProxyError(error.message)}，等待更换会话`);
+          throw new Error(`PROXY_CONNECTION_RETRY: ${redactProxyError(error.message)}`);
         } else {
           console.log(`[proxy] 代理连接失败：${redactProxyError(error.message)}`);
         }
@@ -80,7 +90,7 @@ export class TlsFingerprintTransport {
     }
     throw new Error(
       canRotate
-        ? `代理连续检测失败 10 次：${redactProxyError(lastError?.message || "未知错误")}`
+        ? `PROXY_RISK_CONTROL: 代理本次检测失败：${redactProxyError(lastError?.message || "未知错误")}`
         : `代理检测失败：${redactProxyError(lastError?.message || "未知错误")}`,
     );
   }
@@ -286,10 +296,22 @@ function randomNumericSessionId() {
   return String(Math.floor(10_000_000 + Math.random() * 90_000_000));
 }
 
+function normalizeProxyAttemptLimit(value) {
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 10;
+}
+
 function maskSession(proxyUrl) {
   try {
-    const username = decodeURIComponent(new URL(proxyUrl).username);
-    return username.replace(/(sid-)[A-Za-z0-9]+/, "$1<redacted>");
+    const parsed = new URL(proxyUrl);
+    const username = decodeURIComponent(parsed.username);
+    const password = decodeURIComponent(parsed.password);
+    const source = /(^|-)sid-[A-Za-z0-9]+(?=-|$)/.test(username) ? username : password;
+    const fingerprint = createHash("sha256").update(source).digest("hex").slice(0, 6);
+    if (/(^|-)sid-[A-Za-z0-9]+(?=-|$)/.test(username)) {
+      return username.replace(/(sid-)[A-Za-z0-9]+/, `$1<redacted:${fingerprint}>`);
+    }
+    return `${username || "proxy"}-session-<redacted:${fingerprint}>`;
   } catch {
     return "<redacted>";
   }
