@@ -48,9 +48,10 @@ export function createCredentialStore(options = {}) {
   return {
     async save(email, credentials) {
       const payload = JSON.stringify({
-        version: 1,
+        version: 2,
         password: typeof credentials.password === "string" ? credentials.password : "",
         totpSecret: typeof credentials.totpSecret === "string" ? credentials.totpSecret : "",
+        proxyUrl: typeof credentials.proxyUrl === "string" ? credentials.proxyUrl : "",
       });
       if (platform === "darwin") {
         const result = await securityRunner([
@@ -63,7 +64,7 @@ export function createCredentialStore(options = {}) {
           "-w",
         ], `${payload}\n${payload}\n`);
         if (result.code !== 0) {
-          throw credentialError(500, "无法将密码和 2FA 密钥保存到 macOS Keychain（钥匙串），请先解锁登录钥匙串");
+          throw credentialError(500, "无法将登录凭据和代理配置保存到 macOS Keychain（钥匙串），请先解锁登录钥匙串");
         }
         return;
       }
@@ -75,14 +76,14 @@ export function createCredentialStore(options = {}) {
           result = { code: 1, stdout: "" };
         }
         if (result.code !== 0 || !isBase64(result.stdout)) {
-          throw credentialError(500, "无法使用 Windows DPAPI（数据保护接口）保存密码和 2FA 密钥，请确认 PowerShell 可正常运行");
+          throw credentialError(500, "无法使用 Windows DPAPI（数据保护接口）保存登录凭据和代理配置，请确认 PowerShell 可正常运行");
         }
         await fs.mkdir(windowsRoot, { recursive: true });
         const filePath = windowsCredentialPath(windowsRoot, email);
         await fs.writeFile(filePath, `${result.stdout.trim()}\n`, { mode: 0o600 });
         return;
       }
-      throw credentialError(501, "持久保存密码和 2FA 密钥目前支持 macOS Keychain（钥匙串）和 Windows DPAPI（数据保护接口）");
+      throw credentialError(501, "持久保存登录凭据和代理配置目前支持 macOS Keychain（钥匙串）和 Windows DPAPI（数据保护接口）");
     },
 
     async load(email) {
@@ -162,6 +163,7 @@ function parseCredentialPayload(value) {
     return {
       password: typeof data.password === "string" ? data.password : "",
       totpSecret: typeof data.totpSecret === "string" ? data.totpSecret : "",
+      proxyUrl: typeof data.proxyUrl === "string" ? data.proxyUrl : "",
     };
   } catch {
     return emptyCredentials();
@@ -169,7 +171,7 @@ function parseCredentialPayload(value) {
 }
 
 function emptyCredentials() {
-  return { password: "", totpSecret: "" };
+  return { password: "", totpSecret: "", proxyUrl: "" };
 }
 
 function isBase64(value) {

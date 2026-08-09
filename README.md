@@ -36,9 +36,10 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 ## 环境要求
 
 - Node.js 20 或更高版本，建议使用 Node.js 22。
-- macOS 使用 Keychain（钥匙串）持久保存密码和 2FA 密钥。
-- Windows 使用当前用户的 DPAPI（数据保护接口）加密保存，密文位于 `%LOCALAPPDATA%\toSub2\credentials`，只能由同一个 Windows 用户解密。
-- Linux 仍可使用邮箱验证码流程，但目前不持久保存密码和 2FA 密钥。
+- Python 3.9 或更高版本；默认协议登录流程需要安装 `curl_cffi`（浏览器 TLS 指纹请求库），即使不使用代理也需要。
+- macOS 使用 Keychain（钥匙串）持久保存密码、2FA 密钥和账号代理。
+- Windows 使用当前用户的 DPAPI（数据保护接口）加密保存上述数据，密文位于 `%LOCALAPPDATA%\toSub2\credentials`，只能由同一个 Windows 用户解密。
+- Linux 仍可使用邮箱验证码流程，但目前不持久保存密码、2FA 密钥和账号代理；服务重启后不会让原本配置代理的排队任务悄悄改用本机网络。
 
 ## 安装与启动
 
@@ -46,6 +47,7 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 git clone https://github.com/poxiao33/toSub2.git
 cd toSub2
 npm install
+python -m pip install -r requirements.txt
 npm run dev
 ```
 
@@ -68,6 +70,22 @@ npm run dev -- --host 0.0.0.0
 ```
 
 局域网模式没有访问认证，只应在可信网络内短时间使用。
+
+## 账号代理和 TLS 指纹
+
+网页顶部的“代理 IP”输入框配置账号登录使用的代理。支持以下格式：
+
+```text
+http://用户名:密码@主机:端口
+socks5h://用户名:密码@主机:端口
+socks5h://account-id:proxy-secret-JP-91977332-20m@proxy.example.com:1000
+```
+
+如果用户名中存在 `-sid-xxxxxxxx-t-20`，或者密码中存在 `-JP-12345678-20m` 这样的会话字段，toSub2 会为每个任务随机生成新的会话编号，并使用 `curl_cffi` 的 `chrome146`（Chrome 146 浏览器指纹）真实访问 `chatgpt.com` 检测出口。检测遇到 HTTP 403、安全校验、连接错误或超时时，会更换会话并最多重试 10 次。没有可识别会话字段的固定代理只检测 1 次，失败后直接提示代理不可用。代理检测成功后，后续 ChatGPT、auth.openai.com、Sentinel 和 OAuth 请求会复用同一个 Python 会话、Cookie 和出口。
+
+代理输入为空时使用本机网络。页面设置保存在当前浏览器的 localStorage（本地存储）中；创建任务、重试和重新授权会读取输入框当前最新内容。任务实际使用的代理还会保存在系统安全凭据存储中，以便服务重启后恢复排队任务。代理密码不会写入 `job-meta.json`（任务元数据）或日志。
+
+Python 辅助进程默认使用 `python3`（macOS/Linux）或 `python`/`py -3`（Windows）。如果系统有多个 Python，可以设置环境变量 `TOSUB2_PYTHON` 指定解释器路径。
 
 ## 批量添加格式
 

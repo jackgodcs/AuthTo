@@ -1,0 +1,300 @@
+import { spawn, spawnSync } from "node:child_process";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const WORKER_SCRIPT = path.join(__dirname, "tls_transport.py");
+const DEFAULT_PROFILE = "chrome146";
+const DEFAULT_TIMEOUT_MS = 30_000;
+const UNCONFIGURED = Symbol("unconfigured");
+
+export class TlsFingerprintTransport {
+  constructor({ enabled = true, profile = DEFAULT_PROFILE, verbose = false } = {}) {
+    this.enabled = Boolean(enabled);
+    this.profile = profile || DEFAULT_PROFILE;
+    this.verbose = Boolean(verbose);
+    this.child = null;
+    this.stdoutBuffer = "";
+    this.stderrBuffer = "";
+    this.pending = new Map();
+    this.nextId = 1;
+    this.configuredProxy = UNCONFIGURED;
+    this.configuredProfile = null;
+    this.closed = false;
+  }
+
+  async configure(proxy, { force = false } = {}) {
+    if (!this.enabled) return;
+    if (!force && this.configuredProxy === (proxy || null) && this.configuredProfile === this.profile) return;
+    await this.send({ operation: "configure", proxy: proxy || null, impersonate: this.profile });
+    this.configuredProxy = proxy || null;
+    this.configuredProfile = this.profile;
+  }
+
+  async resetSession() {
+    if (!this.enabled) return;
+    await this.configure(this.configuredProxy === UNCONFIGURED ? null : this.configuredProxy, { force: true });
+  }
+
+  async prepareProxy(proxyTemplate, validationUrl) {
+    if (!this.enabled) return null;
+    const template = String(proxyTemplate || "").trim();
+    if (!template) {
+      await this.configure(null, { force: true });
+      return null;
+    }
+
+    const canRotate = proxySupportsSessionRotation(template);
+    const maxAttempts = canRotate ? 10 : 1;
+    if (!canRotate) {
+      console.log("[proxy] 未检测到可轮换的会话编号，仅检测当前代理 1 次");
+    }
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const proxy = canRotate ? rotateProxySession(template) : template;
+      try {
+        await this.configure(proxy, { force: true });
+        const response = await this.request("GET", validationUrl, {
+          timeoutMs: DEFAULT_TIMEOUT_MS,
+          discardBody: true,
+        });
+        const challenge = response.headers.get("cf-mitigated") || response.headers.get("x-cf-mitigated");
+        if (response.status >= 200 && response.status < 400 && !challenge) {
+          console.log(`[proxy] 代理检测通过（第 ${attempt} 次，出口会话 ${maskSession(proxy)}）`);
+          return proxy;
+        }
+        lastError = new Error(`HTTP ${response.status}${challenge ? "，返回安全校验页面" : ""}`);
+        if (canRotate) {
+          console.log(`[proxy] 第 ${attempt} 次代理检测失败：${lastError.message}，准备更换会话`);
+        } else {
+          console.log(`[proxy] 代理检测失败：${lastError.message}`);
+        }
+      } catch (error) {
+        lastError = error;
+        if (canRotate) {
+          console.log(`[proxy] 第 ${attempt} 次代理连接失败：${redactProxyError(error.message)}，准备更换会话`);
+        } else {
+          console.log(`[proxy] 代理连接失败：${redactProxyError(error.message)}`);
+        }
+      }
+    }
+    throw new Error(
+      canRotate
+        ? `代理连续检测失败 10 次：${redactProxyError(lastError?.message || "未知错误")}`
+        : `代理检测失败：${redactProxyError(lastError?.message || "未知错误")}`,
+    );
+  }
+
+  async request(method, url, options = {}) {
+    if (!this.enabled) {
+      const response = await fetch(url, options);
+      return response;
+    }
+    if (Object.hasOwn(options, "proxy")) await this.configure(options.proxy || null);
+    else if (this.configuredProxy === UNCONFIGURED) await this.configure(null);
+    const headers = options.headers instanceof Headers
+      ? [...options.headers.entries()]
+      : Object.entries(options.headers || {});
+    const body = encodeBody(options.body);
+    const result = await this.send({
+      operation: "request",
+      method,
+      url,
+      headers,
+      body,
+      timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
+      discardBody: Boolean(options.discardBody),
+    });
+    const responseHeaders = new Headers();
+    const rawSetCookie = [];
+    for (const [name, value] of result.headers || []) {
+      if (name.toLowerCase() === "set-cookie") rawSetCookie.push(value);
+      else responseHeaders.append(name, value);
+    }
+    Object.defineProperty(responseHeaders, "rawSetCookie", { value: rawSetCookie });
+    Object.defineProperty(responseHeaders, "transportCookies", { value: result.cookies || [] });
+    const text = result.body ? Buffer.from(result.body, "base64").toString("utf8") : "";
+    return {
+      status: Number(result.status),
+      ok: Number(result.status) >= 200 && Number(result.status) < 300,
+      headers: responseHeaders,
+      text: async () => text,
+      json: async () => JSON.parse(text),
+    };
+  }
+
+  async fetch(url, options = {}) {
+    return this.request(options.method || "GET", url, options);
+  }
+
+  async send(message) {
+    if (this.closed) throw new Error("TLS transport is closed");
+    await this.ensureChild();
+    const id = String(this.nextId++);
+    const payload = { id, ...message };
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`TLS transport timed out after ${message.timeoutMs || DEFAULT_TIMEOUT_MS}ms`));
+      }, Number(message.timeoutMs || DEFAULT_TIMEOUT_MS) + 5_000);
+      this.pending.set(id, { resolve, reject, timer });
+      this.child.stdin.write(`${JSON.stringify(payload)}\n`);
+    });
+  }
+
+  async ensureChild() {
+    if (this.child) return;
+    const python = findPythonCommand();
+    if (!python) {
+      throw new Error("未找到可用的 Python curl_cffi 环境，请先运行 python -m pip install -r requirements.txt；也可以设置 TOSUB2_PYTHON 指定 Python 路径");
+    }
+    this.child = spawn(python.command, [...python.args, WORKER_SCRIPT], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    this.child.stdout.setEncoding("utf8");
+    this.child.stderr.setEncoding("utf8");
+    this.child.stdout.on("data", (chunk) => this.consumeStdout(chunk));
+    this.child.stderr.on("data", (chunk) => {
+      this.stderrBuffer = `${this.stderrBuffer}${chunk}`.slice(-4_000);
+      if (this.verbose) process.stderr.write(`[tls] ${chunk}`);
+    });
+    this.child.on("error", (error) => this.failPending(error));
+    this.child.on("close", (code, signal) => {
+      this.child = null;
+      this.configuredProxy = UNCONFIGURED;
+      this.configuredProfile = null;
+      if (!this.closed) this.failPending(new Error(`TLS worker exited unexpectedly with ${signal || code}`));
+    });
+  }
+
+  consumeStdout(chunk) {
+    this.stdoutBuffer += chunk;
+    let newline;
+    while ((newline = this.stdoutBuffer.indexOf("\n")) >= 0) {
+      const line = this.stdoutBuffer.slice(0, newline).trim();
+      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+      if (!line) continue;
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        this.failPending(new Error(`TLS worker returned invalid JSON: ${error.message}`));
+        continue;
+      }
+      const pending = this.pending.get(String(message.id));
+      if (!pending) continue;
+      this.pending.delete(String(message.id));
+      clearTimeout(pending.timer);
+      if (message.ok) pending.resolve(message.result);
+      else pending.reject(new Error(String(message.error || "TLS worker request failed")));
+    }
+  }
+
+  failPending(error) {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    if (!this.child) return;
+    this.child.kill();
+    this.child = null;
+    this.failPending(new Error("TLS transport closed"));
+  }
+}
+
+export function shouldUseTlsTransport({ chatgptBase, authBase, nativeHttp = false } = {}) {
+  if (nativeHttp) return false;
+  return [chatgptBase, authBase].some((value) => {
+    try {
+      return ["chatgpt.com", "auth.openai.com"].some((host) => new URL(value).hostname === host || new URL(value).hostname.endsWith(`.${host}`));
+    } catch {
+      return false;
+    }
+  });
+}
+
+function findPythonCommand() {
+  const configured = String(process.env.TOSUB2_PYTHON || "").trim();
+  const candidates = configured
+    ? [{ command: configured, args: [] }]
+    : process.platform === "win32"
+      ? [{ command: "python", args: [] }, { command: "py", args: ["-3"] }]
+      : [{ command: "python3", args: [] }, { command: "python", args: [] }];
+  for (const candidate of candidates) {
+    const check = spawnSync(candidate.command, [...candidate.args, "-c", "import curl_cffi"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    if (check.status === 0) return candidate;
+  }
+  return null;
+}
+
+function encodeBody(body) {
+  if (body === undefined || body === null) return null;
+  if (typeof body === "string") return Buffer.from(body, "utf8").toString("base64");
+  if (body instanceof URLSearchParams) return Buffer.from(body.toString(), "utf8").toString("base64");
+  if (Buffer.isBuffer(body) || body instanceof Uint8Array) return Buffer.from(body).toString("base64");
+  return Buffer.from(String(body), "utf8").toString("base64");
+}
+
+export function rotateProxySession(proxyUrl) {
+  const parsed = new URL(proxyUrl);
+  const username = decodeURIComponent(parsed.username);
+  const rotatedUsername = username.replace(/(^|-)sid-[A-Za-z0-9]+(?=-|$)/, `$1sid-${randomSessionId()}`);
+  if (rotatedUsername !== username) {
+    parsed.username = rotatedUsername;
+    return parsed.toString();
+  }
+
+  const password = decodeURIComponent(parsed.password);
+  const rotatedPassword = rotateKookeeySession(password);
+  if (rotatedPassword !== password) parsed.password = rotatedPassword;
+  return parsed.toString();
+}
+
+export function proxySupportsSessionRotation(proxyUrl) {
+  try {
+    const parsed = new URL(proxyUrl);
+    const username = decodeURIComponent(parsed.username);
+    if (/(^|-)sid-[A-Za-z0-9]+(?=-|$)/.test(username)) return true;
+    return rotateKookeeySession(decodeURIComponent(parsed.password)) !== decodeURIComponent(parsed.password);
+  } catch {
+    return false;
+  }
+}
+
+function rotateKookeeySession(password) {
+  const match = /^(.*-[A-Za-z]{2})-([0-9]{8})-(\d+m)$/i.exec(password);
+  if (!match) return password;
+  return `${match[1]}-${randomNumericSessionId()}-${match[3]}`;
+}
+
+function randomSessionId() {
+  const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  return Array.from({ length: 8 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join("");
+}
+
+function randomNumericSessionId() {
+  return String(Math.floor(10_000_000 + Math.random() * 90_000_000));
+}
+
+function maskSession(proxyUrl) {
+  try {
+    const username = decodeURIComponent(new URL(proxyUrl).username);
+    return username.replace(/(sid-)[A-Za-z0-9]+/, "$1<redacted>");
+  } catch {
+    return "<redacted>";
+  }
+}
+
+function redactProxyError(message) {
+  return String(message || "").replace(/(https?|socks5h?):\/\/[^\s/]+:[^\s/@]+@/gi, "$1://<redacted>@").slice(0, 220);
+}

@@ -5,6 +5,7 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { fetchSentinelToken } from "./sentinel.mjs";
+import { shouldUseTlsTransport, TlsFingerprintTransport } from "./tls-transport.mjs";
 
 const DEFAULT_CHATGPT_BASE = "https://chatgpt.com";
 const DEFAULT_AUTH_BASE = "https://auth.openai.com";
@@ -47,7 +48,7 @@ const HAR_ADD_PHONE_COOKIE_NAMES = new Set([
 ]);
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+  "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 
 class CookieJar {
   constructor(cookies = []) {
@@ -104,6 +105,20 @@ class CookieJar {
     return found?.value || null;
   }
 
+  merge(cookies) {
+    for (const rawCookie of Array.isArray(cookies) ? cookies : []) {
+      if (!isStoredCookie(rawCookie)) continue;
+      const cookie = { ...rawCookie, domain: rawCookie.domain.replace(/^\./, "").toLowerCase() };
+      const idx = this.cookies.findIndex(
+        (item) => item.name === cookie.name && item.domain === cookie.domain && item.path === cookie.path,
+      );
+      if (cookie.expires && cookie.expires <= Date.now()) {
+        if (idx >= 0) this.cookies.splice(idx, 1);
+      } else if (idx >= 0) this.cookies[idx] = cookie;
+      else this.cookies.push(cookie);
+    }
+  }
+
   toJSON() {
     return this.cookies;
   }
@@ -118,16 +133,24 @@ class ProtocolClient {
     this.jar = options.jar || new CookieJar();
     this.verbose = Boolean(options.verbose);
     this.debugAuth = Boolean(options.debugAuth);
+    this.transport = options.transport || null;
+  }
+
+  async rawFetch(url, options = {}) {
+    if (this.transport) return this.transport.fetch(url, options);
+    return fetch(url, options);
   }
 
   async request(method, url, options = {}) {
     const targetUrl = new URL(url);
     const headers = new Headers(options.headers || {});
-    headers.set("user-agent", options.userAgent || UA);
+    if (!this.transport?.enabled || options.userAgent) headers.set("user-agent", options.userAgent || UA);
     headers.set("accept-language", "zh-CN,zh;q=0.9,en;q=0.8");
-    headers.set("sec-ch-ua", '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"');
-    headers.set("sec-ch-ua-mobile", "?0");
-    headers.set("sec-ch-ua-platform", '"macOS"');
+    if (!this.transport?.enabled) {
+      headers.set("sec-ch-ua", '"Not;A=Brand";v="8", "Chromium";v="146", "Google Chrome";v="146"');
+      headers.set("sec-ch-ua-mobile", "?0");
+      headers.set("sec-ch-ua-platform", '"macOS"');
+    }
 
     if (!headers.has("accept")) {
       headers.set("accept", options.accept || "application/json, text/plain, */*");
@@ -168,14 +191,16 @@ class ProtocolClient {
     let res;
     let text;
     try {
-      res = await fetch(url, {
+      res = await this.rawFetch(url, {
         method,
         headers,
         body,
         redirect: "manual",
         signal: controller.signal,
+        timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
       });
       this.jar.setFromResponse(url, res.headers);
+      this.jar.merge(res.headers.transportCookies);
       text = await res.text();
     } catch (error) {
       if (error?.name === "AbortError") {
@@ -239,23 +264,31 @@ async function run() {
   }
   const outPath = path.resolve(args.out || DEFAULT_OUT);
   const sub2apiOutPath = path.resolve(args.sub2apiOut || DEFAULT_SUB2API_OUT);
-  if (args.refreshSub2api) {
-    const sourcePath = path.resolve(args.refreshSub2api);
-    const targetPath = path.resolve(args.sub2apiOut || sourcePath);
-    const refreshed = await refreshSub2apiOauthExport({
-      authBase,
-      sourcePath,
-      targetPath,
-      fallbackClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
-    });
-    console.log(`[ok] Saved sub2api import: ${targetPath}`);
-    console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
-    return;
-  }
-  const rl = readline.createInterface({ input, output });
-  const checkpointPath = path.resolve(args.checkpoint || args.resumeCheckpoint || `${sub2apiOutPath}.checkpoint.json`);
-
+  const transport = new TlsFingerprintTransport({
+    enabled: shouldUseTlsTransport({ chatgptBase, authBase, nativeHttp: args.nativeHttp }),
+    profile: args.tlsProfile || process.env.TOSUB2_TLS_PROFILE || "chrome146",
+    verbose: Boolean(args.verbose),
+  });
+  const proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
   try {
+    await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    if (args.refreshSub2api) {
+      const sourcePath = path.resolve(args.refreshSub2api);
+      const targetPath = path.resolve(args.sub2apiOut || sourcePath);
+      const refreshed = await refreshSub2apiOauthExport({
+        authBase,
+        sourcePath,
+        targetPath,
+        fallbackClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
+        transport,
+      });
+      console.log(`[ok] Saved sub2api import: ${targetPath}`);
+      console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
+      return;
+    }
+    const rl = readline.createInterface({ input, output });
+    const checkpointPath = path.resolve(args.checkpoint || args.resumeCheckpoint || `${sub2apiOutPath}.checkpoint.json`);
+    try {
     let client = null;
     let email = args.email || "";
     let web = null;
@@ -284,7 +317,7 @@ async function run() {
 
     if (checkpoint && !args.webOnly) {
       email = checkpoint.email || email;
-      client = new ProtocolClient({ verbose: args.verbose, jar: CookieJar.fromJSON(checkpoint.cookies) });
+      client = new ProtocolClient({ verbose: args.verbose, jar: CookieJar.fromJSON(checkpoint.cookies), transport });
       const saveCheckpoint = createCheckpointWriter(checkpointPath, {
         client,
         email,
@@ -301,14 +334,15 @@ async function run() {
         console.log("[auth-expired] Saved login state expired; restarting email login.");
         await removeProtocolCheckpoint(checkpointPath);
         checkpoint = null;
-        client = null;
-        codex = null;
-      }
+          client = null;
+          codex = null;
+          await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+          }
     }
 
     let freshLoginRestartCount = 0;
     while (!checkpoint && !codex) {
-      client = new ProtocolClient({ verbose: args.verbose });
+      client = new ProtocolClient({ verbose: args.verbose, transport });
       email = email || (await ask(rl, "Email: "));
       if (!email) throw new Error("Email is required");
 
@@ -351,6 +385,7 @@ async function run() {
           client = null;
           web = null;
           codex = null;
+          await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
           continue;
         }
       }
@@ -394,6 +429,8 @@ async function run() {
         concurrency: args.concurrency,
         priority: args.priority,
         rateMultiplier: args.rateMultiplier,
+        transport,
+        cookie: client.jar.headerFor(authBase),
       });
       await fs.mkdir(path.dirname(sub2apiOutPath), { recursive: true });
       await fs.writeFile(sub2apiOutPath, `${JSON.stringify(sub2apiExport.data, null, 2)}\n`);
@@ -409,8 +446,11 @@ async function run() {
     } else if (args.webOnly) {
       await removeProtocolCheckpoint(checkpointPath);
     }
+    } finally {
+      rl.close();
+    }
   } finally {
-    rl.close();
+    await transport.close();
   }
 }
 
@@ -634,9 +674,10 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
     sentinelToken = await fetchSentinelToken({
       flow: "oauth_create_account",
       deviceID: deviceId,
-      fetch: (url, options) => fetch(url, {
+      fetch: (url, options) => client.rawFetch(url, {
         ...options,
         signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+        timeoutMs: DEFAULT_TIMEOUT_MS,
       }),
       reqEndpoint: sentinelRequirementsEndpoint(authBase),
       userAgent: UA,
@@ -1047,6 +1088,8 @@ async function buildSub2apiOauthExport({
   concurrency,
   priority,
   rateMultiplier,
+  transport,
+  cookie,
 }) {
   const callback = new URL(callbackUrl);
   const code = callback.searchParams.get("code");
@@ -1058,6 +1101,8 @@ async function buildSub2apiOauthExport({
     code,
     codeVerifier,
     redirectUri,
+    transport,
+    cookie,
   });
 
   const claims = decodeJwtPayload(tokenSet.id_token);
@@ -1105,8 +1150,24 @@ async function buildSub2apiOauthExport({
   };
 }
 
-async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redirectUri }) {
-  const res = await fetch(`${authBase}/oauth/token`, {
+async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redirectUri, transport, cookie }) {
+  const res = await (transport ? transport.fetch(`${authBase}/oauth/token`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded",
+      "user-agent": UA,
+      ...(cookie ? { cookie } : {}),
+    },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: clientId,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier,
+    }),
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  }) : fetch(`${authBase}/oauth/token`, {
     method: "POST",
     headers: {
       accept: "application/json",
@@ -1120,7 +1181,7 @@ async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redir
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
-  });
+  }));
   const text = await res.text();
   let data;
   try {
@@ -1138,7 +1199,7 @@ async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redir
   return data;
 }
 
-async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fallbackClientId }) {
+async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fallbackClientId, transport }) {
   let data;
   try {
     data = JSON.parse(await fs.readFile(sourcePath, "utf8"));
@@ -1153,7 +1214,7 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
     throw new Error("REFRESH_TOKEN_INVALID: 原文件缺少 OAuth 账号或 refresh_token");
   }
 
-  const tokenSet = await refreshOAuthToken({ authBase, clientId, refreshToken });
+  const tokenSet = await refreshOAuthToken({ authBase, clientId, refreshToken, transport });
   credentials.access_token = tokenSet.access_token;
   credentials.refresh_token = tokenSet.refresh_token || refreshToken;
   if (tokenSet.id_token) credentials.id_token = tokenSet.id_token;
@@ -1192,8 +1253,8 @@ async function refreshSub2apiOauthExport({ authBase, sourcePath, targetPath, fal
   return { email: credentials.email || "" };
 }
 
-async function refreshOAuthToken({ authBase, clientId, refreshToken }) {
-  const res = await fetch(`${authBase}/oauth/token`, {
+async function refreshOAuthToken({ authBase, clientId, refreshToken, transport }) {
+  const res = await (transport ? transport.fetch(`${authBase}/oauth/token`, {
     method: "POST",
     headers: {
       accept: "application/json",
@@ -1205,7 +1266,20 @@ async function refreshOAuthToken({ authBase, clientId, refreshToken }) {
       client_id: clientId,
       refresh_token: refreshToken,
     }),
-  });
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+  }) : fetch(`${authBase}/oauth/token`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded",
+      "user-agent": UA,
+    },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: clientId,
+      refresh_token: refreshToken,
+    }),
+  }));
   const text = await res.text();
   let data;
   try {
@@ -1349,6 +1423,7 @@ function assertOk(result, label) {
 }
 
 function getSetCookie(headers) {
+  if (Array.isArray(headers.rawSetCookie)) return headers.rawSetCookie;
   if (typeof headers.getSetCookie === "function") return headers.getSetCookie();
   const combined = headers.get("set-cookie");
   if (!combined) return [];
@@ -1523,6 +1598,11 @@ function parseArgs(argv) {
     else if (item === "--priority") args.priority = argv[++i];
     else if (item.startsWith("--rate-multiplier=")) args.rateMultiplier = item.slice("--rate-multiplier=".length);
     else if (item === "--rate-multiplier") args.rateMultiplier = argv[++i];
+    else if (item.startsWith("--proxy=")) args.proxy = item.slice("--proxy=".length);
+    else if (item === "--proxy") args.proxy = argv[++i];
+    else if (item.startsWith("--tls-profile=")) args.tlsProfile = item.slice("--tls-profile=".length);
+    else if (item === "--tls-profile") args.tlsProfile = argv[++i];
+    else if (item === "--native-http") args.nativeHttp = true;
     else if (item.startsWith("--chatgpt-base=")) args.chatgptBase = item.slice("--chatgpt-base=".length);
     else if (item === "--chatgpt-base") args.chatgptBase = argv[++i];
     else if (item.startsWith("--auth-base=")) args.authBase = item.slice("--auth-base=".length);
@@ -1543,6 +1623,21 @@ async function ask(rl, prompt) {
 
 function trimSlash(value) {
   return value.replace(/\/+$/, "");
+}
+
+function normalizeProxyUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    throw new Error("账号代理必须是完整的 http://、https://、socks5:// 或 socks5h:// 地址");
+  }
+  if (!["http:", "https:", "socks5:", "socks5h:"].includes(parsed.protocol) || !parsed.hostname) {
+    throw new Error("账号代理只支持 http、https、socks5 和 socks5h 协议");
+  }
+  return parsed.toString();
 }
 
 function base64Url(buffer) {
@@ -1625,6 +1720,9 @@ Options:
   --concurrency <number>          sub2api concurrency. Default: 10
   --priority <number>             sub2api priority. Default: 1
   --rate-multiplier <number>      sub2api rate_multiplier. Default: 1
+  --proxy <url>                   Account proxy; supports http, socks5 and socks5h.
+  --tls-profile <name>            curl_cffi browser profile. Default: chrome146
+  --native-http                   Disable the Python TLS fingerprint transport.
   --chatgpt-base <url>            Default: ${DEFAULT_CHATGPT_BASE}
   --auth-base <url>               Default: ${DEFAULT_AUTH_BASE}
   --codex-client-id <id>          Default: ${DEFAULT_CODEX_CLIENT_ID}

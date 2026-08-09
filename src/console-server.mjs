@@ -37,6 +37,7 @@ const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
 const customSmsPoolPositions = new Map();
+const emailJobLocks = new Map();
 let outputSyncPromise = null;
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
@@ -159,6 +160,7 @@ async function handleApi(req, res, requestUrl) {
         sourceExport: true,
         cancelAll: true,
         sub2apiUpload: true,
+        tlsFingerprint: true,
       },
     });
     return;
@@ -191,29 +193,33 @@ async function handleApi(req, res, requestUrl) {
     }
     const hasCredentialUpdate = ["password", "mailApiUrl", "totpSecret"].some((key) => Object.hasOwn(body, key));
     const credentials = normalizeLoginCredentials(body);
-    const existing = findJobByEmail(email);
-    if (existing) {
-      if (hasCredentialUpdate) await updateJobCredentials(existing, credentials);
-      sendJson(res, 200, { job: publicJob(existing), created: false, updated: hasCredentialUpdate });
-      return;
-    }
-    const job = await startJob(email, credentials);
-    sendJson(res, 201, { job: publicJob(job), created: true, updated: false });
+    const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
+    const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
+    const result = await withEmailJobLock(email, async () => {
+      const existing = findJobByEmail(email);
+      if (existing) {
+        if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate });
+        else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
+        return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate };
+      }
+      return { job: await startJob(email, credentials, proxyUrl), created: true, updated: false };
+    });
+    sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
     return;
   }
 
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/batch") {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text);
-    const existingByEmail = new Map(entries.map((entry) => [entry.email, findJobByEmail(entry.email)]));
-    const results = await Promise.all(entries.map(async (entry) => {
-      const existing = existingByEmail.get(entry.email);
+    const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
+      const existing = findJobByEmail(entry.email);
       if (existing) {
-        await updateJobCredentials(existing, entry);
+        await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true });
         return { job: existing, updated: true };
       }
-      return { job: await startJob(entry.email, entry), updated: false };
-    }));
+      return { job: await startJob(entry.email, entry, proxyUrl), updated: false };
+    })));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
       created: results.filter((item) => !item.updated).length,
@@ -238,7 +244,7 @@ async function handleApi(req, res, requestUrl) {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
     const emails = [...new Set(selected.map((job) => job.email.toLowerCase()))];
-    await Promise.all(emails.map((email) => deleteJobsByEmail(email)));
+    await Promise.all(emails.map((email) => withEmailJobLock(email, () => deleteJobsByEmail(email))));
     sendJson(res, 200, { deleted: emails.length });
     return;
   }
@@ -251,8 +257,8 @@ async function handleApi(req, res, requestUrl) {
     );
     if (unsupported) throw httpError(409, `${unsupported.email} 当前仍在进行中，不能重新授权`);
     await Promise.all(selected.map(async (job) => {
-      if (job.status === "completed") regenerateJob(job);
-      else await retryJob(job);
+      if (job.status === "completed") await regenerateJob(job, body);
+      else await retryJob(job, body);
     }));
     sendJson(res, 200, { jobs: selected.map(publicJob), started: selected.length });
     return;
@@ -406,12 +412,14 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
   if (req.method === "POST" && action === "retry") {
-    await retryJob(job);
+    const body = await readJson(req);
+    await retryJob(job, body);
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "regenerate") {
-    regenerateJob(job);
+    const body = await readJson(req);
+    await regenerateJob(job, body);
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
@@ -461,9 +469,9 @@ function normalizeEmailFilter(value) {
   return [...unique];
 }
 
-async function startJob(email, credentials = {}) {
+async function startJob(email, credentials = {}, proxyUrl = null) {
   const { loginMode, mailApiUrl, password, totpSecret } = normalizeLoginCredentials(credentials);
-  await saveStoredLoginCredentials(email, { password, totpSecret });
+  await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
   const outputDir = path.join(OUTPUT_ROOT, id);
   const outputPath = path.join(outputDir, "sub2api-import-oauth.json");
@@ -490,6 +498,7 @@ async function startJob(email, credentials = {}) {
     totpSecret,
     hasPasswordCredential: Boolean(password),
     hasTotpCredential: Boolean(totpSecret),
+    proxyUrl,
     mailApiUrl,
     mailSeenCandidateKeys: new Set(),
     mailCandidateCounts: new Map(),
@@ -507,6 +516,7 @@ async function startJob(email, credentials = {}) {
     queuedAt: new Date().toISOString(),
     queuedStartPrompt: "正在建立登录会话",
     fallbackInProgress: false,
+    queueRunId: null,
     ...newSmsState(),
   };
   jobs.set(id, job);
@@ -524,6 +534,8 @@ function scheduleQueuedJobs() {
     .sort((a, b) => String(a.queuedAt || a.createdAt).localeCompare(String(b.queuedAt || b.createdAt)));
   for (const job of queuedJobs.slice(0, availableSlots)) {
     const mode = job.queuedMode || "full";
+    const queueRunId = crypto.randomUUID();
+    job.queueRunId = queueRunId;
     job.status = mode === "refresh" ? "refreshing" : "starting";
     job.prompt = job.queuedStartPrompt || (mode === "refresh"
       ? "正在使用已有刷新令牌直接生成新授权"
@@ -531,16 +543,16 @@ function scheduleQueuedJobs() {
     job.queuedAt = null;
     touch(job);
     void saveJobMetadata(job).catch(() => {});
-    void prepareAndLaunchJob(job, mode);
+    void prepareAndLaunchJob(job, mode, queueRunId);
     availableSlots -= 1;
     if (availableSlots <= 0) break;
   }
 }
 
-async function prepareAndLaunchJob(job, mode) {
+async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
     if (mode === "full" && job.mailApiUrl) await loadMailboxBaseline(job);
-    if (!isActive(job.status) || job.status === "queued") return;
+    if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
     failJob(job, `准备登录任务失败：${error.message}`);
@@ -549,6 +561,7 @@ async function prepareAndLaunchJob(job, mode) {
 }
 
 function enqueueJob(job, mode, startPrompt) {
+  job.queueRunId = null;
   job.status = "queued";
   job.prompt = "已加入任务队列";
   job.queuedMode = mode;
@@ -593,6 +606,7 @@ function launchJob(job, options = {}) {
       ...process.env,
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
+      CHATGPT_PROXY_URL: job.proxyUrl || "",
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -635,11 +649,15 @@ function launchJob(job, options = {}) {
   });
 }
 
-async function retryJob(job) {
+async function retryJob(job, options = {}) {
   if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
   const retryingSecurityCheck = Boolean(job.securityCheckRequired);
+  if (Object.hasOwn(options, "proxyUrl")) {
+    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    await saveStoredLoginCredentials(job.email, job);
+  }
   const resumingCheckpoint = job.status === "resume_available"
     || (retryingSecurityCheck && await fileExists(job.checkpointPath));
   stopMailPolling(job);
@@ -670,9 +688,13 @@ async function retryJob(job) {
   enqueueJob(job, "full", startPrompt);
 }
 
-function regenerateJob(job) {
+async function regenerateJob(job, options = {}) {
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
+  }
+  if (Object.hasOwn(options, "proxyUrl")) {
+    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    await saveStoredLoginCredentials(job.email, job);
   }
   job.lastError = null;
   job.parserTail = "";
@@ -1194,7 +1216,11 @@ async function submitJobInput(job, body, options = {}) {
   if (action === "password") {
     requireStage(job, "password");
     if (!rawValue) throw httpError(400, "密码不能为空");
-    await saveStoredLoginCredentials(job.email, { password: rawValue, totpSecret: job.totpSecret });
+    await saveStoredLoginCredentials(job.email, {
+      password: rawValue,
+      totpSecret: job.totpSecret,
+      proxyUrl: job.proxyUrl,
+    });
     job.loginMode = "password";
     job.password = rawValue;
     job.hasPasswordCredential = true;
@@ -1547,6 +1573,7 @@ function publicJob(job) {
     canResume: job.status === "resume_available",
     canRegenerate: job.status === "completed" && job.resultSaved,
     restartRequired: job.restartRequired,
+    proxyConfigured: Boolean(job.proxyUrl),
     attempt: job.attempt,
     queuePosition: job.status === "queued" ? getQueuePosition(job) : 0,
   };
@@ -1643,6 +1670,23 @@ function findJobByEmail(email) {
   return listUniqueJobs().find((job) => job.email.toLowerCase() === key) || null;
 }
 
+async function withEmailJobLock(email, operation) {
+  const key = String(email || "").trim().toLowerCase();
+  const previous = emailJobLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  emailJobLocks.set(key, current);
+  await previous.catch(() => {});
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (emailJobLocks.get(key) === current) emailJobLocks.delete(key);
+  }
+}
+
 function resolveSelectedJobs(ids) {
   if (!Array.isArray(ids) || ids.length === 0) throw httpError(400, "请至少选择一条任务");
   const uniqueIds = [...new Set(ids.map((id) => String(id)))];
@@ -1729,6 +1773,7 @@ async function syncCompletedOutputs(force = false) {
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
           mailStatus: mailApiUrl ? "ready" : "manual",
@@ -1775,6 +1820,7 @@ async function syncCompletedOutputs(force = false) {
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
           mailStatus: mailApiUrl ? "ready" : "manual",
@@ -1799,18 +1845,21 @@ async function syncCompletedOutputs(force = false) {
         const storedCredentials = await loadStoredLoginCredentials(metadata.email);
         const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
         const restoredAt = metadata.updated_at || new Date().toISOString();
+        const proxyCredentialMissing = Boolean(metadata.proxy_configured && !storedCredentials.proxyUrl);
         jobs.set(entry.name, {
           id: entry.name,
           email: metadata.email,
-          status: "queued",
-          prompt: "服务重启后已恢复，等待任务槽位",
+          status: proxyCredentialMissing ? "reauth_required" : "queued",
+          prompt: proxyCredentialMissing ? "代理配置需要重新确认" : "服务重启后已恢复，等待任务槽位",
           createdAt: metadata.created_at || restoredAt,
           updatedAt: restoredAt,
           completedAt: null,
           outputPath,
           checkpointPath,
-          logs: "[restore] 已恢复排队任务，等待可用任务槽位。\n",
-          lastError: null,
+          logs: proxyCredentialMissing
+            ? "[restore] 任务原来使用代理，但系统安全凭据存储中没有可恢复的代理地址，已停止自动启动。\n"
+            : "[restore] 已恢复排队任务，等待可用任务槽位。\n",
+          lastError: proxyCredentialMissing ? "请在页面重新填写代理 IP 后点击重试，避免意外改用本机网络" : null,
           child: null,
           parserTail: "",
           resultSaved: false,
@@ -1819,6 +1868,7 @@ async function syncCompletedOutputs(force = false) {
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
           mailStatus: mailApiUrl ? "baseline" : "manual",
@@ -1832,7 +1882,7 @@ async function syncCompletedOutputs(force = false) {
           runId: null,
           runMode: null,
           queuedMode: metadata.queued_mode === "refresh" ? "refresh" : "full",
-          queuedAt: metadata.queued_at || restoredAt,
+          queuedAt: proxyCredentialMissing ? null : metadata.queued_at || restoredAt,
           queuedStartPrompt: "正在建立登录会话",
           fallbackInProgress: false,
           ...newSmsState(),
@@ -1847,6 +1897,21 @@ async function syncCompletedOutputs(force = false) {
 
 function isEmail(value) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) && value.length <= 254;
+}
+
+function normalizeProxyUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  let parsed;
+  try {
+    parsed = new URL(text);
+  } catch {
+    throw httpError(400, "账号代理必须是完整的 http://、https://、socks5:// 或 socks5h:// 地址");
+  }
+  if (!["http:", "https:", "socks5:", "socks5h:"].includes(parsed.protocol) || !parsed.hostname) {
+    throw httpError(400, "账号代理只支持 http、https、socks5 和 socks5h 协议");
+  }
+  return parsed.toString();
 }
 
 function normalizeLoginCredentials(value = {}) {
@@ -1954,9 +2019,16 @@ function splitAccountLine(line) {
   return null;
 }
 
-async function updateJobCredentials(job, credentials) {
+async function updateJobCredentials(job, credentials, options = {}) {
   const normalized = normalizeLoginCredentials(credentials);
-  await saveStoredLoginCredentials(job.email, normalized);
+  const nextProxyUrl = options.hasProxyUpdate ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl;
+  const changed = job.loginMode !== normalized.loginMode
+    || job.mailApiUrl !== normalized.mailApiUrl
+    || job.password !== normalized.password
+    || job.totpSecret !== normalized.totpSecret
+    || job.proxyUrl !== nextProxyUrl;
+  await saveStoredLoginCredentials(job.email, { ...normalized, proxyUrl: nextProxyUrl });
+  if (!changed) return;
   stopMailPolling(job);
   job.loginMode = normalized.loginMode;
   job.mailApiUrl = normalized.mailApiUrl;
@@ -1964,15 +2036,49 @@ async function updateJobCredentials(job, credentials) {
   job.totpSecret = normalized.totpSecret;
   job.hasPasswordCredential = Boolean(normalized.password);
   job.hasTotpCredential = Boolean(normalized.totpSecret);
+  job.proxyUrl = nextProxyUrl;
   job.mailSeenCandidateKeys.clear();
   job.mailCandidateCounts.clear();
   job.mailStatus = job.mailApiUrl ? "baseline" : "manual";
   job.mailApiError = null;
   appendJobLog(job, "[account] 登录方式与验证资料已按邮箱唯一键更新，敏感字段未写入日志。\n");
-  await saveJobMetadata(job);
-  if (job.mailApiUrl) await loadMailboxBaseline(job);
-  if (job.status === "email_otp") void beginMailPolling(job);
-  touch(job);
+  if (isActive(job.status) && job.status !== "queued") {
+    restartJobAfterConfigurationUpdate(job);
+  } else {
+    touch(job);
+    await saveJobMetadata(job);
+  }
+}
+
+async function updateJobProxy(job, proxyUrl) {
+  if (job.proxyUrl === proxyUrl) return;
+  job.proxyUrl = proxyUrl;
+  await saveStoredLoginCredentials(job.email, job);
+  appendJobLog(job, "[proxy] 账号代理配置已更新。\n");
+  if (isActive(job.status) && job.status !== "queued") {
+    restartJobAfterConfigurationUpdate(job);
+  } else {
+    touch(job);
+    await saveJobMetadata(job);
+  }
+}
+
+function restartJobAfterConfigurationUpdate(job) {
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.queueRunId = null;
+  job.runId = crypto.randomUUID();
+  job.child?.kill("SIGTERM");
+  job.child = null;
+  job.lastError = null;
+  job.parserTail = "";
+  job.currentPhone = null;
+  job.phoneError = null;
+  job.securityCheckRequired = false;
+  job.restartRequired = false;
+  job.attempt += 1;
+  appendJobLog(job, "[account] 已停止使用旧配置的登录进程，并使用新配置重新排队。\n");
+  enqueueJob(job, "full", "账号资料已更新，正在重新建立登录会话");
 }
 
 async function saveJobMetadata(job) {
@@ -1993,6 +2099,7 @@ async function saveJobMetadata(job) {
         has_stored_credentials: Boolean(job.password || job.totpSecret),
         has_password: Boolean(job.password || job.hasPasswordCredential),
         has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
+        proxy_configured: Boolean(job.proxyUrl),
         mail_api_url: job.mailApiUrl || null,
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,
@@ -2012,11 +2119,17 @@ async function saveJobMetadata(job) {
 async function saveStoredLoginCredentials(email, credentials = {}) {
   const password = typeof credentials.password === "string" ? credentials.password : "";
   const totpSecret = credentials.totpSecret ? normalizeTotpSecret(credentials.totpSecret) : "";
-  if (!password && !totpSecret) {
+  const proxyUrl = credentials.proxyUrl ? normalizeProxyUrl(credentials.proxyUrl) : "";
+  if (!password && !totpSecret && !proxyUrl) {
     await deleteStoredLoginCredentials(email);
     return;
   }
-  await credentialStore.save(email, { password, totpSecret });
+  try {
+    await credentialStore.save(email, { password, totpSecret, proxyUrl });
+  } catch (error) {
+    if (error?.status === 501 && proxyUrl && !password && !totpSecret) return;
+    throw error;
+  }
 }
 
 async function loadStoredLoginCredentials(email) {
@@ -2025,9 +2138,10 @@ async function loadStoredLoginCredentials(email) {
     return {
       password: typeof data.password === "string" ? data.password : "",
       totpSecret: data.totpSecret ? normalizeTotpSecret(data.totpSecret) : "",
+      proxyUrl: data.proxyUrl ? normalizeProxyUrl(data.proxyUrl) : null,
     };
   } catch {
-    return { password: "", totpSecret: "" };
+    return { password: "", totpSecret: "", proxyUrl: null };
   }
 }
 

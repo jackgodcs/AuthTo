@@ -11,6 +11,7 @@ import {
   Download,
   FileText,
   Filter,
+  Globe2,
   KeyRound,
   ListPlus,
   LoaderCircle,
@@ -34,6 +35,7 @@ const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
+const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const REGION_NAMES = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "region" })
   : null;
@@ -74,9 +76,11 @@ function App() {
   const [sub2apiSettingsError, setSub2apiSettingsError] = useState("");
   const [sub2apiGroupsLoading, setSub2apiGroupsLoading] = useState(false);
   const [uploadNotice, setUploadNotice] = useState("");
+  const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
+  useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
 
   useEffect(() => {
     let stopped = false;
@@ -202,6 +206,15 @@ function App() {
     setSub2apiSettingsError("");
   }
 
+  function setSub2ApiGroupChecked(groupId, checked) {
+    setSub2apiSettingsDraft((current) => {
+      const selected = new Set(current.groupIds);
+      if (checked) selected.add(String(groupId));
+      else selected.delete(String(groupId));
+      return { ...current, groupIds: [...selected] };
+    });
+  }
+
   async function uploadSelected(ids) {
     if (!sub2apiSettings.baseUrl || !sub2apiSettings.adminApiKey) {
       openSub2ApiSettings();
@@ -321,7 +334,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs", {
         method: "POST",
-        body: JSON.stringify({ email: email.trim() }),
+        body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim() }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
@@ -341,7 +354,7 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText }),
+        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
@@ -425,7 +438,7 @@ function App() {
     try {
       await apiFetch(token, "/api/jobs/reauthorize-batch", {
         method: "POST",
-        body: JSON.stringify({ ids: [...selectedJobIds] }),
+        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
       });
       setSelectedJobIds(new Set());
       setError("");
@@ -581,6 +594,26 @@ function App() {
           </button>
         </div>
 
+        <div className="provider-toolbar account-proxy-toolbar" aria-label="代理 IP 配置">
+          <div className="provider-heading"><Globe2 size={17} /><strong>代理 IP</strong></div>
+          <div className="account-proxy-input">
+            <label className="provider-field account-proxy-field" title="支持 http://、https://、socks5:// 和 socks5h://；用户名中包含 -sid- 时会自动轮换会话编号">
+              <Globe2 size={15} aria-hidden="true" />
+              <input
+                value={accountProxyUrl}
+                onChange={(event) => setAccountProxyUrl(event.target.value)}
+                placeholder="socks5h://用户名:密码@主机:端口"
+                spellCheck="false"
+                aria-label="代理 IP 地址"
+              />
+            </label>
+          </div>
+          <span className={`provider-ready ${accountProxyUrl.trim() ? "" : "incomplete"}`}>
+            {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
+            {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
+          </span>
+        </div>
+
         {error && (
           <div className="global-error" role="alert">
             <CircleAlert size={17} />
@@ -684,6 +717,7 @@ function App() {
                     smsProvider={activeSmsProvider}
                     onUpload={() => uploadSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
+                    accountProxyUrl={accountProxyUrl}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -860,19 +894,42 @@ function App() {
                   autoComplete="off"
                 />
               </label>
-              <label className="settings-field wide-settings-field">
-                <span>目标号池（可多选）</span>
-                <select
-                  multiple
-                  value={sub2apiSettingsDraft.groupIds}
-                  onChange={(event) => {
-                    const values = [...event.target.selectedOptions].map((option) => option.value);
-                    setSub2apiSettingsDraft((current) => ({ ...current, groupIds: values }));
-                  }}
-                >
-                  {sub2apiGroups.map((group) => <option key={group.id} value={String(group.id)}>{group.name}（ID: {group.id}）</option>)}
-                </select>
-              </label>
+              <fieldset className="settings-field wide-settings-field sub2api-group-field">
+                <legend>目标号池（可多选）</legend>
+                <section className="sub2api-group-picker" aria-label="目标号池">
+                  {sub2apiGroups.length ? sub2apiGroups.map((group) => {
+                    const groupId = String(group.id);
+                    return (
+                      <label key={group.id} className="sub2api-group-option">
+                        <input
+                          type="checkbox"
+                          checked={sub2apiSettingsDraft.groupIds.includes(groupId)}
+                          onChange={(event) => setSub2ApiGroupChecked(groupId, event.target.checked)}
+                        />
+                        <span>{group.name}</span>
+                        <small>ID: {group.id}</small>
+                      </label>
+                    );
+                  }) : <div className="sub2api-group-empty">暂无可选号池</div>}
+                </section>
+                <section className="sub2api-group-selection" aria-label="号池选择操作">
+                  <span>已选 {sub2apiSettingsDraft.groupIds.length} 个</span>
+                  <button
+                    type="button"
+                    onClick={() => setSub2apiSettingsDraft((current) => ({ ...current, groupIds: sub2apiGroups.map((group) => String(group.id)) }))}
+                    disabled={!sub2apiGroups.length || sub2apiGroups.every((group) => sub2apiSettingsDraft.groupIds.includes(String(group.id)))}
+                  >
+                    全选
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSub2apiSettingsDraft((current) => ({ ...current, groupIds: [] }))}
+                    disabled={!sub2apiSettingsDraft.groupIds.length}
+                  >
+                    清空
+                  </button>
+                </section>
+              </fieldset>
               <label className="settings-field wide-settings-field">
                 <span>代理 IP</span>
                 <select
@@ -1029,7 +1086,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1065,7 +1122,10 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   async function retry() {
     setSubmitting(true);
     try {
-      await apiFetch(token, `/api/jobs/${job.id}/retry`, { method: "POST" });
+      await apiFetch(token, `/api/jobs/${job.id}/retry`, {
+        method: "POST",
+        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+      });
       onError("");
     } catch (requestError) {
       onError(requestError.message);
@@ -1077,7 +1137,10 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   async function regenerate() {
     setSubmitting(true);
     try {
-      await apiFetch(token, `/api/jobs/${job.id}/regenerate`, { method: "POST" });
+      await apiFetch(token, `/api/jobs/${job.id}/regenerate`, {
+        method: "POST",
+        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+      });
       onError("");
     } catch (requestError) {
       onError(requestError.message);
@@ -1473,6 +1536,21 @@ function readLocalSetting(key) {
   }
 }
 
+function readLocalTextSetting(key) {
+  let value = readLocalSetting(key).trim();
+  for (let attempt = 0; attempt < 4 && value; attempt += 1) {
+    if (!(value.startsWith('"') && value.endsWith('"'))) return value;
+    try {
+      const decoded = JSON.parse(value);
+      if (typeof decoded !== "string") return value;
+      value = decoded.trim();
+    } catch {
+      return value;
+    }
+  }
+  return value;
+}
+
 function readSmsProviderSettings() {
   try {
     const stored = JSON.parse(window.localStorage.getItem(SMS_PROVIDER_SETTINGS_KEY) || "null");
@@ -1611,6 +1689,14 @@ function formatSmsPriceOption(option) {
 function writeLocalJson(key, value) {
   try {
     window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Private browsing modes may disable localStorage; the current tab still works.
+  }
+}
+
+function writeLocalTextSetting(key, value) {
+  try {
+    window.localStorage.setItem(key, String(value || ""));
   } catch {
     // Private browsing modes may disable localStorage; the current tab still works.
   }

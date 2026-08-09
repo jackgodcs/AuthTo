@@ -19,13 +19,21 @@ try {
   };
   const store = createCredentialStore({ platform: "win32", windowsRoot: tempRoot, powerShellRunner });
   const email = "Windows.User@example.com";
-  const credentials = { password: "test-password", totpSecret: "JBSWY3DPEHPK3PXP" };
+  const credentials = {
+    password: "test-password",
+    totpSecret: "JBSWY3DPEHPK3PXP",
+    proxyUrl: "socks5h://user:secret@proxy.example:5000",
+  };
 
-  assert.deepEqual(await store.load(email), { password: "", totpSecret: "" });
+  assert.deepEqual(await store.load(email), { password: "", totpSecret: "", proxyUrl: "" });
   await store.save(email, credentials);
   assert.deepEqual(await store.load(email.toLowerCase()), credentials);
 
-  const updatedCredentials = { password: "更新后的密码", totpSecret: "NB2W45DFOIZAQWER" };
+  const updatedCredentials = {
+    password: "更新后的密码",
+    totpSecret: "NB2W45DFOIZAQWER",
+    proxyUrl: "http://updated:secret@proxy.example:8080",
+  };
   await store.save(email, updatedCredentials);
   assert.deepEqual(await store.load(email), updatedCredentials);
 
@@ -33,16 +41,17 @@ try {
   assert.equal(storedFiles.length, 1);
   const encryptedAtRest = await fs.readFile(path.join(tempRoot, storedFiles[0]), "utf8");
   assert.equal(encryptedAtRest.includes(updatedCredentials.password), false);
+  assert.equal(encryptedAtRest.includes(updatedCredentials.proxyUrl), false);
 
   await store.delete(email);
-  assert.deepEqual(await store.load(email), { password: "", totpSecret: "" });
+  assert.deepEqual(await store.load(email), { password: "", totpSecret: "", proxyUrl: "" });
 
   if (process.platform === "win32") {
     const realStore = createCredentialStore({ windowsRoot: path.join(tempRoot, "real-dpapi") });
     await realStore.save(email, credentials);
     assert.deepEqual(await realStore.load(email), credentials);
     await realStore.delete(email);
-    assert.deepEqual(await realStore.load(email), { password: "", totpSecret: "" });
+    assert.deepEqual(await realStore.load(email), { password: "", totpSecret: "", proxyUrl: "" });
   }
 
   let macPayload = "";
