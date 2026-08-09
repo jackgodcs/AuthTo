@@ -1845,21 +1845,24 @@ async function syncCompletedOutputs(force = false) {
         const storedCredentials = await loadStoredLoginCredentials(metadata.email);
         const mailApiUrl = validateMailApiUrl(metadata.mail_api_url) ? metadata.mail_api_url : null;
         const restoredAt = metadata.updated_at || new Date().toISOString();
-        const proxyCredentialMissing = Boolean(metadata.proxy_configured && !storedCredentials.proxyUrl);
+        const missingStoredCredentials = restoredMissingCredentials(metadata, storedCredentials);
+        const storedCredentialsMissing = missingStoredCredentials.length > 0;
         jobs.set(entry.name, {
           id: entry.name,
           email: metadata.email,
-          status: proxyCredentialMissing ? "reauth_required" : "queued",
-          prompt: proxyCredentialMissing ? "代理配置需要重新确认" : "服务重启后已恢复，等待任务槽位",
+          status: storedCredentialsMissing ? "reauth_required" : "queued",
+          prompt: storedCredentialsMissing ? "登录资料需要重新确认" : "服务重启后已恢复，等待任务槽位",
           createdAt: metadata.created_at || restoredAt,
           updatedAt: restoredAt,
           completedAt: null,
           outputPath,
           checkpointPath,
-          logs: proxyCredentialMissing
-            ? "[restore] 任务原来使用代理，但系统安全凭据存储中没有可恢复的代理地址，已停止自动启动。\n"
+          logs: storedCredentialsMissing
+            ? `[restore] 系统安全凭据存储中无法恢复${missingStoredCredentials.join("、")}，已停止自动启动。\n`
             : "[restore] 已恢复排队任务，等待可用任务槽位。\n",
-          lastError: proxyCredentialMissing ? "请在页面重新填写代理 IP 后点击重试，避免意外改用本机网络" : null,
+          lastError: storedCredentialsMissing
+            ? `请重新导入或填写${missingStoredCredentials.join("、")}后重试，任务不会使用缺失的资料自动登录`
+            : null,
           child: null,
           parserTail: "",
           resultSaved: false,
@@ -1882,7 +1885,7 @@ async function syncCompletedOutputs(force = false) {
           runId: null,
           runMode: null,
           queuedMode: metadata.queued_mode === "refresh" ? "refresh" : "full",
-          queuedAt: proxyCredentialMissing ? null : metadata.queued_at || restoredAt,
+          queuedAt: storedCredentialsMissing ? null : metadata.queued_at || restoredAt,
           queuedStartPrompt: "正在建立登录会话",
           fallbackInProgress: false,
           ...newSmsState(),
@@ -1935,6 +1938,20 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
       || (hasExplicitTotpFlag ? metadata.has_totp_key : metadata.has_stored_credentials),
     ),
   };
+}
+
+function restoredMissingCredentials(metadata = {}, credentials = {}) {
+  const missing = [];
+  const passwordRequired = Object.hasOwn(metadata, "has_password")
+    ? metadata.has_password
+    : metadata.login_mode === "password" && metadata.has_stored_credentials;
+  const totpRequired = Object.hasOwn(metadata, "has_totp_key")
+    ? metadata.has_totp_key
+    : metadata.has_stored_credentials && !passwordRequired;
+  if (passwordRequired && !credentials.password) missing.push("密码");
+  if (totpRequired && !credentials.totpSecret) missing.push("2FA 密钥");
+  if (metadata.proxy_configured && !credentials.proxyUrl) missing.push("代理 IP");
+  return missing;
 }
 
 function normalizeTotpSecret(value, lineNumber = null) {
@@ -2127,7 +2144,7 @@ async function saveStoredLoginCredentials(email, credentials = {}) {
   try {
     await credentialStore.save(email, { password, totpSecret, proxyUrl });
   } catch (error) {
-    if (error?.status === 501 && proxyUrl && !password && !totpSecret) return;
+    if (error?.status === 501) return;
     throw error;
   }
 }
