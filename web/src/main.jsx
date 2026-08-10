@@ -77,6 +77,18 @@ function App() {
   const [sub2apiSettingsOpen, setSub2apiSettingsOpen] = useState(false);
   const [sub2apiSettingsError, setSub2apiSettingsError] = useState("");
   const [sub2apiGroupsLoading, setSub2apiGroupsLoading] = useState(false);
+  const [sub2apiSettingsSaving, setSub2apiSettingsSaving] = useState(false);
+  const [sub2apiMonitorChecking, setSub2apiMonitorChecking] = useState(false);
+  const [sub2apiMonitorStatus, setSub2apiMonitorStatus] = useState({
+    configured: false,
+    enabled: false,
+    running: false,
+    lastCheckAt: null,
+    nextCheckAt: null,
+    lastError: null,
+    lastResult: null,
+    intervalMinutes: 5,
+  });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
@@ -133,6 +145,26 @@ function App() {
     };
   }, [token, page, emailFilter]);
 
+  useEffect(() => {
+    if (!token || !features.sub2apiMonitor) return undefined;
+    let stopped = false;
+    const load = async () => {
+      try {
+        const data = await apiFetch(token, "/api/sub2api/monitor");
+        if (!stopped) {
+          setSub2apiMonitorStatus(data);
+          setSub2apiSettings((current) => ({ ...current, monitorEnabled: Boolean(data.enabled) }));
+        }
+      } catch {}
+    };
+    void load();
+    const timer = window.setInterval(load, 5_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [token, features.sub2apiMonitor]);
+
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
   const activeSmsProvider = useMemo(
@@ -169,7 +201,7 @@ function App() {
   }
 
   function openSub2ApiSettings() {
-    setSub2apiSettingsDraft({ ...sub2apiSettings });
+    setSub2apiSettingsDraft({ ...sub2apiSettings, monitorEnabled: Boolean(sub2apiMonitorStatus.enabled) });
     setSub2apiSettingsError("");
     setSub2apiSettingsOpen(true);
   }
@@ -193,7 +225,7 @@ function App() {
     }
   }
 
-  function saveSub2ApiSettings(event) {
+  async function saveSub2ApiSettings(event) {
     event.preventDefault();
     const baseUrl = String(sub2apiSettingsDraft.baseUrl || "").trim();
     const adminApiKey = String(sub2apiSettingsDraft.adminApiKey || "").trim();
@@ -205,13 +237,43 @@ function App() {
       setSub2apiSettingsError("请输入 Sub2API 管理员 API Key");
       return;
     }
-    setSub2apiSettings({
+    const nextSettings = {
       ...readSub2ApiSettings(sub2apiSettingsDraft),
       baseUrl: baseUrl.replace(/\/+$/, ""),
       adminApiKey,
-    });
-    setSub2apiSettingsOpen(false);
+    };
+    setSub2apiSettingsSaving(true);
+    try {
+      const monitor = await apiFetch(token, "/api/sub2api/monitor", {
+        method: "POST",
+        body: JSON.stringify({ enabled: nextSettings.monitorEnabled, config: nextSettings }),
+      });
+      setSub2apiSettings(nextSettings);
+      setSub2apiMonitorStatus(monitor);
+      setSub2apiSettingsOpen(false);
+      setSub2apiSettingsError("");
+    } catch (requestError) {
+      setSub2apiSettingsError(requestError.message);
+    } finally {
+      setSub2apiSettingsSaving(false);
+    }
+  }
+
+  async function checkSub2ApiMonitorNow() {
+    if (!sub2apiMonitorStatus.enabled || sub2apiMonitorChecking) return;
+    setSub2apiMonitorChecking(true);
     setSub2apiSettingsError("");
+    try {
+      const data = await apiFetch(token, "/api/sub2api/monitor/check", { method: "POST" });
+      setSub2apiMonitorStatus(data);
+      setUploadNotice(formatMonitorResult(data.result));
+      setError("");
+    } catch (requestError) {
+      if (sub2apiSettingsOpen) setSub2apiSettingsError(requestError.message);
+      else setError(requestError.message);
+    } finally {
+      setSub2apiMonitorChecking(false);
+    }
   }
 
   function setSub2ApiGroupChecked(groupId, checked) {
@@ -630,7 +692,7 @@ function App() {
           </button>
         </div>
 
-        <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 上传配置">
+        <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 配置与号池监控">
           <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
           <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
           <span className={`provider-ready ${sub2apiSettings.adminApiKey ? "" : "incomplete"}`}>
@@ -639,6 +701,29 @@ function App() {
               ? `${sub2apiSettings.groupIds.length ? `已配置 · ${sub2apiSettings.groupIds.length} 个号池` : "已配置 · 默认号池"}${sub2apiSettings.proxyId ? " · 已指定代理" : ""}`
               : "未完成配置"}
           </span>
+          {features.sub2apiMonitor && (
+            <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.enabled ? "" : "incomplete"}`}>
+              {sub2apiMonitorStatus.running
+                ? <LoaderCircle className="spin" size={14} />
+                : sub2apiMonitorStatus.enabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+              {sub2apiMonitorStatus.running
+                ? "正在巡检"
+                : sub2apiMonitorStatus.enabled
+                  ? `号池监控已启用${sub2apiMonitorStatus.lastCheckAt ? ` · ${formatRelativeMonitorTime(sub2apiMonitorStatus.lastCheckAt)}` : ""}`
+                  : "号池监控未启用"}
+            </span>
+          )}
+          {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
+            <button
+              type="button"
+              className="icon-button monitor-check-button"
+              onClick={checkSub2ApiMonitorNow}
+              disabled={sub2apiMonitorChecking || sub2apiMonitorStatus.running}
+              title="立即检查 Sub2API 异常账号"
+            >
+              <RefreshCw className={sub2apiMonitorChecking || sub2apiMonitorStatus.running ? "spin" : ""} size={16} />
+            </button>
+          )}
           <button type="button" className="secondary-button provider-settings-button" onClick={openSub2ApiSettings} disabled={!token}>
             <Settings2 size={16} />配置
           </button>
@@ -932,8 +1017,8 @@ function App() {
           <form className="batch-dialog sub2api-settings-dialog" onSubmit={saveSub2ApiSettings} role="dialog" aria-modal="true" aria-labelledby="sub2api-settings-title">
             <div className="dialog-header">
               <div>
-                <h2 id="sub2api-settings-title">Sub2API 上传配置</h2>
-                <span>配置只保存在当前浏览器，管理员 Key 不写入任务文件</span>
+                <h2 id="sub2api-settings-title">Sub2API 配置</h2>
+                <span>管理员 Key 不写入任务文件或日志；启用监控后由本机服务保存</span>
               </div>
               <button type="button" className="icon-button" onClick={() => setSub2apiSettingsOpen(false)} title="关闭"><X size={18} /></button>
             </div>
@@ -948,6 +1033,19 @@ function App() {
                   autoComplete="url"
                 />
               </label>
+              {features.sub2apiMonitor && (
+                <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(sub2apiSettingsDraft.monitorEnabled)}
+                    onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, monitorEnabled: event.target.checked }))}
+                  />
+                  <span>
+                    <strong>每 5 分钟监控异常账号</strong>
+                    <small>只自动处理上次完整登录未人工输入密码、邮箱码或登录 2FA 的任务</small>
+                  </span>
+                </label>
+              )}
               <label className="settings-field wide-settings-field">
                 <span>管理员 API Key</span>
                 <input
@@ -1052,15 +1150,32 @@ function App() {
                 />
               </label>
             </div>
-            <div className="dialog-hint">分组为空表示使用 Sub2API 默认号池；其他参数为空表示保留账号原配置。代理和号池列表需要点击“读取配置”获取。</div>
+            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。</div>
+            {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
+              <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
+                <ShieldCheck size={15} />
+                <span>{sub2apiMonitorStatus.lastError
+                  ? `上次巡检失败：${sub2apiMonitorStatus.lastError}`
+                  : sub2apiMonitorStatus.lastCheckAt
+                    ? formatMonitorResult(sub2apiMonitorStatus.lastResult)
+                    : "尚未执行号池巡检"}</span>
+              </div>
+            )}
             {sub2apiSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{sub2apiSettingsError}</div>}
             <div className="dialog-actions sub2api-dialog-actions">
               <button type="button" className="secondary-button" onClick={() => loadSub2ApiOptions()} disabled={sub2apiGroupsLoading || !token}>
                 {sub2apiGroupsLoading ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}读取配置
               </button>
+              {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
+                <button type="button" className="secondary-button" onClick={checkSub2ApiMonitorNow} disabled={sub2apiMonitorChecking || sub2apiMonitorStatus.running}>
+                  {sub2apiMonitorChecking || sub2apiMonitorStatus.running ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}立即检查
+                </button>
+              )}
               <span className="dialog-actions-spacer" />
-              <button type="button" className="cancel-button" onClick={() => setSub2apiSettingsOpen(false)}>取消</button>
-              <button type="submit" className="primary-button">保存配置</button>
+              <button type="button" className="cancel-button" onClick={() => setSub2apiSettingsOpen(false)} disabled={sub2apiSettingsSaving}>取消</button>
+              <button type="submit" className="primary-button" disabled={sub2apiSettingsSaving}>
+                {sub2apiSettingsSaving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存配置
+              </button>
             </div>
           </form>
         </div>
@@ -1305,6 +1420,9 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       <td className="step-cell">
         <div className="prompt-line">{job.prompt}</div>
         {job.lastError && <div className="row-error">{extractResponseMessage(job.lastError)}</div>}
+        {job.autoRepairBlocked && (
+          <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
+        )}
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
@@ -1586,6 +1704,27 @@ function localTimestamp(date = new Date()) {
   return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
 }
 
+function formatMonitorResult(result) {
+  if (!result || typeof result !== "object") return "号池巡检已完成";
+  const parts = [`检查 ${Number(result.checked || 0)} 条异常记录`];
+  if (result.started) parts.push(`已启动自动修复 ${result.started} 条`);
+  if (result.updated) parts.push(`已更新 ${result.updated} 条`);
+  if (result.blocked) parts.push(`永久跳过 ${result.blocked} 条`);
+  if (result.ineligible) parts.push(`需人工 ${result.ineligible} 条`);
+  if (result.missingTask) parts.push(`本地无任务 ${result.missingTask} 条`);
+  if (result.busy) parts.push(`正在运行 ${result.busy} 条`);
+  if (result.cooldown) parts.push(`冷却中 ${result.cooldown} 条`);
+  return parts.join("，");
+}
+
+function formatRelativeMonitorTime(value) {
+  const elapsed = Date.now() - new Date(value).getTime();
+  if (!Number.isFinite(elapsed) || elapsed < 0) return "刚刚检查";
+  if (elapsed < 60_000) return "刚刚检查";
+  if (elapsed < 60 * 60_000) return `${Math.floor(elapsed / 60_000)} 分钟前检查`;
+  return `${Math.floor(elapsed / (60 * 60_000))} 小时前检查`;
+}
+
 async function apiFetch(token, url, options = {}) {
   const response = await fetch(url, {
     ...options,
@@ -1714,6 +1853,7 @@ function normalizeSub2ApiSettings(value) {
     loadFactor: String(stored.loadFactor ?? ""),
     priority: String(stored.priority ?? ""),
     modelWhitelist: String(stored.modelWhitelist || ""),
+    monitorEnabled: stored.monitorEnabled === true,
   };
 }
 

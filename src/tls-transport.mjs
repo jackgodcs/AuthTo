@@ -7,10 +7,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, "tls_transport.py");
 const DEFAULT_PROFILE = "chrome146";
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_SAME_PROXY_RISK_RETRIES = 3;
+const DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS = 1_000;
 const UNCONFIGURED = Symbol("unconfigured");
 
 export class TlsFingerprintTransport {
-  constructor({ enabled = true, profile = DEFAULT_PROFILE, verbose = false, maxProxySessionAttempts = 10 } = {}) {
+  constructor({
+    enabled = true,
+    profile = DEFAULT_PROFILE,
+    verbose = false,
+    maxProxySessionAttempts = 10,
+    sameProxyRiskRetries = DEFAULT_SAME_PROXY_RISK_RETRIES,
+    sameProxyRiskRetryDelayMs = DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS,
+  } = {}) {
     this.enabled = Boolean(enabled);
     this.profile = profile || DEFAULT_PROFILE;
     this.verbose = Boolean(verbose);
@@ -23,6 +32,11 @@ export class TlsFingerprintTransport {
     this.configuredProfile = null;
     this.closed = false;
     this.remainingProxySessionAttempts = normalizeProxyAttemptLimit(maxProxySessionAttempts);
+    this.sameProxyRiskRetries = normalizeRetryLimit(sameProxyRiskRetries, DEFAULT_SAME_PROXY_RISK_RETRIES);
+    this.sameProxyRiskRetryDelayMs = normalizeRetryLimit(
+      sameProxyRiskRetryDelayMs,
+      DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS,
+    );
   }
 
   async configure(proxy, { force = false } = {}) {
@@ -106,7 +120,7 @@ export class TlsFingerprintTransport {
       ? [...options.headers.entries()]
       : Object.entries(options.headers || {});
     const body = encodeBody(options.body);
-    const result = await this.send({
+    const request = {
       operation: "request",
       method,
       url,
@@ -114,7 +128,27 @@ export class TlsFingerprintTransport {
       body,
       timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
       discardBody: Boolean(options.discardBody),
-    });
+    };
+    let result;
+    let retries = 0;
+    for (;;) {
+      result = await this.send(request);
+      if (!options.retryRiskControl || !isRiskControlResult(result)) break;
+      if (!this.hasConfiguredProxy() || retries >= this.sameProxyRiskRetries) {
+        if (this.hasConfiguredProxy() && retries > 0) {
+          console.log(`[proxy] 同一代理连续重试 ${retries} 次仍触发安全校验，准备更换代理会话。`);
+        }
+        throw new Error(
+          `PROXY_RISK_CONTROL: ${method} ${safeRequestTarget(url)} returned HTTP ${Number(result.status)} ` +
+            `with a security-check page after ${retries} same-proxy retries`,
+        );
+      }
+      retries += 1;
+      console.log(
+        `[proxy] 当前代理出口触发安全校验，保持同一代理重试 ${retries}/${this.sameProxyRiskRetries}。`,
+      );
+      if (this.sameProxyRiskRetryDelayMs > 0) await delay(this.sameProxyRiskRetryDelayMs);
+    }
     const responseHeaders = new Headers();
     const rawSetCookie = [];
     for (const [name, value] of result.headers || []) {
@@ -135,6 +169,10 @@ export class TlsFingerprintTransport {
 
   async fetch(url, options = {}) {
     return this.request(options.method || "GET", url, options);
+  }
+
+  hasConfiguredProxy() {
+    return this.enabled && this.configuredProxy !== UNCONFIGURED && Boolean(this.configuredProxy);
   }
 
   async send(message) {
@@ -299,6 +337,39 @@ function randomNumericSessionId() {
 function normalizeProxyAttemptLimit(value) {
   const parsed = Number.parseInt(String(value), 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : 10;
+}
+
+function normalizeRetryLimit(value, fallback) {
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function isRiskControlResult(result) {
+  const headers = new Map(
+    (result?.headers || []).map(([name, value]) => [String(name).toLowerCase(), String(value)]),
+  );
+  const mitigated = headers.get("cf-mitigated") || headers.get("x-cf-mitigated");
+  if (mitigated && /challenge/i.test(mitigated)) return true;
+  const status = Number(result?.status);
+  const contentType = headers.get("content-type") || "";
+  const body = result?.body ? Buffer.from(result.body, "base64").toString("utf8") : "";
+  const challengePage = /Just a moment|cdn-cgi|challenge-platform|cf-challenge/i.test(body);
+  if (status === 403) return /text\/html/i.test(contentType) || challengePage;
+  const htmlPage = /text\/html/i.test(contentType) || /<(?:!doctype\s+html|html|head|body)\b/i.test(body);
+  return [400, 409].includes(status) && htmlPage && challengePage;
+}
+
+function safeRequestTarget(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return "<invalid-url>";
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function maskSession(proxyUrl) {

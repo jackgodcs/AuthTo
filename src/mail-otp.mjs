@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-const DEFAULT_TIMEOUT_MS = 12_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const OTP_PATTERN = /(?:^|\s)(\d{6})(?=$|\s)/g;
 const CONTENT_KEY_PATTERN = /(?:body|content|text|html|message|subject|snippet|preview|payload|data|mail)/i;

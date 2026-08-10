@@ -61,6 +61,31 @@ try {
   assert.equal(firstExport.type, "sub2api-data");
   assert.equal(firstExport.accounts?.[0]?.credentials?.email, "add-phone-page@example.com");
 
+  const wrongEmailOtpOutputPath = path.join(tempRoot, "wrong-email-otp-sub2api.json");
+  const wrongEmailOtpLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "wrong-email-otp@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    wrongEmailOtpOutputPath,
+    "--verbose",
+  ], [
+    { pattern: /Email OTP \(r=resend/, value: "000000" },
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+    { pattern: /Phone number, E\.164 format/, value: "+60123456789" },
+    { pattern: /Phone OTP \(r=resend/, value: "654321" },
+  ]);
+  assert.equal(wrongEmailOtpLogin.code, 0, processFailure("wrong email OTP retry", wrongEmailOtpLogin));
+  assert.equal(wrongEmailOtpLogin.completedInputSteps, 4, processFailure("wrong email OTP input", wrongEmailOtpLogin));
+  assert.match(wrongEmailOtpLogin.output, /\[email-otp-rejected\].*邮箱验证码错误/);
+  assert.equal(await fileExists(wrongEmailOtpOutputPath), true);
+
   const refresh = await runNode([
     path.join(projectRoot, "src", "protocol-login.mjs"),
     "--refresh-sub2api",
@@ -96,6 +121,32 @@ try {
   assert.match(riskLogin.output, /\[proxy-risk-retry\]/);
   assert.doesNotMatch(riskLogin.output, /Email OTP \(r=resend/);
   assert.equal(await fileExists(riskOutputPath), false);
+
+  const phoneInvalidStateOutputPath = path.join(tempRoot, "phone-invalid-state-sub2api.json");
+  const phoneInvalidStateLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "phone-invalid-state@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    phoneInvalidStateOutputPath,
+    "--verbose",
+  ], [
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+    { pattern: /Phone number, E\.164 format/, value: "+60111111111" },
+    { pattern: /Enter another phone number/, value: "+60122222222" },
+    { pattern: /Phone OTP \(r=resend/, value: "654321" },
+  ]);
+  assert.equal(phoneInvalidStateLogin.code, 0, processFailure("ordinary phone 400 handling", phoneInvalidStateLogin));
+  assert.match(phoneInvalidStateLogin.output, /Could not send SMS to \+60111111111/);
+  assert.doesNotMatch(phoneInvalidStateLogin.output, /\[security-check-required\]/);
+  assert.doesNotMatch(phoneInvalidStateLogin.output, /\[proxy-risk-retry\]/);
+  assert.equal(await fileExists(phoneInvalidStateOutputPath), true);
 
   const unexpectedPageOutputPath = path.join(tempRoot, "unexpected-page-sub2api.json");
   const unexpectedPageLogin = await runNode([
@@ -138,11 +189,11 @@ try {
   assert.doesNotMatch(bannedLogin.output, /Email OTP \(r=resend/);
   assert.equal(await fileExists(bannedOutputPath), false);
 
-  const securityCheckOutputPath = path.join(tempRoot, "security-check-sub2api.json");
-  const securityCheckLogin = await runNode([
+  const phoneRiskOutputPath = path.join(tempRoot, "phone-risk-sub2api.json");
+  const phoneRiskLogin = await runNode([
     path.join(projectRoot, "src", "protocol-login.mjs"),
     "--email",
-    "security-check@example.com",
+    "phone-risk-control@example.com",
     "--chatgpt-base",
     baseUrl,
     "--auth-base",
@@ -150,16 +201,16 @@ try {
     "--output-mode",
     "sub2api",
     "--sub2api-out",
-    securityCheckOutputPath,
+    phoneRiskOutputPath,
     "--verbose",
   ], [
     { pattern: /Email OTP \(r=resend/, value: "123456" },
     { pattern: /Phone number, E\.164 format/, value: "+60123456789" },
   ]);
-  assert.equal(securityCheckLogin.code, 1, processFailure("phone security check", securityCheckLogin));
-  assert.match(securityCheckLogin.output, /\[security-check-required\]/);
-  assert.doesNotMatch(securityCheckLogin.output, /\[proxy-risk-retry\]/);
-  assert.equal(await fileExists(securityCheckOutputPath), false);
+  assert.equal(phoneRiskLogin.code, 1, processFailure("phone security-check page", phoneRiskLogin));
+  assert.match(phoneRiskLogin.output, /\[proxy-risk-retry\]/);
+  assert.doesNotMatch(phoneRiskLogin.output, /Enter another phone number/);
+  assert.equal(await fileExists(phoneRiskOutputPath), false);
 
   const profileCheckpointPath = path.join(tempRoot, "profile-checkpoint.json");
   const profileOutputPath = path.join(tempRoot, "profile-sub2api.json");
@@ -205,6 +256,7 @@ try {
 async function runNode(args, inputSteps = []) {
   const child = spawn(process.execPath, args, {
     cwd: projectRoot,
+    env: { ...process.env, CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS: "0" },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });

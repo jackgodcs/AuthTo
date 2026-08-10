@@ -138,7 +138,7 @@ class ProtocolClient {
   }
 
   async rawFetch(url, options = {}) {
-    if (this.transport) return this.transport.fetch(url, options);
+    if (this.transport) return this.transport.fetch(url, { ...options, retryRiskControl: true });
     return fetch(url, options);
   }
 
@@ -277,6 +277,7 @@ async function run() {
     profile: args.tlsProfile || process.env.TOSUB2_TLS_PROFILE || "chrome146",
     verbose: Boolean(args.verbose),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
+    sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   const proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
   try {
@@ -708,11 +709,11 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
   } else if (isEmailVerificationPage(authPage.finalUrl)) {
     loginMethod = "email_otp";
     console.log("[3/5] Email OTP page reached. Enter code, or type r to resend.");
-    const emailCode = await askEmailOtp(rl, client, authBase);
-    const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/email-otp/validate", {
-      code: emailCode,
-    }, { referer: authPage.finalUrl });
-    authenticated = data;
+    authenticated = await verifyEmailOtp(client, {
+      authBase,
+      rl,
+      referer: authPage.finalUrl,
+    });
   } else if (isCompletedChatgptLoginPage(authPage.finalUrl, chatgptBase, client)) {
     loginMethod = "existing_session";
     authenticated = { continue_url: authPage.finalUrl };
@@ -1191,9 +1192,6 @@ async function bindPhoneIfNeeded(client, options, current, addPhoneUrl) {
 
       const sent = await trySendPhoneOtp(client, options.authBase, phone, addPhoneReferer);
       if (!sent.ok) {
-        const sendError = new Error(sent.message);
-        if (isAddPhoneSecurityCheckError(sendError)) throw securityCheckRequiredError();
-        if (isExpiredCheckpointError(sendError)) throw sendError;
         console.log(`[warn] Could not send SMS to ${phone}: ${sent.message}`);
         console.log("[info] Enter another phone number, or q to quit.");
         continue;
@@ -1218,9 +1216,6 @@ async function bindPhoneIfNeeded(client, options, current, addPhoneUrl) {
         if (resent.ok) {
           console.log("[ok] SMS resend request accepted.");
         } else {
-          const resendError = new Error(resent.message);
-          if (isAddPhoneSecurityCheckError(resendError)) throw securityCheckRequiredError();
-          if (isExpiredCheckpointError(resendError)) throw resendError;
           console.log(`[warn] SMS resend failed: ${resent.message}`);
           console.log("[info] Use p to change phone number, or q to quit.");
         }
@@ -1275,6 +1270,7 @@ async function postAddPhoneSend(client, authBase, phone, referer, payload) {
     const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/add-phone/send", payload, { referer });
     return { ok: true, data };
   } catch (error) {
+    if (isProxyRiskControlError(error)) throw error;
     return { ok: false, message: error.message };
   }
 }
@@ -1286,6 +1282,7 @@ async function tryValidatePhoneOtp(client, authBase, code, referer) {
     }, { referer });
     return { ok: true, data };
   } catch (error) {
+    if (isProxyRiskControlError(error)) throw error;
     return { ok: false, message: error.message };
   }
 }
@@ -1393,6 +1390,7 @@ async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redir
       code_verifier: codeVerifier,
     }),
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    retryRiskControl: true,
   }) : fetch(`${authBase}/oauth/token`, {
     method: "POST",
     headers: {
@@ -1490,6 +1488,7 @@ async function refreshOAuthToken({ authBase, clientId, refreshToken, transport }
       refresh_token: refreshToken,
     }),
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    retryRiskControl: true,
   }) : fetch(`${authBase}/oauth/token`, {
     method: "POST",
     headers: {
@@ -1531,6 +1530,27 @@ async function askEmailOtp(rl, client, authBase) {
     if (/^\d{6}$/.test(value)) return value;
     console.log("[warn] Email OTP should be 6 digits, or type r to resend.");
   }
+}
+
+async function verifyEmailOtp(client, { authBase, rl, referer }) {
+  for (;;) {
+    const emailCode = await askEmailOtp(rl, client, authBase);
+    try {
+      const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/email-otp/validate", {
+        code: emailCode,
+      }, { referer });
+      return data;
+    } catch (error) {
+      if (!isRejectedEmailOtpError(error)) throw error;
+      console.log("[email-otp-rejected] 邮箱验证码错误，请重新输入，或输入 r 重新发送。");
+    }
+  }
+}
+
+function isRejectedEmailOtpError(error) {
+  return /wrong_email_otp_code|wrong code|invalid (?:email )?(?:otp )?code|incorrect (?:email )?(?:otp )?code/i.test(
+    String(error?.message || ""),
+  );
 }
 
 async function resendEmailOtp(client, authBase) {
@@ -1649,11 +1669,13 @@ function assertOk(result, label) {
 
 function isRiskControlResponse(res, text) {
   const mitigated = res?.headers?.get?.("cf-mitigated") || res?.headers?.get?.("x-cf-mitigated");
-  if (mitigated) return true;
+  if (mitigated && /challenge/i.test(mitigated)) return true;
   const contentType = String(res?.headers?.get?.("content-type") || "");
   const body = String(text || "");
-  return res?.status === 403
-    && (/text\/html/i.test(contentType) || /Just a moment|cdn-cgi|challenge-platform|cf-challenge/i.test(body));
+  const challengePage = /Just a moment|cdn-cgi|challenge-platform|cf-challenge/i.test(body);
+  if (res?.status === 403) return /text\/html/i.test(contentType) || challengePage;
+  const htmlPage = /text\/html/i.test(contentType) || /<(?:!doctype\s+html|html|head|body)\b/i.test(body);
+  return [400, 409].includes(Number(res?.status)) && htmlPage && challengePage;
 }
 
 function getSetCookie(headers) {
@@ -1781,15 +1803,6 @@ async function removeProtocolCheckpoint(checkpointPath) {
 function isExpiredCheckpointError(error) {
   return /CHECKPOINT_INVALID|SESSION_SELECTION_INVALID|CODEX_AUTH_LOGIN_REQUIRED|invalid_state|no longer valid|session.+(?:invalid|expired)|expired.+session/i.test(
     String(error?.message || ""),
-  );
-}
-
-function isAddPhoneSecurityCheckError(error) {
-  const message = String(error?.message || "");
-  return (
-    message.includes("/api/accounts/add-phone/send") &&
-    /HTTP 409/i.test(message) &&
-    /invalid_state|no longer valid/i.test(message)
   );
 }
 

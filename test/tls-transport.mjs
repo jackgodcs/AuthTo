@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import http from "node:http";
+import { fileURLToPath } from "node:url";
 
 import { proxySupportsSessionRotation, rotateProxySession, TlsFingerprintTransport } from "../src/tls-transport.mjs";
 import { fetchSentinelToken } from "../src/sentinel.mjs";
@@ -36,6 +38,12 @@ try {
   const expiringCookie = getResponse.headers.transportCookies.find((cookie) => cookie.name === "transport_a");
   assert.ok(expiringCookie.expires > Date.now() + 3_000_000, "cookie expiry should use Unix milliseconds");
 
+  const fallbackTransport = new TlsFingerprintTransport({ enabled: true, profile: "chrome999" });
+  const fallbackResponse = await fallbackTransport.request("GET", `http://127.0.0.1:${address.port}/fallback`);
+  assert.equal(fallbackResponse.status, 200, "unsupported TLS profiles should fall back to a supported profile");
+  await fallbackTransport.close();
+  testConfigureStageProfileFallback();
+
   const postResponse = await transport.request("POST", `http://127.0.0.1:${address.port}/post`, {
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ value: "ok" }),
@@ -70,8 +78,186 @@ try {
   const fixed = "socks5h://user:password@proxy.example:5000";
   assert.equal(proxySupportsSessionRotation(fixed), false);
   assert.equal(rotateProxySession(fixed), fixed);
+
+  const sameProxyRetry = new TlsFingerprintTransport({
+    enabled: true,
+    sameProxyRiskRetries: 3,
+    sameProxyRiskRetryDelayMs: 0,
+  });
+  const riskResult = {
+    status: 409,
+    headers: [["content-type", "application/json"], ["cf-mitigated", "challenge"]],
+    body: Buffer.from('{"error":"managed challenge"}').toString("base64"),
+    cookies: [],
+  };
+  let sameProxyRequests = 0;
+  sameProxyRetry.send = async (message) => {
+    if (message.operation === "configure") return {};
+    sameProxyRequests += 1;
+    if (sameProxyRequests <= 3) return riskResult;
+    return {
+      status: 200,
+      headers: [["content-type", "application/json"]],
+      body: Buffer.from('{"ok":true}').toString("base64"),
+      cookies: [],
+    };
+  };
+  await sameProxyRetry.configure(fixed);
+  const recoveredResponse = await sameProxyRetry.request("GET", "https://chatgpt.com/test", {
+    retryRiskControl: true,
+  });
+  assert.equal(recoveredResponse.status, 200);
+  assert.equal(sameProxyRequests, 4, "the initial request plus three same-proxy retries should be allowed");
+
+  const exhaustedRetry = new TlsFingerprintTransport({
+    enabled: true,
+    sameProxyRiskRetries: 3,
+    sameProxyRiskRetryDelayMs: 0,
+  });
+  let exhaustedRequests = 0;
+  exhaustedRetry.send = async (message) => {
+    if (message.operation === "configure") return {};
+    exhaustedRequests += 1;
+    return riskResult;
+  };
+  await exhaustedRetry.configure(fixed);
+  await assert.rejects(
+    exhaustedRetry.request("POST", "https://auth.openai.com/api/accounts/add-phone/send", {
+      retryRiskControl: true,
+    }),
+    /PROXY_RISK_CONTROL.*after 3 same-proxy retries/,
+  );
+  assert.equal(exhaustedRequests, 4);
+
+  const ordinaryBadRequest = new TlsFingerprintTransport({
+    enabled: true,
+    sameProxyRiskRetries: 3,
+    sameProxyRiskRetryDelayMs: 0,
+  });
+  let ordinaryBadRequestCount = 0;
+  ordinaryBadRequest.send = async (message) => {
+    if (message.operation === "configure") return {};
+    ordinaryBadRequestCount += 1;
+    return {
+      status: 400,
+      headers: [["content-type", "application/json"]],
+      body: Buffer.from('{"error":{"message":"phone number unavailable"}}').toString("base64"),
+      cookies: [],
+    };
+  };
+  await ordinaryBadRequest.configure(fixed);
+  const badRequestResponse = await ordinaryBadRequest.request(
+    "POST",
+    "https://auth.openai.com/api/accounts/add-phone/send",
+    { retryRiskControl: true },
+  );
+  assert.equal(badRequestResponse.status, 400);
+  assert.equal(ordinaryBadRequestCount, 1, "ordinary JSON 400 responses must not be retried as proxy risk control");
+
+  const challenge400 = new TlsFingerprintTransport({
+    enabled: true,
+    sameProxyRiskRetries: 3,
+    sameProxyRiskRetryDelayMs: 0,
+  });
+  let challenge400Count = 0;
+  challenge400.send = async (message) => {
+    if (message.operation === "configure") return {};
+    challenge400Count += 1;
+    return {
+      status: 400,
+      headers: [["content-type", "text/html"]],
+      body: Buffer.from("<html><div id=\"challenge-platform\"></div></html>").toString("base64"),
+      cookies: [],
+    };
+  };
+  await challenge400.configure(fixed);
+  await assert.rejects(
+    challenge400.request("POST", "https://auth.openai.com/api/accounts/add-phone/send", {
+      retryRiskControl: true,
+    }),
+    /PROXY_RISK_CONTROL.*after 3 same-proxy retries/,
+  );
+  assert.equal(challenge400Count, 4, "a 400 challenge page should use three same-proxy retries");
+
+  const invalidState409 = new TlsFingerprintTransport({
+    enabled: true,
+    sameProxyRiskRetries: 3,
+    sameProxyRiskRetryDelayMs: 0,
+  });
+  let invalidState409Count = 0;
+  invalidState409.send = async (message) => {
+    if (message.operation === "configure") return {};
+    invalidState409Count += 1;
+    return {
+      status: 409,
+      headers: [["content-type", "application/json"]],
+      body: Buffer.from('{"error":{"code":"invalid_state"}}').toString("base64"),
+      cookies: [],
+    };
+  };
+  await invalidState409.configure(fixed);
+  const invalidStateResponse = await invalidState409.request(
+    "POST",
+    "https://auth.openai.com/api/accounts/add-phone/send",
+    { retryRiskControl: true },
+  );
+  assert.equal(invalidStateResponse.status, 409);
+  assert.equal(invalidState409Count, 1, "JSON invalid_state must remain a phone-specific error");
   console.log("TLS fingerprint transport tests passed");
 } finally {
   await transport.close();
   await new Promise((resolve) => server.close(resolve));
+}
+
+function testConfigureStageProfileFallback() {
+  const python = findTestPython();
+  assert.ok(python, "a Python interpreter with curl_cffi is required for TLS tests");
+  const workerPath = fileURLToPath(new URL("../src/tls_transport.py", import.meta.url));
+  const script = String.raw`
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("tosub2_tls_transport", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+class FakeSession:
+    def close(self):
+        pass
+
+class FakeRequests:
+    attempts = []
+
+    @classmethod
+    def Session(cls, impersonate, proxy):
+        cls.attempts.append(impersonate)
+        if impersonate == "chrome146":
+            raise RuntimeError("Impersonating chrome146 is not supported")
+        return FakeSession()
+
+module.requests = FakeRequests
+worker = module.Worker()
+worker.configure(None, "chrome146")
+assert worker.impersonate == "chrome", worker.impersonate
+assert FakeRequests.attempts[:2] == ["chrome146", "chrome"], FakeRequests.attempts
+`;
+  const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `configure-stage TLS fallback failed:\n${result.stderr || result.stdout}`);
+}
+
+function findTestPython() {
+  const configured = String(process.env.TOSUB2_PYTHON || "").trim();
+  const candidates = configured
+    ? [{ command: configured, args: [] }]
+    : process.platform === "win32"
+      ? [{ command: "python", args: [] }, { command: "py", args: ["-3"] }]
+      : [{ command: "python3", args: [] }, { command: "python", args: [] }];
+  return candidates.find((candidate) => spawnSync(candidate.command, [...candidate.args, "-c", "import curl_cffi"], {
+    stdio: "ignore",
+    windowsHide: true,
+  }).status === 0) || null;
 }

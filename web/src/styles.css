@@ -107,6 +107,8 @@ button { letter-spacing: 0; }
 .provider-name { padding: 4px 7px; color: var(--blue); background: var(--blue-soft); border-radius: 4px; font-size: 11px; font-weight: 700; }
 .provider-settings-button { height: 34px; margin-left: auto; }
 .sub2api-toolbar .provider-name { max-width: min(360px, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.monitor-ready { padding-left: 8px; border-left: 1px solid var(--line); }
+.monitor-check-button { width: 34px; height: 34px; }
 
 .add-form { display: flex; gap: 8px; }
 .email-field {
@@ -651,6 +653,29 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .sub2api-config-grid .settings-field > input:focus,
 .sub2api-config-grid .settings-field > select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.sub2api-config-grid .sub2api-monitor-toggle {
+  min-height: 52px;
+  padding: 9px 11px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  background: #f6f9f8;
+  border: 1px solid #d7dfdb;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.sub2api-config-grid .sub2api-monitor-toggle > input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+  accent-color: var(--green);
+  cursor: pointer;
+}
+.sub2api-monitor-toggle > span { display: grid; gap: 3px; color: var(--ink); }
+.sub2api-monitor-toggle small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
 .sub2api-group-field { min-width: 0; margin: 0; padding: 0; border: 0; }
 .sub2api-group-field legend { margin-bottom: 6px; padding: 0; }
 .sub2api-group-picker {
@@ -714,6 +739,20 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .batch-dialog .sub2api-model-textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
 .dialog-hint { margin-top: 12px; color: var(--muted); font-size: 12px; line-height: 1.55; }
+.sub2api-monitor-status {
+  margin-top: 10px;
+  padding: 9px 10px;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--green-strong);
+  background: var(--green-soft);
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.sub2api-monitor-status svg { flex: 0 0 auto; margin-top: 1px; }
+.sub2api-monitor-status.error { color: #a33c31; background: #fff0ed; }
 .dialog-actions {
   position: sticky;
   bottom: calc(var(--dialog-padding) * -1);

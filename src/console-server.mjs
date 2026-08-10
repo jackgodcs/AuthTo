@@ -27,6 +27,9 @@ const MAX_LOG_CHARS = 80_000;
 const JOB_META_FILENAME = "job-meta.json";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
+const SUB2API_MONITOR_FILENAME = "sub2api-monitor.json";
+const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS", 5 * 60_000, 1_000);
+const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
 const SMS_POLL_INTERVAL_MS = Number(process.env.SMS_POLL_INTERVAL_MS || process.env.LUBAN_SMS_POLL_INTERVAL_MS || 3_000);
@@ -39,6 +42,7 @@ const WORKSPACE_ROOT = TOOL_ROOT;
 const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
+const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
@@ -49,6 +53,19 @@ let lastOutputSyncAt = 0;
 let shuttingDown = false;
 let queueSchedulingPaused = false;
 let shutdownPromise = null;
+let sub2ApiMonitorConfig = null;
+let sub2ApiMonitorTimer = null;
+let sub2ApiMonitorPromise = null;
+const sub2ApiRequestControllers = new Set();
+const sub2ApiRequestPromises = new Set();
+const sub2ApiAutoRepairPromises = new Set();
+const sub2ApiMonitorState = {
+  running: false,
+  lastCheckAt: null,
+  nextCheckAt: null,
+  lastError: null,
+  lastResult: null,
+};
 
 const hostArg = process.argv.find((item) => item.startsWith("--host="));
 const hostIndex = process.argv.indexOf("--host");
@@ -74,8 +91,10 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 }
 
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
+scheduleSub2ApiMonitor();
 
 const vite = await createViteServer({
   root: WEB_ROOT,
@@ -167,6 +186,7 @@ async function handleApi(req, res, requestUrl) {
         sourceExport: true,
         cancelAll: true,
         sub2apiUpload: true,
+        sub2apiMonitor: true,
         tlsFingerprint: true,
         totpSetup: true,
         forceRelogin: true,
@@ -265,10 +285,10 @@ async function handleApi(req, res, requestUrl) {
       (job) => !["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     );
     if (unsupported) throw httpError(409, `${unsupported.email} 当前仍在进行中，不能重新授权`);
-    await Promise.all(selected.map(async (job) => {
+    await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
       if (job.status === "completed") await regenerateJob(job, body);
       else await retryJob(job, body);
-    }));
+    })));
     sendJson(res, 200, { jobs: selected.map(publicJob), started: selected.length });
     return;
   }
@@ -276,9 +296,13 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/relogin-batch") {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
-    const eligible = selected.filter(canForceRelogin);
+    const started = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+      if (!canForceRelogin(job)) return null;
+      await forceReloginJob(job, body);
+      return job;
+    })));
+    const eligible = started.filter(Boolean);
     if (!eligible.length) throw httpError(409, "选中的账号当前都不能重新登录");
-    await Promise.all(eligible.map((job) => forceReloginJob(job, body)));
     sendJson(res, 200, {
       jobs: eligible.map(publicJob),
       started: eligible.length,
@@ -290,9 +314,13 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/setup-2fa-batch") {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
-    const eligible = selected.filter(canSetupTotp);
+    const started = await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+      if (!canSetupTotp(job)) return null;
+      await startTotpSetup(job, body);
+      return job;
+    })));
+    const eligible = started.filter(Boolean);
     if (!eligible.length) throw httpError(409, "选中的账号都不能设置 2FA");
-    await Promise.all(eligible.map((job) => startTotpSetup(job, body)));
     sendJson(res, 200, {
       jobs: eligible.map(publicJob),
       started: eligible.length,
@@ -370,6 +398,8 @@ async function handleApi(req, res, requestUrl) {
       return {
         ...accountData,
         credentials,
+        status: "active",
+        schedulable: true,
         group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
         ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
         ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
@@ -390,6 +420,33 @@ async function handleApi(req, res, requestUrl) {
       groupIds: config.groupIds,
       result,
     });
+    return;
+  }
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/sub2api/monitor") {
+    sendJson(res, 200, publicSub2ApiMonitorState());
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor") {
+    const body = await readJson(req);
+    if (body.enabled) {
+      const config = normalizeSub2ApiConfig(body.config);
+      sub2ApiMonitorConfig = { ...config, enabled: true };
+    } else {
+      sub2ApiMonitorConfig = null;
+    }
+    sub2ApiMonitorState.lastError = null;
+    await persistSub2ApiMonitorConfiguration();
+    scheduleSub2ApiMonitor();
+    sendJson(res, 200, publicSub2ApiMonitorState());
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor/check") {
+    if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "请先启用 Sub2API 号池监控");
+    const result = await runSub2ApiMonitor("manual");
+    sendJson(res, 200, { ...publicSub2ApiMonitorState(), result });
     return;
   }
 
@@ -439,42 +496,42 @@ async function handleApi(req, res, requestUrl) {
     const config = action === "luban-number"
       ? { apiKey: body.apiKey, serviceId: body.serviceId }
       : body.config;
-    await acquireSmsNumber(job, providerId, config);
+    await withEmailJobLock(job.email, () => acquireSmsNumber(job, providerId, config));
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "cancel") {
-    await cancelJob(job);
+    await withEmailJobLock(job.email, () => cancelJob(job));
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "retry") {
     const body = await readJson(req);
-    await retryJob(job, body);
+    await withEmailJobLock(job.email, () => retryJob(job, body));
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "regenerate") {
     const body = await readJson(req);
-    await regenerateJob(job, body);
+    await withEmailJobLock(job.email, () => regenerateJob(job, body));
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "relogin") {
     const body = await readJson(req);
-    await forceReloginJob(job, body);
+    await withEmailJobLock(job.email, () => forceReloginJob(job, body));
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "setup-2fa") {
     const body = await readJson(req);
-    await startTotpSetup(job, body);
+    await withEmailJobLock(job.email, () => startTotpSetup(job, body));
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
   if (req.method === "POST" && action === "input") {
     const body = await readJson(req);
-    await submitJobInput(job, body);
+    await withEmailJobLock(job.email, () => submitJobInput(job, body));
     sendJson(res, 200, { job: publicJob(job) });
     return;
   }
@@ -579,8 +636,23 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     proxySessionAttemptIds: new Set(),
     proxyAttemptParserTail: "",
     queueRunId: null,
+    lastAuthAutomated: false,
+    lastAuthAutomationReason: "尚未完成可验证的全自动登录",
+    lastAuthAutomatedAt: null,
+    lastAuthRequirements: null,
+    authAutomationAttempt: null,
+    autoRepairBlocked: false,
+    autoRepairBlockedReason: null,
+    autoRepairBlockedAt: null,
+    autoRepairLastAttemptAt: null,
+    autoRepairLastSuccessAt: null,
+    autoRepairLastError: null,
+    autoRepairPendingAccountIds: [],
+    autoRepairPendingBackend: null,
+    autoRepairOperation: null,
     ...newSmsState(),
   };
+  beginAuthorizationAutomationAttempt(job, "initial");
   jobs.set(id, job);
   await saveJobMetadata(job);
   scheduleQueuedJobs();
@@ -640,6 +712,9 @@ function enqueueJob(job, mode, startPrompt) {
 
 function launchJob(job, options = {}) {
   const mode = options.mode || "full";
+  if (mode === "full" && !job.authAutomationAttempt) {
+    beginAuthorizationAutomationAttempt(job, "login");
+  }
   const runId = crypto.randomUUID();
   job.runId = runId;
   job.runMode = mode;
@@ -696,14 +771,17 @@ function launchJob(job, options = {}) {
     if (job.runId === runId) consumeOutput(job, chunk.toString("utf8"));
   });
   child.on("error", (error) => {
-    if (job.runId !== runId) return;
-    if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
-    else failJob(job, `无法启动登录进程：${error.message}`);
+    void withEmailJobLock(job.email, async () => {
+      if (job.runId !== runId) return;
+      if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
+      else failJob(job, `无法启动登录进程：${error.message}`);
+    });
   });
   child.on("close", (code, signal) => {
-    void handleChildClose(job, { code, signal, mode, runId }).catch((error) => {
-      handleChildCloseFailure(job, mode, runId, error);
-    });
+    void withEmailJobLock(job.email, () => handleChildClose(job, { code, signal, mode, runId }))
+      .catch((error) => {
+        handleChildCloseFailure(job, mode, runId, error);
+      });
   });
 }
 
@@ -717,15 +795,18 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (["canceled", "reauth_required"].includes(job.status)) {
+    await finishSub2ApiAutoRepairFailure(job);
     scheduleQueuedJobs();
     return;
   }
   if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+    if (mode === "full") completeAuthorizationAutomationAttempt(job);
     job.status = "completed";
     job.prompt = "授权完成，可以下载导入文件";
     job.completedAt = new Date().toISOString();
     touch(job);
     await saveJobMetadata(job);
+    await finishSub2ApiAutoRepairSuccess(job);
     scheduleQueuedJobs();
     return;
   }
@@ -736,6 +817,7 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
       failJob(job, signal ? `登录进程被 ${signal} 终止` : `登录进程退出，代码 ${code ?? "未知"}`);
     }
   }
+  await finishSub2ApiAutoRepairFailure(job);
   scheduleQueuedJobs();
 }
 
@@ -790,6 +872,11 @@ async function retryJob(job, options = {}) {
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
   job.mailCandidateCounts.clear();
+  clearAutoRepairBlock(job);
+  job.autoRepairOperation = null;
+  job.autoRepairPendingAccountIds = [];
+  job.autoRepairPendingBackend = null;
+  beginAuthorizationAutomationAttempt(job, "manual_retry");
   appendJobLog(
     job,
     retryingSecurityCheck
@@ -824,11 +911,14 @@ async function regenerateJob(job, options = {}) {
   enqueueJob(job, "refresh", "正在使用已有刷新令牌直接生成新授权");
 }
 
-async function forceReloginJob(job, options = {}) {
+async function forceReloginJob(job, options = {}, context = {}) {
   if (!canForceRelogin(job)) {
     throw httpError(409, "当前任务正在进行中，不能重新登录");
   }
   await reloadMissingJobCredentials(job);
+  if (!canForceRelogin(job)) {
+    throw httpError(409, "当前任务正在进行中，不能重新登录");
+  }
   if (Object.hasOwn(options, "proxyUrl")) {
     job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
     await saveStoredLoginCredentials(job.email, job);
@@ -860,6 +950,19 @@ async function forceReloginJob(job, options = {}) {
   job.proxyAttemptParserTail = "";
   job.mailCandidateCounts.clear();
   job.attempt += 1;
+  if (!context.autoRepair) {
+    clearAutoRepairBlock(job);
+    job.autoRepairPendingAccountIds = [];
+    job.autoRepairPendingBackend = null;
+  }
+  job.autoRepairOperation = context.autoRepair || null;
+  if (context.autoRepair) {
+    job.autoRepairLastAttemptAt = new Date().toISOString();
+    job.autoRepairLastError = null;
+    job.autoRepairPendingAccountIds = [...new Set(context.autoRepair.accountIds || [])];
+    job.autoRepairPendingBackend = context.autoRepair.backend || null;
+  }
+  beginAuthorizationAutomationAttempt(job, context.autoRepair ? "sub2api_monitor" : "manual_relogin");
   appendJobLog(job, `\n[relogin] 第 ${job.attempt} 次授权：跳过刷新令牌并强制重新登录。\n`);
   if (job.hasTotpCredential && !job.totpSecret) {
     appendJobLog(job, "[mfa] 本地未能读取已记录的 2FA 密钥，遇到 2FA 时需要手动输入验证码。\n");
@@ -1025,6 +1128,7 @@ async function fallbackFromRefresh(job) {
   job.parserTail = "";
   job.currentPhone = null;
   job.phoneError = null;
+  beginAuthorizationAutomationAttempt(job, "refresh_fallback");
   appendJobLog(job, "[refresh] 刷新令牌已失效，自动回退到邮箱验证码登录。\n");
   if (job.mailApiUrl) await loadMailboxBaseline(job);
   job.fallbackInProgress = false;
@@ -1050,6 +1154,14 @@ function consumeOutput(job, rawText) {
   job.logs = `${job.logs}${text}`.slice(-MAX_LOG_CHARS);
   const scan = `${job.parserTail}${text}`;
   job.parserTail = scan.slice(-2_000);
+
+  if (scan.includes("[3/5] Password login page reached.")) {
+    markAuthorizationRequirement(job, "password");
+    if (job.password) markAuthorizationAutomatic(job, "password");
+  }
+  if (scan.includes("[3/5] Email OTP page reached.")) {
+    markAuthorizationRequirement(job, "emailOtp");
+  }
 
   if (scan.includes("[proxy-risk-retry]")) {
     void restartAfterProxyRisk(job, {
@@ -1132,14 +1244,21 @@ function consumeOutput(job, rawText) {
   }
 
   if (scan.includes("Email OTP (r=resend, q=quit):")) {
+    markAuthorizationRequirement(job, "emailOtp");
+    const rejected = scan.includes("[email-otp-rejected]");
     setStage(
       job,
       "email_otp",
-      job.mailApiUrl ? "正在等待收码接口返回新验证码，也可以手动输入" : "请输入邮箱验证码",
+      rejected
+        ? "邮箱验证码错误，请重新输入或重新发送"
+        : job.mailApiUrl
+          ? "正在等待收码接口返回新验证码，也可以手动输入"
+          : "请输入邮箱验证码",
     );
     if (job.mailApiUrl) void beginMailPolling(job);
   }
   if (scan.includes("Password (q=quit):")) {
+    markAuthorizationRequirement(job, "password");
     stopMailPolling(job);
     setStage(job, "password", "请输入账号密码");
   }
@@ -1149,9 +1268,14 @@ function consumeOutput(job, rawText) {
   const mfaReachedIndex = scan.lastIndexOf("[mfa] TOTP 2FA challenge reached.");
   const mfaPromptIndex = scan.lastIndexOf("2FA OTP (6 digits, q=quit):");
   if (mfaReachedIndex > mfaPromptIndex) {
+    markAuthorizationRequirement(job, "mfa");
     setStage(job, "working", job.totpSecret ? "正在自动完成 2FA 验证" : "正在准备 2FA 验证");
   } else if (mfaPromptIndex > mfaReachedIndex) {
+    markAuthorizationRequirement(job, "mfa");
     setStage(job, "mfa_otp", "请输入 6 位 2FA 验证码");
+  }
+  if (scan.includes("[mfa] Generated a 6-digit code from the configured 2FA key.")) {
+    markAuthorizationAutomatic(job, "mfa");
   }
   const phoneNumberPromptIndex = scan.lastIndexOf("Phone number, E.164 format");
   const phoneOtpPromptIndex = scan.lastIndexOf("Phone OTP (r=resend, p=change phone, q=quit):");
@@ -1221,10 +1345,11 @@ function consumeOutput(job, rawText) {
 
   const errorMatches = [...scan.matchAll(/\[error\]\s*([^\r\n]+)/g)];
   if (errorMatches.length) {
+    const errorMessage = extractResponseMessage(errorMatches.at(-1)[1]);
     if (job.runMode === "totp_setup") {
-      job.totpSetupError = extractResponseMessage(errorMatches.at(-1)[1]);
+      job.totpSetupError = errorMessage;
     } else {
-      failJob(job, extractResponseMessage(errorMatches.at(-1)[1]));
+      failJob(job, errorMessage);
     }
   }
   touch(job);
@@ -1694,6 +1819,7 @@ async function submitJobInput(job, body, options = {}) {
     job.loginMode = "password";
     job.password = rawValue;
     job.hasPasswordCredential = true;
+    markAuthorizationManual(job, "password");
     await saveJobMetadata(job);
     inputValue = rawValue;
     setStage(job, "working", "正在验证账号密码");
@@ -1701,6 +1827,7 @@ async function submitJobInput(job, body, options = {}) {
     requireStage(job, "mfa_otp");
     if (!/^\d{6}$/.test(value)) throw httpError(400, "2FA 验证码必须是 6 位数字");
     inputValue = value;
+    markAuthorizationManual(job, "mfa");
     setStage(job, "working", "正在验证 2FA 验证码");
   } else if (action === "totp_setup_otp") {
     requireStage(job, "totp_setup_otp");
@@ -1711,11 +1838,14 @@ async function submitJobInput(job, body, options = {}) {
     requireStage(job, "email_otp");
     if (!/^\d{6}$/.test(value)) throw httpError(400, "Email code must be 6 digits");
     stopMailPolling(job);
+    job.parserTail = "";
+    markAuthorizationManual(job, "emailOtp");
     inputValue = value;
     setStage(job, "working", "正在验证邮箱验证码");
   } else if (action === "resend_email") {
     requireStage(job, "email_otp");
     stopMailPolling(job);
+    job.parserTail = "";
     inputValue = "r";
     setStage(job, "working", "正在重新发送邮箱验证码");
   } else if (action === "phone") {
@@ -1799,7 +1929,7 @@ async function cancelAllJobs() {
   if (!activeJobs.length) return 0;
   queueSchedulingPaused = true;
   try {
-    await Promise.all(activeJobs.map((job) => cancelJob(job)));
+    await Promise.all(activeJobs.map((job) => withEmailJobLock(job.email, () => cancelJob(job))));
     await Promise.all(activeJobs.map((job) => saveJobMetadata(job)));
   } finally {
     queueSchedulingPaused = false;
@@ -1925,6 +2055,13 @@ function normalizeSub2ApiConfig(value) {
   return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist };
 }
 
+function readDurationEnv(name, fallback, minimum) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= minimum ? value : fallback;
+}
+
 function parseOptionalSub2ApiInteger(value, label, min, max) {
   const text = String(value ?? "").trim();
   if (!text) return null;
@@ -1944,8 +2081,19 @@ function parseSub2ApiModelWhitelist(value) {
   return [...new Set(models)];
 }
 
-async function requestSub2Api(config, endpoint, options = {}) {
+function requestSub2Api(config, endpoint, options = {}) {
+  const requestPromise = performSub2ApiRequest(config, endpoint, options);
+  sub2ApiRequestPromises.add(requestPromise);
+  void requestPromise.then(
+    () => sub2ApiRequestPromises.delete(requestPromise),
+    () => sub2ApiRequestPromises.delete(requestPromise),
+  );
+  return requestPromise;
+}
+
+async function performSub2ApiRequest(config, endpoint, options = {}) {
   const controller = new AbortController();
+  sub2ApiRequestControllers.add(controller);
   const timeout = setTimeout(() => controller.abort(), 120_000);
   try {
     const response = await fetch(`${config.baseUrl}${endpoint}`, {
@@ -1968,15 +2116,20 @@ async function requestSub2Api(config, endpoint, options = {}) {
     }
     if (!response.ok) {
       const message = sub2ApiResponseMessage(payload, text).slice(0, 500);
-      throw httpError(502, `Sub2API 返回 HTTP ${response.status}${message ? `：${message}` : ""}`);
+      const error = httpError(502, `Sub2API 返回 HTTP ${response.status}${message ? `：${message}` : ""}`);
+      error.remoteStatus = response.status;
+      throw error;
     }
     return payload;
   } catch (error) {
     if (error?.status) throw error;
-    if (error?.name === "AbortError") throw httpError(504, "Sub2API 请求超时");
+    if (error?.name === "AbortError") {
+      throw httpError(shuttingDown ? 503 : 504, shuttingDown ? "Sub2API 请求已因服务关闭而取消" : "Sub2API 请求超时");
+    }
     throw httpError(502, `无法连接 Sub2API 后端：${error.message}`);
   } finally {
     clearTimeout(timeout);
+    sub2ApiRequestControllers.delete(controller);
   }
 }
 
@@ -1985,6 +2138,415 @@ function sub2ApiResponseMessage(payload, text) {
   return typeof message === "string" && message.trim()
     ? message.trim()
     : extractResponseMessage(text);
+}
+
+async function loadSub2ApiMonitorConfiguration() {
+  try {
+    const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
+    const config = normalizeSub2ApiConfig(saved.config);
+    sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true };
+    sub2ApiMonitorState.lastCheckAt = saved.state?.lastCheckAt || null;
+    sub2ApiMonitorState.lastError = saved.state?.lastError || null;
+    sub2ApiMonitorState.lastResult = saved.state?.lastResult && typeof saved.state.lastResult === "object"
+      ? saved.state.lastResult
+      : null;
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      console.warn(`[warn] Sub2API 号池监控配置无法读取：${String(error?.message || error).slice(0, 180)}`);
+    }
+    sub2ApiMonitorConfig = null;
+  }
+}
+
+async function persistSub2ApiMonitorConfiguration() {
+  if (!sub2ApiMonitorConfig) {
+    await fs.rm(SUB2API_MONITOR_PATH, { force: true });
+    return;
+  }
+  const payload = {
+    version: 1,
+    enabled: Boolean(sub2ApiMonitorConfig.enabled),
+    config: {
+      baseUrl: sub2ApiMonitorConfig.baseUrl,
+      adminApiKey: sub2ApiMonitorConfig.adminApiKey,
+      groupIds: sub2ApiMonitorConfig.groupIds,
+      proxyId: sub2ApiMonitorConfig.proxyId,
+      concurrency: sub2ApiMonitorConfig.concurrency,
+      loadFactor: sub2ApiMonitorConfig.loadFactor,
+      priority: sub2ApiMonitorConfig.priority,
+      modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
+    },
+    state: {
+      lastCheckAt: sub2ApiMonitorState.lastCheckAt,
+      lastError: sub2ApiMonitorState.lastError,
+      lastResult: sub2ApiMonitorState.lastResult,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+  const tempPath = `${SUB2API_MONITOR_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await fs.rename(tempPath, SUB2API_MONITOR_PATH);
+}
+
+function publicSub2ApiMonitorState() {
+  return {
+    configured: Boolean(sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey),
+    enabled: Boolean(sub2ApiMonitorConfig?.enabled),
+    baseUrl: sub2ApiMonitorConfig?.baseUrl || null,
+    groupIds: sub2ApiMonitorConfig?.groupIds || [],
+    intervalMinutes: Math.max(1, Math.round(SUB2API_MONITOR_INTERVAL_MS / 60_000)),
+    cooldownMinutes: Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000)),
+    running: sub2ApiMonitorState.running,
+    lastCheckAt: sub2ApiMonitorState.lastCheckAt,
+    nextCheckAt: sub2ApiMonitorState.nextCheckAt,
+    lastError: sub2ApiMonitorState.lastError,
+    lastResult: sub2ApiMonitorState.lastResult,
+  };
+}
+
+function scheduleSub2ApiMonitor() {
+  if (sub2ApiMonitorTimer) {
+    clearInterval(sub2ApiMonitorTimer);
+    sub2ApiMonitorTimer = null;
+  }
+  sub2ApiMonitorState.nextCheckAt = null;
+  if (!sub2ApiMonitorConfig?.enabled || shuttingDown) return;
+  const interval = Number.isFinite(SUB2API_MONITOR_INTERVAL_MS) && SUB2API_MONITOR_INTERVAL_MS >= 1_000
+    ? SUB2API_MONITOR_INTERVAL_MS
+    : 5 * 60_000;
+  sub2ApiMonitorState.nextCheckAt = new Date(Date.now() + interval).toISOString();
+  sub2ApiMonitorTimer = setInterval(() => {
+    sub2ApiMonitorState.nextCheckAt = new Date(Date.now() + interval).toISOString();
+    void runSub2ApiMonitor("scheduled").catch((error) => {
+      console.warn(`[warn] Sub2API 号池巡检失败：${String(error?.message || error).slice(0, 180)}`);
+    });
+  }, interval);
+  sub2ApiMonitorTimer.unref?.();
+}
+
+async function runSub2ApiMonitor(trigger = "scheduled") {
+  if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "Sub2API 号池监控未启用");
+  if (sub2ApiMonitorPromise) return sub2ApiMonitorPromise;
+  const config = { ...sub2ApiMonitorConfig, groupIds: [...sub2ApiMonitorConfig.groupIds] };
+  sub2ApiMonitorPromise = (async () => {
+    sub2ApiMonitorState.running = true;
+    sub2ApiMonitorState.lastError = null;
+    const summary = {
+      trigger,
+      checked: 0,
+      matched: 0,
+      started: 0,
+      updated: 0,
+      missingTask: 0,
+      ineligible: 0,
+      blocked: 0,
+      busy: 0,
+      cooldown: 0,
+      outsideGroups: 0,
+      missingEmail: 0,
+    };
+    try {
+      await syncCompletedOutputs(true);
+      await retryPendingSub2ApiUploads(config, summary);
+      if (shuttingDown) throw httpError(503, "服务正在关闭，已停止号池巡检");
+      const remoteAccounts = await listSub2ApiErrorAccounts(config);
+      summary.checked = remoteAccounts.length;
+      const grouped = new Map();
+      for (const account of remoteAccounts) {
+        if (!isSub2ApiAccountInMonitoredGroups(account, config.groupIds)) {
+          summary.outsideGroups += 1;
+          continue;
+        }
+        const email = sub2ApiAccountEmail(account);
+        if (!email) {
+          summary.missingEmail += 1;
+          continue;
+        }
+        if (!grouped.has(email)) grouped.set(email, []);
+        grouped.get(email).push(account);
+      }
+
+      for (const [email, accounts] of grouped) {
+        await withEmailJobLock(email, async () => {
+          const job = findJobByEmail(email);
+          if (!job) {
+            summary.missingTask += accounts.length;
+            return;
+          }
+          summary.matched += accounts.length;
+          if (job.autoRepairBlocked) {
+            summary.blocked += accounts.length;
+            return;
+          }
+          if (isActive(job.status) || job.autoRepairOperation) {
+            summary.busy += accounts.length;
+            return;
+          }
+          if (isAutoRepairCoolingDown(job)) {
+            summary.cooldown += accounts.length;
+            return;
+          }
+          await reloadMissingJobCredentials(job);
+          const eligibility = getAutoRepairEligibility(job);
+          if (!eligibility.eligible) {
+            summary.ineligible += accounts.length;
+            return;
+          }
+
+          const operation = createSub2ApiAutoRepairOperation(config, accounts);
+          await forceReloginJob(job, {}, { autoRepair: operation });
+          appendJobLog(job, `[monitor] Sub2API 号池发现 ${accounts.length} 条异常记录，已自动加入重新登录并授权队列。\n`);
+          await saveJobMetadata(job);
+          summary.started += accounts.length;
+        });
+      }
+
+      sub2ApiMonitorState.lastCheckAt = new Date().toISOString();
+      sub2ApiMonitorState.lastResult = summary;
+      await persistSub2ApiMonitorConfiguration();
+      return summary;
+    } catch (error) {
+      sub2ApiMonitorState.lastCheckAt = new Date().toISOString();
+      sub2ApiMonitorState.lastError = String(error?.message || error).slice(0, 500);
+      await persistSub2ApiMonitorConfiguration().catch(() => {});
+      throw error;
+    } finally {
+      sub2ApiMonitorState.running = false;
+    }
+  })().finally(() => {
+    sub2ApiMonitorPromise = null;
+  });
+  return sub2ApiMonitorPromise;
+}
+
+function createSub2ApiAutoRepairOperation(config, accounts) {
+  const validAccounts = accounts.filter((account) => {
+    const id = Number(account?.id);
+    return Number.isSafeInteger(id) && id > 0;
+  });
+  return {
+    accountIds: validAccounts.map((account) => Number(account.id)),
+    accounts: validAccounts,
+    backend: monitorBackendIdentity(config),
+    config,
+    startedAt: new Date().toISOString(),
+  };
+}
+
+async function retryPendingSub2ApiUploads(config, summary) {
+  const backend = monitorBackendIdentity(config);
+  for (const candidate of listUniqueJobs()) {
+    await withEmailJobLock(candidate.email, async () => {
+      const job = findJobByEmail(candidate.email);
+      const pendingIds = [...new Set(job?.autoRepairPendingAccountIds || [])]
+        .map(Number)
+        .filter((id) => Number.isSafeInteger(id) && id > 0);
+      if (
+        !job
+        || pendingIds.length === 0
+        || job.autoRepairPendingBackend !== backend
+        || !job.resultSaved
+        || job.status !== "completed"
+        || job.autoRepairOperation
+        || isAutoRepairCoolingDown(job)
+      ) return;
+
+      const accounts = [];
+      const missingIds = [];
+      try {
+        for (const accountId of pendingIds) {
+          const account = await getSub2ApiAccount(config, accountId);
+          if (account) accounts.push(account);
+          else missingIds.push(accountId);
+        }
+      } catch (error) {
+        job.autoRepairLastAttemptAt = new Date().toISOString();
+        job.autoRepairLastError = String(error?.message || error).slice(0, 500);
+        appendJobLog(job, `[monitor] 读取待重传的 Sub2API 账号失败：${job.autoRepairLastError}。\n`);
+        touch(job);
+        await saveJobMetadata(job);
+        return;
+      }
+
+      if (missingIds.length) {
+        const missing = new Set(missingIds);
+        job.autoRepairPendingAccountIds = pendingIds.filter((id) => !missing.has(id));
+        appendJobLog(job, `[monitor] ${missingIds.length} 条待重传账号已从 Sub2API 删除，已停止重试。\n`);
+      }
+      if (!accounts.length) {
+        job.autoRepairPendingBackend = null;
+        job.autoRepairLastError = null;
+        touch(job);
+        await saveJobMetadata(job);
+        return;
+      }
+
+      job.autoRepairOperation = createSub2ApiAutoRepairOperation(config, accounts);
+      job.autoRepairLastAttemptAt = new Date().toISOString();
+      appendJobLog(job, `[monitor] 正在重传 ${accounts.length} 条上次未完成的 Sub2API 更新，不重复登录。\n`);
+      if (await finishSub2ApiAutoRepairSuccess(job)) summary.updated += accounts.length;
+    });
+  }
+}
+
+async function getSub2ApiAccount(config, accountId) {
+  try {
+    const payload = await requestSub2Api(config, `/api/v1/admin/accounts/${accountId}`);
+    const account = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    if (!account || Number(account.id) !== Number(accountId)) {
+      throw new Error(`Sub2API 账号 ${accountId} 返回数据不完整`);
+    }
+    return account;
+  } catch (error) {
+    if (error?.remoteStatus === 404) return null;
+    throw error;
+  }
+}
+
+async function listSub2ApiErrorAccounts(config) {
+  const accounts = [];
+  let page = 1;
+  let pages = 1;
+  do {
+    const query = new URLSearchParams({
+      page: String(page),
+      page_size: "100",
+      platform: "openai",
+      status: "error",
+    });
+    const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
+    const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
+    const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
+    accounts.push(...items.filter((account) => account && String(account.platform || "openai") === "openai" && String(account.status || "error") === "error"));
+    const reportedPages = Number(data?.pages);
+    pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
+      ? reportedPages
+      : items.length >= 100 ? page + 1 : page;
+    page += 1;
+  } while (page <= pages && page <= 1_000);
+  return accounts;
+}
+
+function sub2ApiAccountEmail(account) {
+  const direct = [account?.credentials?.email, account?.extra?.email]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .find(isEmail);
+  if (direct) return direct;
+  const match = String(account?.name || "").toLowerCase().match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  return match && isEmail(match[0]) ? match[0] : null;
+}
+
+function isSub2ApiAccountInMonitoredGroups(account, groupIds) {
+  if (!groupIds.length) return true;
+  const accountGroupIds = [
+    ...(Array.isArray(account?.group_ids) ? account.group_ids : []),
+    ...(Array.isArray(account?.account_groups) ? account.account_groups.map((item) => item?.group_id) : []),
+  ].map(Number).filter(Number.isSafeInteger);
+  return groupIds.some((id) => accountGroupIds.includes(Number(id)));
+}
+
+function monitorBackendIdentity(config) {
+  return crypto.createHash("sha256").update(String(config?.baseUrl || "")).digest("hex").slice(0, 24);
+}
+
+function isAutoRepairCoolingDown(job) {
+  if (!job.autoRepairLastAttemptAt || !Number.isFinite(SUB2API_AUTO_REPAIR_COOLDOWN_MS) || SUB2API_AUTO_REPAIR_COOLDOWN_MS <= 0) return false;
+  return Date.now() - new Date(job.autoRepairLastAttemptAt).getTime() < SUB2API_AUTO_REPAIR_COOLDOWN_MS;
+}
+
+function getAutoRepairEligibility(job) {
+  if (job.autoRepairBlocked) return { eligible: false, reason: "账号已确认封禁、删除或永久停用" };
+  if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
+  const requirements = job.lastAuthRequirements || {};
+  if (requirements.password && !job.password) return { eligible: false, reason: "已保存的密码无法读取" };
+  if (requirements.emailOtp && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动收取邮箱验证码的 API" };
+  if (requirements.mfa && !job.totpSecret) return { eligible: false, reason: "已保存的 2FA 密钥无法读取" };
+  if (!job.password && !job.mailApiUrl) return { eligible: false, reason: "缺少可自动登录的密码或邮件收码 API" };
+  if (job.hasTotpCredential && !job.totpSecret) return { eligible: false, reason: "2FA 密钥在当前系统上无法恢复" };
+  return { eligible: true, reason: "上次完整登录全自动完成，所需资料仍可用" };
+}
+
+function finishSub2ApiAutoRepairSuccess(job) {
+  const operationPromise = performSub2ApiAutoRepairSuccess(job);
+  sub2ApiAutoRepairPromises.add(operationPromise);
+  void operationPromise.then(
+    () => sub2ApiAutoRepairPromises.delete(operationPromise),
+    () => sub2ApiAutoRepairPromises.delete(operationPromise),
+  );
+  return operationPromise;
+}
+
+async function performSub2ApiAutoRepairSuccess(job) {
+  const operation = job.autoRepairOperation;
+  if (!operation) return false;
+  job.autoRepairPendingAccountIds = [...new Set(operation.accountIds)];
+  job.autoRepairPendingBackend = operation.backend;
+  try {
+    const payload = await buildSub2ApiUploadPayload([job]);
+    const localAccount = payload.accounts.find((account) => sub2ApiAccountEmail(account) === job.email.toLowerCase())
+      || payload.accounts[0];
+    if (!localAccount?.credentials) throw new Error("新授权文件中没有可更新的账号凭据");
+
+    const pendingIds = new Set(job.autoRepairPendingAccountIds);
+    for (const remoteAccount of operation.accounts) {
+      const accountId = Number(remoteAccount.id);
+      if (!Number.isSafeInteger(accountId) || accountId <= 0) continue;
+      const credentials = {
+        ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
+        ...localAccount.credentials,
+      };
+      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
+        method: "PUT",
+        body: JSON.stringify({ credentials }),
+      });
+      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
+        method: "POST",
+        body: "{}",
+      });
+      await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/schedulable`, {
+        method: "POST",
+        body: JSON.stringify({ schedulable: true }),
+      });
+      pendingIds.delete(accountId);
+      job.autoRepairPendingAccountIds = [...pendingIds];
+    }
+
+    job.autoRepairLastSuccessAt = new Date().toISOString();
+    job.autoRepairLastError = null;
+    job.autoRepairPendingAccountIds = [];
+    job.autoRepairPendingBackend = null;
+    job.autoRepairOperation = null;
+    clearAutoRepairBlock(job);
+    appendJobLog(job, `[monitor] 已用新授权覆盖更新 Sub2API 中的 ${operation.accountIds.length} 条账号记录。\n`);
+    touch(job);
+    await saveJobMetadata(job);
+    return true;
+  } catch (error) {
+    job.autoRepairLastAttemptAt = new Date().toISOString();
+    job.autoRepairLastError = String(error?.message || error).slice(0, 500);
+    job.autoRepairOperation = null;
+    appendJobLog(job, `[monitor] 新授权已生成，但更新 Sub2API 失败：${job.autoRepairLastError}。下次巡检会优先重传，不会重复登录。\n`);
+    touch(job);
+    await saveJobMetadata(job);
+    return false;
+  }
+}
+
+async function finishSub2ApiAutoRepairFailure(job) {
+  if (!job.autoRepairOperation) return;
+  const operation = job.autoRepairOperation;
+  job.autoRepairOperation = null;
+  job.autoRepairLastAttemptAt = new Date().toISOString();
+  job.autoRepairLastError = job.autoRepairBlockedReason || job.lastError || "自动重新登录并授权未完成";
+  appendJobLog(job, job.autoRepairBlocked
+    ? "[monitor] 自动授权确认账号已永久不可用，已停止后续巡检。\n"
+    : `[monitor] 本次自动授权未完成，${Math.max(1, Math.round(SUB2API_AUTO_REPAIR_COOLDOWN_MS / 60_000))} 分钟内不会重复启动。\n`);
+  if (!job.autoRepairBlocked) {
+    job.autoRepairPendingAccountIds = [];
+    job.autoRepairPendingBackend = operation.backend;
+  }
+  touch(job);
+  await saveJobMetadata(job);
 }
 
 async function exportSourceAccounts(res, ids) {
@@ -2034,6 +2596,7 @@ async function exportSourceAccounts(res, ids) {
 }
 
 function publicJob(job) {
+  const autoRepair = getAutoRepairEligibility(job);
   return {
     id: job.id,
     email: job.email,
@@ -2069,6 +2632,13 @@ function publicJob(job) {
     canSetupTotp: canSetupTotp(job),
     restartRequired: job.restartRequired,
     proxyConfigured: Boolean(job.proxyUrl),
+    autoRepairEligible: autoRepair.eligible,
+    autoRepairEligibilityReason: autoRepair.reason,
+    autoRepairBlocked: Boolean(job.autoRepairBlocked),
+    autoRepairBlockedReason: job.autoRepairBlockedReason || null,
+    autoRepairLastAttemptAt: job.autoRepairLastAttemptAt || null,
+    autoRepairLastSuccessAt: job.autoRepairLastSuccessAt || null,
+    autoRepairLastError: job.autoRepairLastError || null,
     attempt: job.attempt,
     queuePosition: job.status === "queued" ? getQueuePosition(job) : 0,
   };
@@ -2114,8 +2684,79 @@ function failJob(job, message) {
   job.status = "failed";
   job.prompt = "流程失败";
   job.lastError = message;
+  if (isPermanentAccountFailure(message)) markAutoRepairBlocked(job, message);
   touch(job);
   void saveJobMetadata(job).catch(() => {});
+}
+
+function beginAuthorizationAutomationAttempt(job, source) {
+  job.authAutomationAttempt = {
+    source,
+    startedAt: new Date().toISOString(),
+    requirements: { password: false, emailOtp: false, mfa: false },
+    automatic: { password: false, emailOtp: false, mfa: false },
+    manual: { password: false, emailOtp: false, mfa: false },
+  };
+}
+
+function markAuthorizationRequirement(job, field) {
+  if (!job.authAutomationAttempt?.requirements || !Object.hasOwn(job.authAutomationAttempt.requirements, field)) return;
+  job.authAutomationAttempt.requirements[field] = true;
+}
+
+function markAuthorizationAutomatic(job, field) {
+  if (!job.authAutomationAttempt?.automatic || !Object.hasOwn(job.authAutomationAttempt.automatic, field)) return;
+  job.authAutomationAttempt.automatic[field] = true;
+}
+
+function markAuthorizationManual(job, field) {
+  if (!job.authAutomationAttempt?.manual || !Object.hasOwn(job.authAutomationAttempt.manual, field)) return;
+  job.authAutomationAttempt.manual[field] = true;
+}
+
+function completeAuthorizationAutomationAttempt(job) {
+  const attempt = job.authAutomationAttempt;
+  if (!attempt) return;
+  const reasons = [];
+  for (const [field, label] of [["password", "密码"], ["emailOtp", "邮箱验证码"], ["mfa", "登录 2FA 验证码"]]) {
+    if (attempt.manual[field]) reasons.push(`${label}由用户手动输入`);
+    else if (attempt.requirements[field] && !attempt.automatic[field]) reasons.push(`${label}未记录为自动完成`);
+  }
+  const hasAutomaticLoginSource = attempt.requirements.password
+    || attempt.requirements.emailOtp
+    || Boolean(job.password || job.mailApiUrl);
+  if (!hasAutomaticLoginSource) reasons.push("没有可用于下次自动登录的密码或邮件收码接口");
+
+  job.lastAuthAutomated = reasons.length === 0;
+  job.lastAuthAutomationReason = reasons.length ? reasons.join("；") : "上次完整登录未需要人工输入密码、邮箱码或登录 2FA";
+  job.lastAuthAutomatedAt = new Date().toISOString();
+  job.lastAuthRequirements = { ...attempt.requirements };
+  job.authAutomationAttempt = null;
+  appendJobLog(job, job.lastAuthAutomated
+    ? "[automation] 本次完整登录已记录为可自动修复。\n"
+    : `[automation] 本次完整登录不可自动修复：${job.lastAuthAutomationReason}。\n`);
+}
+
+function clearAutoRepairBlock(job) {
+  job.autoRepairBlocked = false;
+  job.autoRepairBlockedReason = null;
+  job.autoRepairBlockedAt = null;
+}
+
+function markAutoRepairBlocked(job, reason) {
+  job.autoRepairBlocked = true;
+  job.autoRepairBlockedReason = String(reason || "账号已被永久停用").slice(0, 500);
+  job.autoRepairBlockedAt = new Date().toISOString();
+  job.autoRepairLastError = job.autoRepairBlockedReason;
+  job.autoRepairPendingAccountIds = [];
+  job.autoRepairPendingBackend = null;
+  job.autoRepairOperation = null;
+  appendJobLog(job, "[monitor] 已确认账号被封禁、删除或永久停用，后续号池巡检将直接跳过。\n");
+}
+
+function isPermanentAccountFailure(message) {
+  const text = String(message || "");
+  return /(?:account|user)_(?:deactivated|deleted|suspended|disabled)|(?:your|this) account (?:has been|is) (?:deleted|deactivated|suspended|disabled)|account has been (?:deleted|deactivated|suspended|disabled)|deleted or deactivated|do not have an account because it has been deleted/i.test(text);
 }
 
 function requireStage(job, expected) {
@@ -2307,6 +2948,7 @@ async function syncCompletedOutputs(force = false) {
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
+          ...restoredAutoRepairState(metadata),
           totpSetupError: restoredOperation.totpSetupError,
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
@@ -2365,6 +3007,7 @@ async function syncCompletedOutputs(force = false) {
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
+          ...restoredAutoRepairState(metadata),
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...restoredSmsState(metadata),
         });
@@ -2448,6 +3091,7 @@ async function syncCompletedOutputs(force = false) {
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
+          ...restoredAutoRepairState(metadata),
           securityCheckRequired: Boolean(metadata.security_check_required),
           ...newSmsState(),
         });
@@ -2600,6 +3244,35 @@ function restoredProxyRiskState(metadata = {}) {
     proxyRiskRestarting: false,
     proxySessionAttemptIds: new Set(),
     proxyAttemptParserTail: "",
+  };
+}
+
+function restoredAutoRepairState(metadata = {}) {
+  const requirements = metadata.last_auth_requirements;
+  const pendingIds = Array.isArray(metadata.auto_repair_pending_account_ids)
+    ? metadata.auto_repair_pending_account_ids.map(Number).filter((id) => Number.isSafeInteger(id) && id > 0)
+    : [];
+  return {
+    lastAuthAutomated: metadata.last_auth_automated === true,
+    lastAuthAutomationReason: String(metadata.last_auth_automation_reason || "旧任务没有自动化参与记录"),
+    lastAuthAutomatedAt: metadata.last_auth_automated_at || null,
+    lastAuthRequirements: requirements && typeof requirements === "object"
+      ? {
+          password: Boolean(requirements.password),
+          emailOtp: Boolean(requirements.emailOtp),
+          mfa: Boolean(requirements.mfa),
+        }
+      : null,
+    authAutomationAttempt: null,
+    autoRepairBlocked: metadata.auto_repair_blocked === true,
+    autoRepairBlockedReason: metadata.auto_repair_blocked_reason || null,
+    autoRepairBlockedAt: metadata.auto_repair_blocked_at || null,
+    autoRepairLastAttemptAt: metadata.auto_repair_last_attempt_at || null,
+    autoRepairLastSuccessAt: metadata.auto_repair_last_success_at || null,
+    autoRepairLastError: metadata.auto_repair_last_error || null,
+    autoRepairPendingAccountIds: [...new Set(pendingIds)],
+    autoRepairPendingBackend: metadata.auto_repair_pending_backend || null,
+    autoRepairOperation: null,
   };
 }
 
@@ -2776,6 +3449,7 @@ function restartJobAfterConfigurationUpdate(job) {
   job.securityCheckRequired = false;
   job.restartRequired = false;
   job.attempt += 1;
+  beginAuthorizationAutomationAttempt(job, "configuration_update");
   appendJobLog(job, "[account] 已停止使用旧配置的登录进程，并使用新配置重新排队。\n");
   enqueueJob(job, "full", "账号资料已更新，正在重新建立登录会话");
 }
@@ -2815,6 +3489,18 @@ async function saveJobMetadata(job) {
         sms_order_id: job.smsOrderId || null,
         sms_number: job.smsNumber || null,
         sms_status: job.smsStatus || null,
+        last_auth_automated: Boolean(job.lastAuthAutomated),
+        last_auth_automation_reason: job.lastAuthAutomationReason || null,
+        last_auth_automated_at: job.lastAuthAutomatedAt || null,
+        last_auth_requirements: job.lastAuthRequirements || null,
+        auto_repair_blocked: Boolean(job.autoRepairBlocked),
+        auto_repair_blocked_reason: job.autoRepairBlockedReason || null,
+        auto_repair_blocked_at: job.autoRepairBlockedAt || null,
+        auto_repair_last_attempt_at: job.autoRepairLastAttemptAt || null,
+        auto_repair_last_success_at: job.autoRepairLastSuccessAt || null,
+        auto_repair_last_error: job.autoRepairLastError || null,
+        auto_repair_pending_account_ids: job.autoRepairPendingAccountIds || [],
+        auto_repair_pending_backend: job.autoRepairPendingBackend || null,
         updated_at: new Date().toISOString(),
       };
       const tempPath = `${metadataPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -2906,6 +3592,8 @@ async function beginMailPolling(job) {
           job.mailSeenCandidateKeys.add(fresh.key);
           job.mailCandidateCounts.delete(fresh.key);
           job.mailStatus = "found";
+          markAuthorizationRequirement(job, "emailOtp");
+          markAuthorizationAutomatic(job, "emailOtp");
           job.parserTail = "";
           appendJobLog(job, "[mail] 已从收码接口自动取得新验证码并提交。\n");
           setStage(job, "working", "已自动获取邮箱验证码，正在验证");
@@ -3008,6 +3696,16 @@ async function shutdown() {
   shutdownPromise = (async () => {
     shuttingDown = true;
     queueSchedulingPaused = true;
+    if (sub2ApiMonitorTimer) {
+      clearInterval(sub2ApiMonitorTimer);
+      sub2ApiMonitorTimer = null;
+    }
+    for (const controller of sub2ApiRequestControllers) controller.abort();
+    await Promise.allSettled([
+      sub2ApiMonitorPromise,
+      ...sub2ApiRequestPromises,
+      ...sub2ApiAutoRepairPromises,
+    ].filter(Boolean));
     const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
     const childWaits = activeJobs
       .map((job) => job.child)

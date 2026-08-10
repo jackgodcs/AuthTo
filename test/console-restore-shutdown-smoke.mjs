@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +17,22 @@ const interruptedId = "22222222-2222-4222-8222-222222222222";
 const interruptedEmail = "restore-interrupted@example.com";
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
+const sub2apiPort = await findAvailablePort();
+const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
+let resolveMonitorRequest;
+const monitorRequestStarted = new Promise((resolve) => { resolveMonitorRequest = resolve; });
+const sub2api = http.createServer((req, res) => {
+  if (req.headers["x-api-key"] !== "shutdown-test-key") {
+    res.writeHead(401).end();
+    return;
+  }
+  if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
+    resolveMonitorRequest();
+    return;
+  }
+  res.writeHead(404).end();
+});
+await new Promise((resolve) => sub2api.listen(sub2apiPort, "127.0.0.1", resolve));
 
 await fs.mkdir(restoredDir, { recursive: true });
 await fs.writeFile(path.join(restoredDir, "sub2api-import-oauth.json"), `${JSON.stringify({
@@ -92,10 +109,26 @@ try {
   const created = await createResponse.json();
   await waitForJob(headers, created.job.id, (job) => job.status === "mfa_otp");
 
+  const monitorConfigResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      enabled: true,
+      config: { baseUrl: sub2apiUrl, adminApiKey: "shutdown-test-key" },
+    }),
+  });
+  assert.equal(monitorConfigResponse.status, 200, await monitorConfigResponse.text());
+  void fetch(`${baseUrl}/api/sub2api/monitor/check`, { method: "POST", headers }).catch(() => {});
+  await Promise.race([
+    monitorRequestStarted,
+    delay(3_000).then(() => { throw new Error("monitor request did not start"); }),
+  ]);
+  const shutdownStartedAt = Date.now();
   child.kill("SIGTERM");
   const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
   assert.ok(exit, "console did not exit after SIGTERM");
   assert.equal(exit.code, 0, logs);
+  assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
   const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
   assert.equal(metadata.status, "canceled");
   assert.equal(metadata.prompt, "流程已取消");
@@ -103,6 +136,8 @@ try {
 } finally {
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);
+  sub2api.closeAllConnections?.();
+  await new Promise((resolve) => sub2api.close(resolve));
   await fs.rm(tempRoot, { recursive: true, force: true });
 }
 

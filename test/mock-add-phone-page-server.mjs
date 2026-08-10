@@ -54,6 +54,16 @@ const server = http.createServer(async (req, res) => {
     return sendText(res, 200, "<html><title>Check your inbox</title></html>", "text/html");
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/validate") {
+    const payload = parseJson(body);
+    if (lastLoginHint === "wrong-email-otp@example.com" && payload.code !== "123456") {
+      return sendJson(res, 401, {
+        error: {
+          message: "Wrong code. Please check it and try again.",
+          type: "invalid_request_error",
+          code: "wrong_email_otp_code",
+        },
+      });
+    }
     if (lastLoginHint === "account-profile@example.com") {
       return sendJson(res, 200, {
         continue_url: `${publicBase}/about-you`,
@@ -125,6 +135,14 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/add-phone/send") {
     const payload = JSON.parse(body || "{}");
+    if (lastLoginHint === "phone-risk-control@example.com") {
+      return sendText(
+        res,
+        409,
+        "<html><title>Just a moment...</title><div id=\"challenge-platform\"></div></html>",
+        "text/html",
+      );
+    }
     if (lastLoginHint === "security-check@example.com") {
       return sendJson(res, 409, {
         error: {
@@ -138,6 +156,14 @@ const server = http.createServer(async (req, res) => {
     }
     if ("channel" in payload) {
       return sendJson(res, 400, { error: { message: "unexpected channel field" } });
+    }
+    if (lastLoginHint === "phone-invalid-state@example.com" && payload.phone_number === "+60111111111") {
+      return sendJson(res, 400, {
+        error: {
+          message: "Your sign-in session is no longer valid. Please start over to continue.",
+          code: "invalid_state",
+        },
+      });
     }
     return sendJson(res, 200, {
       continue_url: `${publicBase}/phone-verification`,

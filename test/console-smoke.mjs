@@ -14,6 +14,12 @@ const baseUrl = `http://127.0.0.1:${port}`;
 const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
+let remoteErrorAccounts = [];
+const updatedRemoteAccounts = new Map();
+const clearedRemoteAccountIds = new Set();
+const scheduledRemoteAccounts = new Map();
+const clearRemoteCounts = new Map();
+const failClearOnce = new Set();
 const sub2api = http.createServer(async (req, res) => {
   if (req.headers["x-api-key"] !== "test-admin-key") {
     res.writeHead(401, { "content-type": "application/json" });
@@ -42,6 +48,73 @@ const sub2api = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0, results: [] }));
     return;
   }
+  if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
+    const requestUrl = new URL(req.url, sub2apiUrl);
+    const status = requestUrl.searchParams.get("status");
+    const items = remoteErrorAccounts.filter((account) => !status || account.status === status);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      code: 0,
+      message: "success",
+      data: { items, total: items.length, page: 1, page_size: 100, pages: 1 },
+    }));
+    return;
+  }
+  const detailMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
+  if (req.method === "GET" && detailMatch) {
+    const accountId = Number(detailMatch[1]);
+    const account = remoteErrorAccounts.find((item) => Number(item.id) === accountId);
+    if (!account) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "account not found" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, message: "success", data: account }));
+    return;
+  }
+  const updateMatch = /^\/api\/v1\/admin\/accounts\/(\d+)$/.exec(req.url || "");
+  if (req.method === "PUT" && updateMatch) {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const accountId = Number(updateMatch[1]);
+    updatedRemoteAccounts.set(accountId, body);
+    remoteErrorAccounts = remoteErrorAccounts.map((account) => (
+      Number(account.id) === accountId ? { ...account, ...body } : account
+    ));
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, message: "success", data: { id: accountId } }));
+    return;
+  }
+  const clearMatch = /^\/api\/v1\/admin\/accounts\/(\d+)\/clear-error$/.exec(req.url || "");
+  if (req.method === "POST" && clearMatch) {
+    const accountId = Number(clearMatch[1]);
+    clearedRemoteAccountIds.add(accountId);
+    clearRemoteCounts.set(accountId, (clearRemoteCounts.get(accountId) || 0) + 1);
+    remoteErrorAccounts = remoteErrorAccounts.map((account) => (
+      Number(account.id) === accountId ? { ...account, status: "active", error_message: "" } : account
+    ));
+    if (failClearOnce.delete(accountId)) {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "rate-limit cleanup failed after status recovery" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, message: "success", data: { id: accountId, status: "active" } }));
+    return;
+  }
+  const schedulableMatch = /^\/api\/v1\/admin\/accounts\/(\d+)\/schedulable$/.exec(req.url || "");
+  if (req.method === "POST" && schedulableMatch) {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const accountId = Number(schedulableMatch[1]);
+    scheduledRemoteAccounts.set(accountId, body.schedulable);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ code: 0, message: "success", data: { id: accountId, schedulable: body.schedulable } }));
+    return;
+  }
   res.writeHead(404, { "content-type": "application/json" });
   res.end(JSON.stringify({ message: "not found" }));
 });
@@ -59,6 +132,7 @@ const child = spawn(process.execPath, [
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
     PROXY_CONNECTION_RETRY_BASE_MS: "1",
+    SUB2API_AUTO_REPAIR_COOLDOWN_MS: "0",
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -207,6 +281,36 @@ try {
   assert.equal(mfaInputResponse.status, 200, await mfaInputResponse.text());
   await waitForJob(headers, mfaPromptJobId, (value) => value.status === "completed");
 
+  const wrongEmailOtpResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "wrong-email-otp-console@example.com" }),
+  });
+  assert.equal(wrongEmailOtpResponse.status, 201);
+  const wrongEmailOtpJobId = (await wrongEmailOtpResponse.json()).job.id;
+  await waitForJob(headers, wrongEmailOtpJobId, (value) => value.status === "email_otp");
+  const wrongEmailOtpInput = await fetch(`${baseUrl}/api/jobs/${wrongEmailOtpJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "email_otp", value: "000000" }),
+  });
+  assert.equal(wrongEmailOtpInput.status, 200, await wrongEmailOtpInput.text());
+  const retryEmailOtpJob = await waitForJob(
+    headers,
+    wrongEmailOtpJobId,
+    (value) => value.status === "email_otp" && /验证码错误/.test(value.prompt || ""),
+  );
+  assert.equal(retryEmailOtpJob.prompt, "邮箱验证码错误，请重新输入或重新发送");
+  const correctEmailOtpInput = await fetch(`${baseUrl}/api/jobs/${wrongEmailOtpJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "email_otp", value: "123456" }),
+  });
+  assert.equal(correctEmailOtpInput.status, 200, await correctEmailOtpInput.text());
+  const manuallyVerifiedJob = await waitForJob(headers, wrongEmailOtpJobId, (value) => value.status === "completed");
+  assert.equal(manuallyVerifiedJob.autoRepairEligible, false);
+  assert.match(manuallyVerifiedJob.autoRepairEligibilityReason, /手动输入/);
+
   const batchReloginResponse = await fetch(`${baseUrl}/api/jobs/relogin-batch`, {
     method: "POST",
     headers,
@@ -263,6 +367,8 @@ try {
   assert.equal(uploadedAccounts[0].concurrency, 10);
   assert.equal(uploadedAccounts[0].load_factor, 100);
   assert.equal(uploadedAccounts[0].priority, 1);
+  assert.equal(uploadedAccounts[0].status, "active");
+  assert.equal(uploadedAccounts[0].schedulable, true);
   assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
   assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
 
@@ -316,6 +422,143 @@ try {
     (await preservedSourceResponse.text()).replace(/^\uFEFF/, ""),
     new RegExp(`password-mail-totp@example\\.com----test-password-2----.*----JBSWY3DPEHPK3PXP`),
   );
+
+  const manualPhoneResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "manual-phone-automation@example.com", password: "saved-phone-password" }),
+  });
+  const manualPhoneText = await manualPhoneResponse.text();
+  assert.equal(manualPhoneResponse.status, 201, manualPhoneText);
+  const manualPhoneJobId = JSON.parse(manualPhoneText).job.id;
+  await waitForJob(headers, manualPhoneJobId, (value) => value.status === "phone");
+  const manualPhoneInput = await fetch(`${baseUrl}/api/jobs/${manualPhoneJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "phone", value: "+60123456789" }),
+  });
+  assert.equal(manualPhoneInput.status, 200, await manualPhoneInput.text());
+  await waitForJob(headers, manualPhoneJobId, (value) => value.status === "phone_otp");
+  const manualPhoneOtpInput = await fetch(`${baseUrl}/api/jobs/${manualPhoneJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "phone_otp", value: "123456" }),
+  });
+  assert.equal(manualPhoneOtpInput.status, 200, await manualPhoneOtpInput.text());
+  const manualPhoneCompleted = await waitForJob(
+    headers,
+    manualPhoneJobId,
+    (value) => value.status === "completed",
+  );
+  assert.equal(manualPhoneCompleted.autoRepairEligible, true);
+
+  const monitorJob = await waitForJob(
+    headers,
+    batch.jobs.find((item) => item.email === "password-mail@example.com").id,
+    (value) => value.status === "completed" && value.autoRepairEligible,
+  );
+  const monitorConfig = {
+    baseUrl: sub2apiUrl,
+    adminApiKey: "test-admin-key",
+    groupIds: ["7"],
+  };
+  const monitorSaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ enabled: true, config: monitorConfig }),
+  });
+  const monitorSaveText = await monitorSaveResponse.text();
+  assert.equal(monitorSaveResponse.status, 200, monitorSaveText);
+  const monitorSaved = JSON.parse(monitorSaveText);
+  assert.equal(monitorSaved.enabled, true);
+  assert.equal(monitorSaved.configured, true);
+
+  remoteErrorAccounts = [{
+    id: 91,
+    name: "oauth---password-mail@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "error",
+    error_message: "refresh token expired",
+    credentials: { email: "password-mail@example.com", model_mapping: { "gpt-5": "gpt-5" } },
+    group_ids: [7],
+  }];
+  failClearOnce.add(91);
+  const monitorCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const monitorCheckText = await monitorCheckResponse.text();
+  assert.equal(monitorCheckResponse.status, 200, monitorCheckText);
+  const monitorCheck = JSON.parse(monitorCheckText);
+  assert.equal(monitorCheck.result.checked, 1);
+  assert.equal(monitorCheck.result.started, 1);
+  const firstRepair = await waitForJob(
+    headers,
+    monitorJob.id,
+    (value) => value.status === "completed" && value.attempt > monitorJob.attempt && value.autoRepairLastError,
+  );
+  assert.equal(Object.hasOwn(updatedRemoteAccounts.get(91), "status"), false);
+  assert.equal(remoteErrorAccounts[0].status, "active", "the mock simulates clear-error partially restoring status before failing");
+  assert.equal(scheduledRemoteAccounts.has(91), false, "scheduling must remain disabled until error cleanup succeeds");
+
+  const pendingRetryResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const pendingRetryText = await pendingRetryResponse.text();
+  assert.equal(pendingRetryResponse.status, 200, pendingRetryText);
+  const pendingRetry = JSON.parse(pendingRetryText);
+  assert.equal(pendingRetry.result.checked, 0, "an active account no longer appears in the error-only list");
+  assert.equal(pendingRetry.result.updated, 1, "persisted pending IDs must still be retried directly");
+  const repairedJob = await waitForJob(headers, monitorJob.id, (value) => value.autoRepairLastSuccessAt && !value.autoRepairLastError);
+  assert.equal(repairedJob.attempt, firstRepair.attempt, "retrying the remote update must not repeat account login");
+  assert.equal(clearRemoteCounts.get(91), 2);
+  assert.equal(scheduledRemoteAccounts.get(91), true);
+  assert.match(updatedRemoteAccounts.get(91).credentials.access_token, /^test-access-password-mail@example\.com$/);
+  assert.deepEqual(updatedRemoteAccounts.get(91).credentials.model_mapping, { "gpt-5": "gpt-5" });
+
+  const bannedCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "monitor-banned@example.com", password: "saved-test-password" }),
+  });
+  const bannedCreateText = await bannedCreateResponse.text();
+  assert.equal(bannedCreateResponse.status, 201, bannedCreateText);
+  const bannedJobId = JSON.parse(bannedCreateText).job.id;
+  await waitForJob(headers, bannedJobId, (value) => value.status === "completed" && value.autoRepairEligible);
+  remoteErrorAccounts = [{
+    id: 92,
+    name: "oauth---monitor-banned@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "error",
+    error_message: "token invalid",
+    credentials: { email: "monitor-banned@example.com" },
+    group_ids: [7],
+  }];
+  const bannedMonitorResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const bannedMonitorText = await bannedMonitorResponse.text();
+  assert.equal(bannedMonitorResponse.status, 200, bannedMonitorText);
+  assert.equal(JSON.parse(bannedMonitorText).result.started, 1);
+  const blockedJob = await waitForJob(
+    headers,
+    bannedJobId,
+    (value) => value.status === "failed" && value.autoRepairBlocked,
+  );
+  assert.match(blockedJob.autoRepairBlockedReason, /deactivated/i);
+  const blockedCheckResponse = await fetch(`${baseUrl}/api/sub2api/monitor/check`, {
+    method: "POST",
+    headers,
+  });
+  const blockedCheckText = await blockedCheckResponse.text();
+  assert.equal(blockedCheckResponse.status, 200, blockedCheckText);
+  const blockedCheck = JSON.parse(blockedCheckText);
+  assert.equal(blockedCheck.result.started, 0);
+  assert.equal(blockedCheck.result.blocked, 1);
 
   const rotatingProxy = "socks5h://account-region-JP-sid-initial-t-20:password@proxy.example:5000";
   const proxyRetryResponse = await fetch(`${baseUrl}/api/jobs`, {
@@ -386,18 +629,21 @@ try {
       jobId,
       profileJob.id,
       mfaPromptJobId,
+      wrongEmailOtpJobId,
       ...batch.jobs.map((item) => item.id),
       proxyRetryCreated.job.id,
       proxyAlwaysCreated.job.id,
       proxyConnectionCreated.job.id,
       proxyConnectionAlwaysCreated.job.id,
+      bannedJobId,
+      manualPhoneJobId,
     ] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 9);
+  assert.equal(deleted.deleted, 12);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
@@ -436,6 +682,15 @@ async function waitForJob(headers, jobId, predicate) {
     await delay(100);
   }
   throw new Error(`job ${jobId} did not reach the expected state`);
+}
+
+async function waitFor(predicate) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await delay(50);
+  }
+  throw new Error("condition did not become true before timeout");
 }
 
 function findAvailablePort() {

@@ -153,7 +153,7 @@ try {
     return;
   }
 
-  if (["luban@example.com", "sms-provider@example.com", "custom-sms@example.com"].includes(args.email)) {
+  if (["luban@example.com", "sms-provider@example.com", "custom-sms@example.com", "manual-phone-automation@example.com"].includes(args.email)) {
     await rl.question("Phone number, E.164 format (p=quit): ");
     console.log("Phone OTP (r=resend, p=change phone, q=quit): ");
     await rl.question("");
@@ -180,10 +180,24 @@ try {
     return;
   }
 
+  if (args.email === "wrong-email-otp-console@example.com") {
+    await rl.question("Email OTP (r=resend, q=quit): ");
+    console.log("[email-otp-rejected] 邮箱验证码错误，请重新输入，或输入 r 重新发送。");
+    await rl.question("Email OTP (r=resend, q=quit): ");
+    await writeCompleted(args.sub2apiOut, args.email, "email-otp-retried");
+    return;
+  }
+
   if (args.email === "mfa-prompt@example.com") {
     process.stdout.write("[mfa] TOTP 2FA challenge reached.\n2FA OTP (6 digits, q=quit): ");
     await rl.question("");
     await writeCompleted(args.sub2apiOut, args.email, "mfa-login");
+    return;
+  }
+
+  if (args.email === "monitor-banned@example.com" && (await fileExists(args.sub2apiOut))) {
+    console.error('[error] HTTP 403: { "error": { "message": "Your account has been deactivated.", "code": "account_deactivated" } }');
+    process.exitCode = 1;
     return;
   }
 

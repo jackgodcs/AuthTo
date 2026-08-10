@@ -82,6 +82,21 @@ try {
 
   const page = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(page.pagination.total, 1);
+  const cancelResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/cancel`, { method: "POST", headers, body: "{}" });
+  assert.equal(cancelResponse.status, 200, await cancelResponse.text());
+  await waitForJob(headers, jobId, (job) => job.status === "canceled");
+
+  const reloginResponses = await Promise.all(Array.from({ length: 2 }, () => fetch(`${baseUrl}/api/jobs/${jobId}/relogin`, {
+    method: "POST",
+    headers,
+    body: "{}",
+  })));
+  assert.equal(reloginResponses.filter((response) => response.status === 200).length, 1);
+  assert.equal(reloginResponses.filter((response) => response.status === 409).length, 1);
+  const reloginJob = await waitForJob(headers, jobId, (job) => job.attempt === 3 && job.status === "email_otp");
+  assert.equal(reloginJob.attempt, 3, "concurrent relogin requests must increment the attempt only once");
+  const logsAfterConcurrentRelogin = await (await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers })).json();
+  assert.equal(countOccurrences(logsAfterConcurrentRelogin.logs, "Mock queued login started"), 3);
   await fetch(`${baseUrl}/api/jobs/${jobId}/cancel`, { method: "POST", headers, body: "{}" });
   console.log("console job lock tests passed");
 } catch (error) {
