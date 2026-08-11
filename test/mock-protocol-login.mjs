@@ -145,7 +145,12 @@ try {
 
   if (args.email === "phone@example.com") {
     const firstPhone = await rl.question("Phone number, E.164 format (p=quit): ");
-    console.log(`[warn] Could not send SMS to ${firstPhone}: HTTP 400: We've detected suspicious behavior from phone numbers similar to yours.`);
+    console.log(
+      `[warn] Could not send SMS to ${firstPhone}: HTTP 409: ` +
+      `{ "error": { "message": "Your sign-in session is no longer valid. Please start over to continue.", "code": "invalid_state" } }; ` +
+      `fallback without channel also failed: HTTP 400: ` +
+      `{ "error": { "message": "We've detected suspicious behavior from phone numbers similar to yours.", "code": "phone_suspicious_behavior" } }`,
+    );
     const secondPhone = await rl.question("Phone number, E.164 format (p=quit): ");
     console.log(`Phone OTP (r=resend, p=change phone, q=quit): `);
     await rl.question("");

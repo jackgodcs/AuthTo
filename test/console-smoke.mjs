@@ -311,6 +311,44 @@ try {
   assert.equal(manuallyVerifiedJob.autoRepairEligible, false);
   assert.match(manuallyVerifiedJob.autoRepairEligibilityReason, /手动输入/);
 
+  const phoneFallbackResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "phone@example.com" }),
+  });
+  const phoneFallbackText = await phoneFallbackResponse.text();
+  assert.equal(phoneFallbackResponse.status, 201, phoneFallbackText);
+  const phoneFallbackJobId = JSON.parse(phoneFallbackText).job.id;
+  await waitForJob(headers, phoneFallbackJobId, (value) => value.status === "phone");
+  const firstPhoneInput = await fetch(`${baseUrl}/api/jobs/${phoneFallbackJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "phone", value: "+60111111111" }),
+  });
+  assert.equal(firstPhoneInput.status, 200, await firstPhoneInput.text());
+  const changePhoneJob = await waitForJob(
+    headers,
+    phoneFallbackJobId,
+    (value) => value.status === "phone" && /更换手机号/.test(value.prompt || ""),
+  );
+  assert.equal(changePhoneJob.attempt, 1, "a phone-specific fallback error must not restart account login");
+  assert.equal(changePhoneJob.restartRequired, false);
+  assert.match(changePhoneJob.phoneError || "", /手机号触发了风控/);
+  const secondPhoneInput = await fetch(`${baseUrl}/api/jobs/${phoneFallbackJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "phone", value: "+60122222222" }),
+  });
+  assert.equal(secondPhoneInput.status, 200, await secondPhoneInput.text());
+  await waitForJob(headers, phoneFallbackJobId, (value) => value.status === "phone_otp");
+  const phoneOtpInput = await fetch(`${baseUrl}/api/jobs/${phoneFallbackJobId}/input`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ action: "phone_otp", value: "123456" }),
+  });
+  assert.equal(phoneOtpInput.status, 200, await phoneOtpInput.text());
+  await waitForJob(headers, phoneFallbackJobId, (value) => value.status === "completed");
+
   const batchReloginResponse = await fetch(`${baseUrl}/api/jobs/relogin-batch`, {
     method: "POST",
     headers,
@@ -637,13 +675,14 @@ try {
       proxyConnectionAlwaysCreated.job.id,
       bannedJobId,
       manualPhoneJobId,
+      phoneFallbackJobId,
     ] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 12);
+  assert.equal(deleted.deleted, 13);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);

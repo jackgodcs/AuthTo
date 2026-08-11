@@ -132,7 +132,17 @@ export class TlsFingerprintTransport {
     let result;
     let retries = 0;
     for (;;) {
-      result = await this.send(request);
+      try {
+        result = await this.send(request);
+      } catch (error) {
+        if (options.retryRiskControl && this.hasConfiguredProxy() && isRetryableProxyConnectionError(error)) {
+          throw new Error(
+            `PROXY_CONNECTION_RETRY: ${method} ${safeRequestTarget(url)} failed: ` +
+              redactProxyError(error?.message || "proxy connection failed"),
+          );
+        }
+        throw error;
+      }
       if (!options.retryRiskControl || !isRiskControlResult(result)) break;
       if (!this.hasConfiguredProxy() || retries >= this.sameProxyRiskRetries) {
         if (this.hasConfiguredProxy() && retries > 0) {
@@ -357,6 +367,17 @@ function isRiskControlResult(result) {
   if (status === 403) return /text\/html/i.test(contentType) || challengePage;
   const htmlPage = /text\/html/i.test(contentType) || /<(?:!doctype\s+html|html|head|body)\b/i.test(body);
   return [400, 409].includes(status) && htmlPage && challengePage;
+}
+
+function isRetryableProxyConnectionError(error) {
+  const message = String(error?.message || error || "");
+  return (
+    /\b(?:Timeout|ProxyError|ConnectionError|ConnectError|SSLError)\b/i.test(message)
+    || /timed?\s*out|operation timed out/i.test(message)
+    || /curl:\s*\((?:5|6|7|18|28|35|47|52|55|56|92)\)/i.test(message)
+    || /could not resolve|failed to connect|connection (?:reset|refused|closed|aborted)/i.test(message)
+    || /recv failure|send failure|empty reply|unexpected eof|tls connect error/i.test(message)
+  );
 }
 
 function safeRequestTarget(url) {

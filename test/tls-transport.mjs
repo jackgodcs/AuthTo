@@ -203,6 +203,33 @@ try {
   );
   assert.equal(invalidStateResponse.status, 409);
   assert.equal(invalidState409Count, 1, "JSON invalid_state must remain a phone-specific error");
+
+  const requestTimeout = new TlsFingerprintTransport({ enabled: true });
+  let timeoutRequests = 0;
+  requestTimeout.send = async (message) => {
+    if (message.operation === "configure") return {};
+    timeoutRequests += 1;
+    throw new Error(
+      "Timeout: Failed to perform, curl: (28) Operation timed out after 30002 milliseconds with 63538 bytes received",
+    );
+  };
+  await requestTimeout.configure(fixed);
+  await assert.rejects(
+    requestTimeout.request("GET", "https://chatgpt.com/", { retryRiskControl: true }),
+    /PROXY_CONNECTION_RETRY: GET https:\/\/chatgpt\.com\/ failed:.*curl: \(28\)/,
+  );
+  assert.equal(timeoutRequests, 1, "a timed-out login request should rotate the proxy instead of retrying it in place");
+
+  const ordinaryRequestFailure = new TlsFingerprintTransport({ enabled: true });
+  ordinaryRequestFailure.send = async (message) => {
+    if (message.operation === "configure") return {};
+    throw new Error("application payload parsing failed");
+  };
+  await ordinaryRequestFailure.configure(fixed);
+  await assert.rejects(
+    ordinaryRequestFailure.request("GET", "https://chatgpt.com/", { retryRiskControl: true }),
+    /^Error: application payload parsing failed$/,
+  );
   console.log("TLS fingerprint transport tests passed");
 } finally {
   await transport.close();

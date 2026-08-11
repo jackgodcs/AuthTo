@@ -1225,7 +1225,9 @@ function consumeOutput(job, rawText) {
     return;
   }
 
-  if (/Your sign-in session is no longer valid|["']code["']\s*:\s*["']invalid_state["']/i.test(scan)) {
+  const sessionErrorLines = [...scan.matchAll(/^\[error\]\s*([^\r\n]+)/gim)];
+  const latestSessionError = sessionErrorLines.at(-1)?.[1] || "";
+  if (/Your sign-in session is no longer valid|["']code["']\s*:\s*["']invalid_state["']/i.test(latestSessionError)) {
     if (job.runMode === "totp_setup") {
       job.totpSetupError = "设置 2FA 时登录状态失效，请稍后重试";
       touch(job);

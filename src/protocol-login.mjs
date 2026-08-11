@@ -272,14 +272,14 @@ async function run() {
   }
   const outPath = path.resolve(args.out || DEFAULT_OUT);
   const sub2apiOutPath = path.resolve(args.sub2apiOut || DEFAULT_SUB2API_OUT);
+  const proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
   const transport = new TlsFingerprintTransport({
     enabled: shouldUseTlsTransport({ chatgptBase, authBase, nativeHttp: args.nativeHttp }),
-    profile: args.tlsProfile || process.env.TOSUB2_TLS_PROFILE || "chrome146",
+    profile: args.tlsProfile || process.env.TOSUB2_TLS_PROFILE || (proxyTemplate ? "chrome146" : "chrome142"),
     verbose: Boolean(args.verbose),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
-  const proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
   try {
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
     if (args.setupTotp) {
@@ -1987,7 +1987,7 @@ Options:
   --priority <number>             sub2api priority. Default: 1
   --rate-multiplier <number>      sub2api rate_multiplier. Default: 1
   --proxy <url>                   Account proxy; supports http, socks5 and socks5h.
-  --tls-profile <name>            curl_cffi browser profile. Default: chrome146
+  --tls-profile <name>            curl_cffi browser profile. Default: chrome142 without proxy; chrome146 with proxy
   --native-http                   Disable the Python TLS fingerprint transport.
   --chatgpt-base <url>            Default: ${DEFAULT_CHATGPT_BASE}
   --auth-base <url>               Default: ${DEFAULT_AUTH_BASE}
