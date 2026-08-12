@@ -73,6 +73,7 @@ const child = spawn(process.execPath, [
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
+    TOSUB2_TLS_PROFILE: "chrome142",
   },
   stdio: ["ignore", "pipe", "pipe"],
   windowsHide: true,

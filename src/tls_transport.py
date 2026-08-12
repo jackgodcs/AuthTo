@@ -7,6 +7,7 @@ import json
 import re
 import sys
 from typing import get_args
+from urllib.parse import urljoin, urlparse
 
 try:
     from curl_cffi import requests
@@ -28,7 +29,7 @@ class Worker:
         self.session = None
         self.proxy = None
         self.impersonate = "chrome146"
-        self.fallback_profiles = ("chrome", "chrome142", "chrome145", "chrome136")
+        self.fallback_profiles = ("chrome146", "chrome145", "chrome142", "chrome136")
 
     def configure(self, proxy, impersonate, allow_fallback=True):
         if IMPORT_ERROR:
@@ -79,7 +80,7 @@ class Worker:
         self.session = None
         failures = []
         attempts = 0
-        batch_size = max(1, min(8, int(concurrency or 4)))
+        batch_size = max(1, min(4, int(concurrency or 4)))
         for offset in range(0, len(candidates), batch_size):
             batch = candidates[offset:offset + batch_size]
             with ThreadPoolExecutor(max_workers=len(batch)) as executor:
@@ -125,7 +126,7 @@ class Worker:
                 timeout=max(1, int(timeout_ms)) / 1000,
                 allow_redirects=False,
             )
-            if cls._is_usable_probe_response(response):
+            if cls._is_usable_probe_response(response, url):
                 return session, response, None
             return session, None, f"HTTP {int(response.status_code)}"
         except Exception as error:
@@ -146,13 +147,23 @@ class Worker:
         return sorted(profiles, key=sort_key, reverse=True)
 
     @staticmethod
-    def _is_usable_probe_response(response):
+    def _is_usable_probe_response(response, request_url="https://chatgpt.com/"):
         status = int(response.status_code)
         headers = {str(name).lower(): str(value) for name, value in response.headers.items()}
         if not 200 <= status < 400:
             return False
         if "challenge" in (headers.get("cf-mitigated") or headers.get("x-cf-mitigated") or "").lower():
             return False
+        if 300 <= status < 400:
+            location = headers.get("location") or ""
+            if not location:
+                return False
+            target = urlparse(urljoin(request_url, location))
+            source = urlparse(request_url)
+            if target.hostname != source.hostname:
+                return False
+            if re.search(r"cdn-cgi|challenge|captcha|security-check|verify", target.path + "?" + target.query, re.I):
+                return False
         body = bytes(response.content or b"")[:200000].decode("utf-8", errors="ignore")
         return re.search(r"Just a moment|cdn-cgi|challenge-platform|cf-challenge", body, re.I) is None
 
@@ -248,7 +259,7 @@ def main():
             operation = message.get("operation", "request")
             if operation == "configure":
                 worker.configure(message.get("proxy"), message.get("impersonate"))
-                result = {"configured": True}
+                result = {"configured": True, "profile": worker.impersonate}
             elif operation == "probe_profiles":
                 result = worker.probe_profiles(
                     str(message.get("url") or "https://chatgpt.com/"),

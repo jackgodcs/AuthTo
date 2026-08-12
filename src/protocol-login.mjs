@@ -5,7 +5,11 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { fetchSentinelToken } from "./sentinel.mjs";
-import { shouldUseTlsTransport, TlsFingerprintTransport } from "./tls-transport.mjs";
+import {
+  browserIdentityForTlsProfile,
+  shouldUseTlsTransport,
+  TlsFingerprintTransport,
+} from "./tls-transport.mjs";
 
 const DEFAULT_CHATGPT_BASE = "https://chatgpt.com";
 const DEFAULT_AUTH_BASE = "https://auth.openai.com";
@@ -47,17 +51,26 @@ const HAR_ADD_PHONE_COOKIE_NAMES = new Set([
   "oai-sc",
   "_dd_s",
 ]);
-const UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-  "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
-
 function userAgentForTransport(transport) {
-  const match = /^chrome(\d+)/i.exec(String(transport?.profile || ""));
-  if (!match) return UA;
-  return (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-    `(KHTML, like Gecko) Chrome/${match[1]}.0.0.0 Safari/537.36`
-  );
+  return browserIdentityForTransport(transport).userAgent;
+}
+
+function browserIdentityForTransport(transport) {
+  return browserIdentityForTlsProfile(transport?.profile || "chrome146");
+}
+
+function browserHeadersForTransport(transport) {
+  const identity = browserIdentityForTransport(transport);
+  const headers = {
+    "user-agent": identity.userAgent,
+    "accept-language": identity.acceptLanguage,
+  };
+  if (!transport?.enabled) {
+    headers["sec-ch-ua"] = identity.secChUa;
+    headers["sec-ch-ua-mobile"] = identity.secChUaMobile;
+    headers["sec-ch-ua-platform"] = identity.secChUaPlatform;
+  }
+  return headers;
 }
 
 class CookieJar {
@@ -154,13 +167,10 @@ class ProtocolClient {
   async request(method, url, options = {}) {
     const targetUrl = new URL(url);
     const headers = new Headers(options.headers || {});
-    if (!this.transport?.enabled || options.userAgent) headers.set("user-agent", options.userAgent || UA);
-    headers.set("accept-language", "zh-CN,zh;q=0.9,en;q=0.8");
-    if (!this.transport?.enabled) {
-      headers.set("sec-ch-ua", '"Not;A=Brand";v="8", "Chromium";v="146", "Google Chrome";v="146"');
-      headers.set("sec-ch-ua-mobile", "?0");
-      headers.set("sec-ch-ua-platform", '"macOS"');
+    for (const [name, value] of Object.entries(browserHeadersForTransport(this.transport))) {
+      headers.set(name, value);
     }
+    if (options.userAgent) headers.set("user-agent", options.userAgent);
 
     if (!headers.has("accept")) {
       headers.set("accept", options.accept || "application/json, text/plain, */*");
@@ -284,12 +294,31 @@ async function run() {
   const proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
   const transport = new TlsFingerprintTransport({
     enabled: shouldUseTlsTransport({ chatgptBase, authBase, nativeHttp: args.nativeHttp }),
-    profile: args.tlsProfile || process.env.TOSUB2_TLS_PROFILE || (proxyTemplate ? "chrome146" : "auto"),
+    profile:
+      args.tlsProfile
+      || process.env.TOSUB2_TLS_PROFILE
+      || (proxyTemplate || args.refreshSub2api ? "chrome146" : "auto"),
     verbose: Boolean(args.verbose),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
   });
   try {
+    if (args.refreshSub2api) {
+      if (proxyTemplate) await transport.prepareProxy(proxyTemplate, `${authBase}/`);
+      else await transport.configure(null, { force: true });
+      const sourcePath = path.resolve(args.refreshSub2api);
+      const targetPath = path.resolve(args.sub2apiOut || sourcePath);
+      const refreshed = await refreshSub2apiOauthExport({
+        authBase,
+        sourcePath,
+        targetPath,
+        fallbackClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
+        transport,
+      });
+      console.log(`[ok] Saved sub2api import: ${targetPath}`);
+      console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
+      return;
+    }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
     if (args.setupTotp) {
       const resultPath = path.resolve(args.totpResult || DEFAULT_TOTP_RESULT);
@@ -322,20 +351,6 @@ async function run() {
       } finally {
         rl.close();
       }
-      return;
-    }
-    if (args.refreshSub2api) {
-      const sourcePath = path.resolve(args.refreshSub2api);
-      const targetPath = path.resolve(args.sub2apiOut || sourcePath);
-      const refreshed = await refreshSub2apiOauthExport({
-        authBase,
-        sourcePath,
-        targetPath,
-        fallbackClientId: args.codexClientId || DEFAULT_CODEX_CLIENT_ID,
-        transport,
-      });
-      console.log(`[ok] Saved sub2api import: ${targetPath}`);
-      console.log(`[ok] Refreshed OAuth account: ${refreshed.email || "<unknown>"}`);
       return;
     }
     const rl = readline.createInterface({ input, output });
@@ -916,7 +931,8 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
         timeoutMs: DEFAULT_TIMEOUT_MS,
       }),
       reqEndpoint: sentinelRequirementsEndpoint(authBase),
-      userAgent: userAgentForTransport(client.transport),
+      deviceProfile: browserIdentityForTransport(client.transport),
+      sendClientHints: !client.transport?.enabled,
     });
   } catch (error) {
     throw new Error(
@@ -1388,7 +1404,7 @@ async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redir
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": userAgentForTransport(transport),
+      ...browserHeadersForTransport(transport),
       ...(cookie ? { cookie } : {}),
     },
     body: new URLSearchParams({
@@ -1405,7 +1421,7 @@ async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redir
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": userAgentForTransport(transport),
+      ...browserHeadersForTransport(transport),
     },
     body: new URLSearchParams({
       grant_type: "authorization_code",
@@ -1489,7 +1505,7 @@ async function refreshOAuthToken({ authBase, clientId, refreshToken, transport }
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": userAgentForTransport(transport),
+      ...browserHeadersForTransport(transport),
     },
     body: new URLSearchParams({
       grant_type: "refresh_token",
@@ -1503,7 +1519,7 @@ async function refreshOAuthToken({ authBase, clientId, refreshToken, transport }
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": userAgentForTransport(transport),
+      ...browserHeadersForTransport(transport),
     },
     body: new URLSearchParams({
       grant_type: "refresh_token",

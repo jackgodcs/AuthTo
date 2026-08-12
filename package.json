@@ -1,6 +1,6 @@
 {
   "name": "tosub2",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "通过协议登录 ChatGPT、完成 Codex 授权并生成 sub2api 导入文件",
   "type": "module",
   "scripts": {

@@ -12,7 +12,7 @@ import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import { fetchMailboxOtpCandidates, validateMailApiUrl } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
-import { proxySupportsSessionRotation } from "./tls-transport.mjs";
+import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
@@ -59,6 +59,10 @@ let sub2ApiMonitorPromise = null;
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
 const sub2ApiAutoRepairPromises = new Set();
+const directTlsProfileProbe = new DirectTlsProfileProbe({
+  explicitProfile: process.env.TOSUB2_TLS_PROFILE,
+  validationUrl: `${String(process.env.CHATGPT_BASE || "https://chatgpt.com").replace(/\/$/, "")}/`,
+});
 const sub2ApiMonitorState = {
   running: false,
   lastCheckAt: null,
@@ -95,6 +99,9 @@ await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
+void directTlsProfileProbe.resolve().catch((error) => {
+  console.warn(`[warn] 本机直连 TLS 指纹预探测失败，将在无代理任务启动时重试：${error.message}`);
+});
 
 const vite = await createViteServer({
   root: WEB_ROOT,
@@ -687,7 +694,14 @@ async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
     if (["full", "totp_setup"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
-    launchJob(job, { mode });
+    let tlsProfile = "";
+    if (["full", "totp_setup"].includes(mode) && !job.proxyUrl) {
+      job.prompt = "正在等待本机直连 TLS 指纹探测";
+      touch(job);
+      tlsProfile = await directTlsProfileProbe.resolve();
+      if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
+    }
+    launchJob(job, { mode, tlsProfile });
   } catch (error) {
     if (mode === "totp_setup") {
       restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
@@ -759,6 +773,9 @@ function launchJob(job, options = {}) {
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_PROXY_URL: job.proxyUrl || "",
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
+      TOSUB2_TLS_PROFILE:
+        String(process.env.TOSUB2_TLS_PROFILE || "").trim()
+        || (!job.proxyUrl ? String(options.tlsProfile || directTlsProfileProbe.profile || "") : ""),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -1130,9 +1147,10 @@ async function fallbackFromRefresh(job) {
   job.phoneError = null;
   beginAuthorizationAutomationAttempt(job, "refresh_fallback");
   appendJobLog(job, "[refresh] 刷新令牌已失效，自动回退到邮箱验证码登录。\n");
-  if (job.mailApiUrl) await loadMailboxBaseline(job);
   job.fallbackInProgress = false;
-  if (job.status !== "canceled") launchJob(job, { mode: "full" });
+  if (job.status !== "canceled") {
+    enqueueJob(job, "full", "刷新令牌已失效，正在重新登录并授权");
+  }
   touch(job);
 }
 

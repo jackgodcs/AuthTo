@@ -14,6 +14,35 @@ const DEFAULT_SAME_PROXY_RISK_RETRIES = 3;
 const DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS = 1_000;
 const UNCONFIGURED = Symbol("unconfigured");
 
+export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
+  const normalizedProfile = String(profile || DEFAULT_PROFILE).trim();
+  const majorVersion = Number(/^chrome(\d+)/i.exec(normalizedProfile)?.[1] || 146);
+  const usesMacOs = majorVersion >= 119;
+  const platformToken = usesMacOs
+    ? "Macintosh; Intel Mac OS X 10_15_7"
+    : "Windows NT 10.0; Win64; x64";
+  const platform = usesMacOs ? "macOS" : "Windows";
+  return {
+    profile: normalizedProfile,
+    browser: "chrome",
+    browserMajorVersion: majorVersion,
+    userAgent:
+      `Mozilla/5.0 (${platformToken}) AppleWebKit/537.36 ` +
+      `(KHTML, like Gecko) Chrome/${majorVersion}.0.0.0 Safari/537.36`,
+    secChUa:
+      `"Chromium";v="${majorVersion}", "Google Chrome";v="${majorVersion}", "Not.A/Brand";v="99"`,
+    secChUaMobile: "?0",
+    secChUaPlatform: `"${platform}"`,
+    acceptLanguage: "zh-CN,zh;q=0.9,en;q=0.8",
+    locale: "zh-CN",
+    languages: ["zh-CN", "zh", "en"],
+    timezoneId: "Asia/Shanghai",
+    os: usesMacOs ? "macos" : "windows",
+    osVersion: usesMacOs ? "15.7.0" : "10.0",
+    platform: usesMacOs ? "MacIntel" : "Win32",
+  };
+}
+
 export class TlsFingerprintTransport {
   constructor({
     enabled = true,
@@ -45,7 +74,9 @@ export class TlsFingerprintTransport {
   async configure(proxy, { force = false } = {}) {
     if (!this.enabled) return;
     if (!force && this.configuredProxy === (proxy || null) && this.configuredProfile === this.profile) return;
-    await this.send({ operation: "configure", proxy: proxy || null, impersonate: this.profile });
+    const result = await this.send({ operation: "configure", proxy: proxy || null, impersonate: this.profile });
+    const actualProfile = String(result?.profile || "").trim();
+    if (/^chrome\d+[a-z]?$/i.test(actualProfile)) this.profile = actualProfile;
     this.configuredProxy = proxy || null;
     this.configuredProfile = this.profile;
   }
@@ -283,6 +314,47 @@ export class TlsFingerprintTransport {
     this.child.kill();
     this.child = null;
     this.failPending(new Error("TLS transport closed"));
+  }
+}
+
+export class DirectTlsProfileProbe {
+  constructor({
+    explicitProfile = "",
+    validationUrl = "https://chatgpt.com/",
+    transportFactory = () => new TlsFingerprintTransport({ enabled: true, profile: "auto" }),
+  } = {}) {
+    this.profile = String(explicitProfile || "").trim() || null;
+    this.validationUrl = validationUrl;
+    this.transportFactory = transportFactory;
+    this.pending = null;
+  }
+
+  async resolve() {
+    if (this.profile) return this.profile;
+    if (this.pending) return this.pending;
+
+    const operation = this.probe();
+    this.pending = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.pending === operation) this.pending = null;
+    }
+  }
+
+  async probe() {
+    const transport = this.transportFactory();
+    try {
+      await transport.prepareProxy(null, this.validationUrl);
+      const profile = String(transport.profile || "").trim();
+      if (!/^chrome\d+[a-z]?$/i.test(profile)) {
+        throw new Error(`自动探测返回了无效的 TLS 指纹：${profile || "<empty>"}`);
+      }
+      this.profile = profile;
+      return profile;
+    } finally {
+      await transport.close();
+    }
   }
 }
 

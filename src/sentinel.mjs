@@ -48,12 +48,14 @@ function getDeviceClientHints(profile) {
     `"Chromium";v="${fullVersion}"`,
     `"Not.A/Brand";v="24.0.0.0"`
   ];
+  const platform = profile.os === "android" ? "Android" : profile.os === "macos" ? "macOS" : "Windows";
+  const platformVersion = profile.os === "android" ? profile.osVersion : profile.os === "macos" ? "15.7.0" : "15.0.0";
   return {
     secChUa: brands.join(", "),
     secChUaFullVersionList: fullVersionBrands.join(", "),
     secChUaMobile: profile.isMobile ? "?1" : "?0",
-    secChUaPlatform: profile.os === "android" ? '"Android"' : '"Windows"',
-    secChUaPlatformVersion: profile.os === "android" ? `"${profile.osVersion}"` : '"15.0.0"',
+    secChUaPlatform: `"${platform}"`,
+    secChUaPlatformVersion: `"${platformVersion}"`,
     secChViewportWidth: `"${profile.viewportWidth}"`
   };
 }
@@ -248,13 +250,22 @@ function defaultSentinelEnv(deviceProfile) {
   };
 }
 async function fetchSentinelToken(options) {
-  const profile = options.deviceProfile ?? defaultDeviceProfile();
+  const profile = resolveSentinelDeviceProfile(options.deviceProfile);
   const env = defaultSentinelEnv({
     ...profile,
     userAgent: options.userAgent?.trim() || profile.userAgent
   });
   const generator = new SentinelGenerator(env);
   const reqToken = await generator.getRequirementsToken();
+  const browserHeaders = {
+    "user-agent": env.userAgent,
+    "accept-language": profile.acceptLanguage
+  };
+  if (options.sendClientHints !== false) {
+    browserHeaders["sec-ch-ua"] = profile.secChUa || getDeviceClientHints(profile).secChUa;
+    browserHeaders["sec-ch-ua-mobile"] = profile.secChUaMobile || getDeviceClientHints(profile).secChUaMobile;
+    browserHeaders["sec-ch-ua-platform"] = profile.secChUaPlatform || getDeviceClientHints(profile).secChUaPlatform;
+  }
   const response = await options.fetch(options.reqEndpoint, {
     method: "POST",
     headers: {
@@ -262,7 +273,7 @@ async function fetchSentinelToken(options) {
       "content-type": "text/plain;charset=UTF-8",
       origin: "https://sentinel.openai.com",
       referer: "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6",
-      "user-agent": env.userAgent
+      ...browserHeaders
     },
     body: JSON.stringify({
       p: reqToken,
@@ -285,6 +296,14 @@ async function fetchSentinelToken(options) {
     id: options.deviceID,
     flow: options.flow
   });
+}
+function resolveSentinelDeviceProfile(deviceProfile) {
+  const fallbackProfile = defaultDeviceProfile();
+  return {
+    ...fallbackProfile,
+    ...(deviceProfile || {}),
+    languages: [...(deviceProfile?.languages || fallbackProfile.languages)]
+  };
 }
 var SentinelGenerator = class {
   constructor(env) {
@@ -1142,12 +1161,19 @@ function createNavigatorObject(env) {
       description: "Portable Document Format"
     }
   ];
+  const os = env.platform === "Win32" ? "windows" : env.platform === "MacIntel" ? "macos" : "android";
+  const platformName = os === "windows" ? "Windows" : os === "macos" ? "macOS" : "Android";
+  const platformVersion = os === "windows"
+    ? "15.0.0"
+    : os === "macos" ? "15.7.0" : /Android (\d+)/.exec(env.userAgent)?.[1]
+      ? `${/Android (\d+)/.exec(env.userAgent)[1]}.0.0`
+      : "14.0.0";
   const clientHints = getDeviceClientHints({
     id: "sentinel",
     family: env.isMobile ? "mobile" : "desktop",
     browser: env.userAgent.includes("Edg/") ? "edge" : "chrome",
-    os: env.platform === "Win32" ? "windows" : "android",
-    osVersion: env.platform === "Win32" ? "10.0" : /Android (\d+)/.exec(env.userAgent)?.[1] ? `${/Android (\d+)/.exec(env.userAgent)?.[1]}.0.0` : "14.0.0",
+    os,
+    osVersion: platformVersion,
     userAgent: env.userAgent,
     locale: env.locale,
     languages: env.languages,
@@ -1199,7 +1225,7 @@ function createNavigatorObject(env) {
     onLine: true,
     userAgentData: {
       mobile: env.isMobile,
-      platform: env.platform === "Win32" ? "Windows" : "Android",
+      platform: platformName,
       brands: clientHints.secChUa.split(", ").map((entry) => {
         const match = entry.match(/^"(.+)";v="(.+)"$/);
         return match ? { brand: match[1], version: match[2] } : null;
@@ -1210,12 +1236,12 @@ function createNavigatorObject(env) {
       }).filter(Boolean),
       getHighEntropyValues: async (hints) => {
         const values = {
-          architecture: env.platform === "Win32" ? "x86" : "arm",
-          bitness: env.platform === "Win32" ? "64" : "64",
+          architecture: os === "android" ? "arm" : "x86",
+          bitness: "64",
           mobile: env.isMobile,
           model: env.isMobile ? env.userAgent.match(/Android [^;]+; ([^)]+)/)?.[1] ?? "" : "",
-          platform: env.platform === "Win32" ? "Windows" : "Android",
-          platformVersion: env.platform === "Win32" ? "15.0.0" : /Android (\d+)/.exec(env.userAgent)?.[1] ? `${/Android (\d+)/.exec(env.userAgent)?.[1]}.0.0` : "14.0.0",
+          platform: platformName,
+          platformVersion,
           uaFullVersion: env.userAgent.match(/(?:Chrome|Edg)\/([\d.]+)/)?.[1] ?? "146.0.0.0",
           fullVersionList: clientHints.secChUaFullVersionList.split(", ").map((entry) => {
             const match = entry.match(/^"(.+)";v="(.+)"$/);
@@ -1470,5 +1496,6 @@ function randomUUID2() {
 }
 export {
   defaultSentinelEnv,
-  fetchSentinelToken
+  fetchSentinelToken,
+  resolveSentinelDeviceProfile
 };

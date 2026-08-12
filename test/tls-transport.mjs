@@ -3,8 +3,14 @@ import { spawnSync } from "node:child_process";
 import http from "node:http";
 import { fileURLToPath } from "node:url";
 
-import { proxySupportsSessionRotation, rotateProxySession, TlsFingerprintTransport } from "../src/tls-transport.mjs";
-import { fetchSentinelToken } from "../src/sentinel.mjs";
+import {
+  browserIdentityForTlsProfile,
+  DirectTlsProfileProbe,
+  proxySupportsSessionRotation,
+  rotateProxySession,
+  TlsFingerprintTransport,
+} from "../src/tls-transport.mjs";
+import { defaultSentinelEnv, fetchSentinelToken, resolveSentinelDeviceProfile } from "../src/sentinel.mjs";
 
 const server = http.createServer(async (req, res) => {
   let body = "";
@@ -13,6 +19,10 @@ const server = http.createServer(async (req, res) => {
   res.setHeader("set-cookie", ["transport_a=1; Max-Age=3600; Path=/", "transport_b=2; Path=/"]);
   if (req.url === "/sentinel") {
     res.end(JSON.stringify({ token: "test-sentinel", proofofwork: { required: false }, turnstile: { required: false } }));
+    return;
+  }
+  if (req.url === "/identity") {
+    res.end(JSON.stringify({ headers: req.headers }));
     return;
   }
   res.end(JSON.stringify({ method: req.method, body }));
@@ -42,19 +52,30 @@ try {
   const fallbackResponse = await fallbackTransport.request("GET", `http://127.0.0.1:${address.port}/fallback`);
   assert.equal(fallbackResponse.status, 200, "unsupported TLS profiles should fall back to a supported profile");
   await fallbackTransport.close();
-  testConfigureStageProfileFallback();
+  await testConfigureStageProfileFallback();
   testProfileProbeWorker();
+  testBrowserIdentity();
+  await testSharedDirectProfileProbe();
 
   const autoProfileTransport = new TlsFingerprintTransport({ enabled: true, profile: "auto" });
   autoProfileTransport.send = async (message) => {
     assert.equal(message.operation, "probe_profiles");
     assert.equal(message.url, "https://chatgpt.com/");
+    assert.equal(message.concurrency, 4, "the dedicated TLS profile probe must use at most four requests");
     return { profile: "chrome142", attempts: 3 };
   };
   await autoProfileTransport.prepareProxy(null, "https://chatgpt.com/");
   assert.equal(autoProfileTransport.profile, "chrome142");
   assert.equal(autoProfileTransport.configuredProxy, null);
   assert.equal(autoProfileTransport.configuredProfile, "chrome142");
+
+  const identityTransport = new TlsFingerprintTransport({ enabled: true, profile: "chrome142" });
+  const identityResponse = await identityTransport.request("GET", `http://127.0.0.1:${address.port}/identity`);
+  const identityHeaders = (await identityResponse.json()).headers;
+  assert.match(identityHeaders["user-agent"], /Chrome\/142\.0\.0\.0/);
+  assert.equal(identityHeaders["sec-ch-ua-platform"], '"macOS"');
+  assert.match(identityHeaders["sec-ch-ua"], /"Chromium";v="142"/);
+  await identityTransport.close();
 
   const postResponse = await transport.request("POST", `http://127.0.0.1:${address.port}/post`, {
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -70,6 +91,7 @@ try {
   }));
   assert.equal(sentinelToken.c, "test-sentinel");
   assert.equal(sentinelToken.flow, "oauth_create_account");
+  await testSentinelBrowserIdentity();
 
   const original = "socks5h://account-region-JP-sid-oldValue-t-20:password@proxy.example:5000";
   const rotated = new URL(rotateProxySession(original));
@@ -248,7 +270,7 @@ try {
   await new Promise((resolve) => server.close(resolve));
 }
 
-function testConfigureStageProfileFallback() {
+async function testConfigureStageProfileFallback() {
   const python = findTestPython();
   assert.ok(python, "a Python interpreter with curl_cffi is required for TLS tests");
   const workerPath = fileURLToPath(new URL("../src/tls_transport.py", import.meta.url));
@@ -277,8 +299,8 @@ class FakeRequests:
 module.requests = FakeRequests
 worker = module.Worker()
 worker.configure(None, "chrome146")
-assert worker.impersonate == "chrome", worker.impersonate
-assert FakeRequests.attempts[:2] == ["chrome146", "chrome"], FakeRequests.attempts
+assert worker.impersonate == "chrome145", worker.impersonate
+assert FakeRequests.attempts[:2] == ["chrome146", "chrome145"], FakeRequests.attempts
 `;
   const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
     encoding: "utf8",
@@ -286,6 +308,16 @@ assert FakeRequests.attempts[:2] == ["chrome146", "chrome"], FakeRequests.attemp
     windowsHide: true,
   });
   assert.equal(result.status, 0, `configure-stage TLS fallback failed:\n${result.stderr || result.stdout}`);
+
+  const transport = new TlsFingerprintTransport({ enabled: true, profile: "chrome146" });
+  transport.send = async (message) => {
+    assert.equal(message.operation, "configure");
+    assert.equal(message.impersonate, "chrome146");
+    return { configured: true, profile: "chrome145" };
+  };
+  await transport.configure(null);
+  assert.equal(transport.profile, "chrome145");
+  assert.equal(transport.configuredProfile, "chrome145");
 }
 
 function testProfileProbeWorker() {
@@ -338,11 +370,32 @@ result = worker.probe_profiles("https://chatgpt.com/", ["chrome146", "chrome142"
 assert result == {"profile": "chrome142", "attempts": 2}, result
 assert worker.impersonate == "chrome142"
 assert FakeRequests.attempts == ["chrome146", "chrome142"]
+FakeRequests.attempts = []
+bounded = module.Worker().probe_profiles(
+    "https://chatgpt.com/",
+    ["chrome146", "chrome142", "chrome141", "chrome140", "chrome139"],
+    1000,
+    80,
+)
+assert bounded == {"profile": "chrome142", "attempts": 4}, bounded
+assert FakeRequests.attempts == ["chrome146", "chrome142", "chrome141", "chrome140"]
 profiles = worker._supported_chrome_profiles()
 assert profiles[0] == "chrome146", profiles
 assert "chrome142" in profiles
 assert "chrome131_android" not in profiles
 assert "chrome" not in profiles
+assert worker._is_usable_probe_response(
+    FakeResponse(302, {"location": "/cdn-cgi/challenge-platform/test"}),
+    "https://chatgpt.com/",
+) is False
+assert worker._is_usable_probe_response(
+    FakeResponse(302, {"location": "https://example.com/"}),
+    "https://chatgpt.com/",
+) is False
+assert worker._is_usable_probe_response(
+    FakeResponse(302, {"location": "/auth/login"}),
+    "https://chatgpt.com/",
+) is True
 `;
   const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
     encoding: "utf8",
@@ -350,6 +403,111 @@ assert "chrome" not in profiles
     windowsHide: true,
   });
   assert.equal(result.status, 0, `TLS profile probe test failed:\n${result.stderr || result.stdout}`);
+}
+
+async function testSharedDirectProfileProbe() {
+  let factoryCalls = 0;
+  let prepareCalls = 0;
+  let closeCalls = 0;
+  let releaseProbe;
+  const gate = new Promise((resolve) => { releaseProbe = resolve; });
+  const probe = new DirectTlsProfileProbe({
+    transportFactory: () => {
+      factoryCalls += 1;
+      return {
+        profile: "auto",
+        async prepareProxy(proxy, url) {
+          prepareCalls += 1;
+          assert.equal(proxy, null);
+          assert.equal(url, "https://chatgpt.com/");
+          await gate;
+          this.profile = "chrome142";
+        },
+        async close() {
+          closeCalls += 1;
+        },
+      };
+    },
+  });
+
+  const pending = Array.from({ length: 20 }, () => probe.resolve());
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(factoryCalls, 1, "20 concurrent jobs must share one TLS profile probe");
+  assert.equal(prepareCalls, 1, "the shared probe must only start one profile scan");
+  releaseProbe();
+  assert.deepEqual(await Promise.all(pending), Array(20).fill("chrome142"));
+  assert.equal(closeCalls, 1);
+  assert.equal(await probe.resolve(), "chrome142");
+  assert.equal(factoryCalls, 1, "a successful profile must remain cached");
+
+  let retryFactoryCalls = 0;
+  const retryProbe = new DirectTlsProfileProbe({
+    transportFactory: () => {
+      retryFactoryCalls += 1;
+      const attempt = retryFactoryCalls;
+      return {
+        profile: "auto",
+        async prepareProxy() {
+          if (attempt === 1) throw new Error("temporary probe failure");
+          this.profile = "chrome141";
+        },
+        async close() {},
+      };
+    },
+  });
+  await assert.rejects(retryProbe.resolve(), /temporary probe failure/);
+  assert.equal(await retryProbe.resolve(), "chrome141");
+  assert.equal(retryFactoryCalls, 2, "a failed shared probe must be retryable");
+}
+
+function testBrowserIdentity() {
+  const modern = browserIdentityForTlsProfile("chrome145");
+  assert.match(modern.userAgent, /Macintosh; Intel Mac OS X 10_15_7/);
+  assert.match(modern.userAgent, /Chrome\/145\.0\.0\.0/);
+  assert.equal(modern.secChUaPlatform, '"macOS"');
+  assert.equal(modern.platform, "MacIntel");
+  assert.equal(modern.browserMajorVersion, 145);
+  const sentinel = defaultSentinelEnv(resolveSentinelDeviceProfile(modern));
+  assert.match(sentinel.userAgent, /Chrome\/145\.0\.0\.0/);
+  assert.equal(sentinel.platform, "MacIntel");
+  assert.equal(sentinel.locale, "zh-CN");
+  assert.equal(sentinel.timezoneId, "Asia\/Shanghai");
+
+  const legacy = browserIdentityForTlsProfile("chrome116");
+  assert.match(legacy.userAgent, /Windows NT 10\.0; Win64; x64/);
+  assert.match(legacy.userAgent, /Chrome\/116\.0\.0\.0/);
+  assert.equal(legacy.secChUaPlatform, '"Windows"');
+  assert.equal(legacy.platform, "Win32");
+}
+
+async function testSentinelBrowserIdentity() {
+  const identity = browserIdentityForTlsProfile("chrome145");
+  let requestOptions;
+  const token = JSON.parse(await fetchSentinelToken({
+    deviceID: "identity-device-id",
+    flow: "oauth_create_account",
+    deviceProfile: identity,
+    sendClientHints: false,
+    reqEndpoint: "https://sentinel.openai.com/backend-api/sentinel/req",
+    fetch: async (_url, options) => {
+      requestOptions = options;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { token: "identity-sentinel-token", proofofwork: { required: false }, turnstile: { required: false } };
+        },
+      };
+    },
+  }));
+  assert.equal(token.c, "identity-sentinel-token");
+  assert.match(requestOptions.headers["user-agent"], /Chrome\/145\.0\.0\.0/);
+  assert.equal(requestOptions.headers["accept-language"], "zh-CN,zh;q=0.9,en;q=0.8");
+  assert.equal(requestOptions.headers["sec-ch-ua"], undefined);
+  const requirements = JSON.parse(requestOptions.body);
+  assert.equal(requirements.flow, "oauth_create_account");
+  assert.equal(requirements.id, "identity-device-id");
+  assert.match(requirements.p, /^gAAAAAC/);
 }
 
 function findTestPython() {

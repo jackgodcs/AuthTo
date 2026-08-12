@@ -56,6 +56,7 @@ const child = spawn(process.execPath, [path.join(projectRoot, "src", "console-se
     ONBOARDING_OUTPUT_ROOT: outputRoot,
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(outputRoot, "test-mac-credentials"),
     ONBOARDING_PROTOCOL_SCRIPT: path.join(projectRoot, "test", "mock-protocol-login.mjs"),
+    TOSUB2_TLS_PROFILE: "chrome142",
     SMSBOWER_API_BASE: `http://127.0.0.1:${smsServer.address().port}/handler_api.php`,
     SMS_POLL_INTERVAL_MS: "20",
     SMS_POLL_TIMEOUT_MS: "3000",
