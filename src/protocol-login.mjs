@@ -51,6 +51,15 @@ const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36";
 
+function userAgentForTransport(transport) {
+  const match = /^chrome(\d+)/i.exec(String(transport?.profile || ""));
+  if (!match) return UA;
+  return (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+    `(KHTML, like Gecko) Chrome/${match[1]}.0.0.0 Safari/537.36`
+  );
+}
+
 class CookieJar {
   constructor(cookies = []) {
     this.cookies = Array.isArray(cookies)
@@ -275,7 +284,7 @@ async function run() {
   const proxyTemplate = normalizeProxyUrl(args.proxy || process.env.CHATGPT_PROXY_URL);
   const transport = new TlsFingerprintTransport({
     enabled: shouldUseTlsTransport({ chatgptBase, authBase, nativeHttp: args.nativeHttp }),
-    profile: args.tlsProfile || process.env.TOSUB2_TLS_PROFILE || (proxyTemplate ? "chrome146" : "chrome142"),
+    profile: args.tlsProfile || process.env.TOSUB2_TLS_PROFILE || (proxyTemplate ? "chrome146" : "auto"),
     verbose: Boolean(args.verbose),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
@@ -907,7 +916,7 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
         timeoutMs: DEFAULT_TIMEOUT_MS,
       }),
       reqEndpoint: sentinelRequirementsEndpoint(authBase),
-      userAgent: UA,
+      userAgent: userAgentForTransport(client.transport),
     });
   } catch (error) {
     throw new Error(
@@ -1379,7 +1388,7 @@ async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redir
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": UA,
+      "user-agent": userAgentForTransport(transport),
       ...(cookie ? { cookie } : {}),
     },
     body: new URLSearchParams({
@@ -1396,7 +1405,7 @@ async function exchangeOAuthCode({ authBase, clientId, code, codeVerifier, redir
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": UA,
+      "user-agent": userAgentForTransport(transport),
     },
     body: new URLSearchParams({
       grant_type: "authorization_code",
@@ -1480,7 +1489,7 @@ async function refreshOAuthToken({ authBase, clientId, refreshToken, transport }
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": UA,
+      "user-agent": userAgentForTransport(transport),
     },
     body: new URLSearchParams({
       grant_type: "refresh_token",
@@ -1494,7 +1503,7 @@ async function refreshOAuthToken({ authBase, clientId, refreshToken, transport }
     headers: {
       accept: "application/json",
       "content-type": "application/x-www-form-urlencoded",
-      "user-agent": UA,
+      "user-agent": userAgentForTransport(transport),
     },
     body: new URLSearchParams({
       grant_type: "refresh_token",
@@ -1987,7 +1996,7 @@ Options:
   --priority <number>             sub2api priority. Default: 1
   --rate-multiplier <number>      sub2api rate_multiplier. Default: 1
   --proxy <url>                   Account proxy; supports http, socks5 and socks5h.
-  --tls-profile <name>            curl_cffi browser profile. Default: chrome142 without proxy; chrome146 with proxy
+  --tls-profile <name>            curl_cffi browser profile. Default: auto-probe without proxy; chrome146 with proxy
   --native-http                   Disable the Python TLS fingerprint transport.
   --chatgpt-base <url>            Default: ${DEFAULT_CHATGPT_BASE}
   --auth-base <url>               Default: ${DEFAULT_AUTH_BASE}

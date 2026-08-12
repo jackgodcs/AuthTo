@@ -43,6 +43,18 @@ try {
   assert.equal(fallbackResponse.status, 200, "unsupported TLS profiles should fall back to a supported profile");
   await fallbackTransport.close();
   testConfigureStageProfileFallback();
+  testProfileProbeWorker();
+
+  const autoProfileTransport = new TlsFingerprintTransport({ enabled: true, profile: "auto" });
+  autoProfileTransport.send = async (message) => {
+    assert.equal(message.operation, "probe_profiles");
+    assert.equal(message.url, "https://chatgpt.com/");
+    return { profile: "chrome142", attempts: 3 };
+  };
+  await autoProfileTransport.prepareProxy(null, "https://chatgpt.com/");
+  assert.equal(autoProfileTransport.profile, "chrome142");
+  assert.equal(autoProfileTransport.configuredProxy, null);
+  assert.equal(autoProfileTransport.configuredProfile, "chrome142");
 
   const postResponse = await transport.request("POST", `http://127.0.0.1:${address.port}/post`, {
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -274,6 +286,70 @@ assert FakeRequests.attempts[:2] == ["chrome146", "chrome"], FakeRequests.attemp
     windowsHide: true,
   });
   assert.equal(result.status, 0, `configure-stage TLS fallback failed:\n${result.stderr || result.stdout}`);
+}
+
+function testProfileProbeWorker() {
+  const python = findTestPython();
+  assert.ok(python, "a Python interpreter with curl_cffi is required for TLS tests");
+  const workerPath = fileURLToPath(new URL("../src/tls_transport.py", import.meta.url));
+  const script = String.raw`
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("tosub2_tls_transport", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+class FakeHeaders(dict):
+    pass
+
+class FakeResponse:
+    def __init__(self, status, headers=None, content=b""):
+        self.status_code = status
+        self.headers = FakeHeaders(headers or {})
+        self.content = content
+
+class FakeSession:
+    def __init__(self, profile):
+        self.profile = profile
+        self.closed = False
+
+    def get(self, url, timeout, allow_redirects):
+        assert url == "https://chatgpt.com/"
+        if self.profile == "chrome146":
+            return FakeResponse(403, {"content-type": "text/html", "cf-mitigated": "challenge"}, b"Just a moment")
+        return FakeResponse(200, {"content-type": "text/html"}, b"ChatGPT")
+
+    def close(self):
+        self.closed = True
+
+class FakeRequests:
+    attempts = []
+
+    @classmethod
+    def Session(cls, impersonate, proxy):
+        assert proxy is None
+        cls.attempts.append(impersonate)
+        return FakeSession(impersonate)
+
+module.requests = FakeRequests
+worker = module.Worker()
+result = worker.probe_profiles("https://chatgpt.com/", ["chrome146", "chrome142"], 1000)
+assert result == {"profile": "chrome142", "attempts": 2}, result
+assert worker.impersonate == "chrome142"
+assert FakeRequests.attempts == ["chrome146", "chrome142"]
+profiles = worker._supported_chrome_profiles()
+assert profiles[0] == "chrome146", profiles
+assert "chrome142" in profiles
+assert "chrome131_android" not in profiles
+assert "chrome" not in profiles
+`;
+  const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `TLS profile probe test failed:\n${result.stderr || result.stdout}`);
 }
 
 function findTestPython() {

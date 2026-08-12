@@ -7,6 +7,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_SCRIPT = path.join(__dirname, "tls_transport.py");
 const DEFAULT_PROFILE = "chrome146";
 const DEFAULT_TIMEOUT_MS = 30_000;
+const PROFILE_PROBE_TIMEOUT_MS = 15_000;
+const PROFILE_PROBE_TOTAL_TIMEOUT_MS = 300_000;
+const PROFILE_PROBE_CONCURRENCY = 4;
 const DEFAULT_SAME_PROXY_RISK_RETRIES = 3;
 const DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS = 1_000;
 const UNCONFIGURED = Symbol("unconfigured");
@@ -56,6 +59,22 @@ export class TlsFingerprintTransport {
     if (!this.enabled) return null;
     const template = String(proxyTemplate || "").trim();
     if (!template) {
+      if (this.profile === "auto") {
+        const result = await this.send({
+          operation: "probe_profiles",
+          url: validationUrl,
+          probeTimeoutMs: PROFILE_PROBE_TIMEOUT_MS,
+          concurrency: PROFILE_PROBE_CONCURRENCY,
+          timeoutMs: PROFILE_PROBE_TOTAL_TIMEOUT_MS,
+        });
+        this.profile = String(result.profile);
+        this.configuredProxy = null;
+        this.configuredProfile = this.profile;
+        console.log(
+          `[tls] 本机直连指纹探测通过：${this.profile}（共探测 ${Number(result.attempts) || 1} 个候选）。`,
+        );
+        return null;
+      }
       await this.configure(null, { force: true });
       return null;
     }
