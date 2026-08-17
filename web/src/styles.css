@@ -104,6 +104,19 @@ button { letter-spacing: 0; }
 .account-proxy-field { width: 100%; }
 .provider-ready { display: inline-flex; align-items: center; gap: 4px; color: var(--green-strong); font-size: 11px; font-weight: 700; }
 .provider-ready.incomplete { color: var(--amber); }
+.provider-external-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.4;
+  text-decoration: none;
+}
+.provider-external-link:hover { color: var(--green-strong); text-decoration: underline; }
+.provider-external-link svg { flex: 0 0 auto; }
 .provider-name { padding: 4px 7px; color: var(--blue); background: var(--blue-soft); border-radius: 4px; font-size: 11px; font-weight: 700; }
 .provider-settings-button { height: 34px; margin-left: auto; }
 .sub2api-toolbar .provider-name { max-width: min(360px, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -249,7 +262,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .stop-all-button:hover:not(:disabled) { color: #fff; background: var(--danger); border-color: var(--danger); }
 
 .table-frame { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; }
-table { width: 100%; min-width: 1600px; border-collapse: collapse; table-layout: fixed; }
+table { width: 100%; min-width: 1740px; border-collapse: collapse; table-layout: fixed; }
 th {
   height: 42px;
   padding: 0 16px;
@@ -263,11 +276,12 @@ th {
   letter-spacing: 0;
 }
 th:nth-child(1) { width: 4%; }
-th:nth-child(2) { width: 19%; }
-th:nth-child(3) { width: 11%; }
-th:nth-child(4) { width: 27%; }
-th:nth-child(5) { width: 9%; }
-th:nth-child(6) { width: 30%; }
+th:nth-child(2) { width: 17%; }
+th:nth-child(3) { width: 9%; }
+th:nth-child(4) { width: 23%; }
+th:nth-child(5) { width: 8%; }
+th:nth-child(6) { width: 11%; }
+th:nth-child(7) { width: 28%; }
 .actions-heading { text-align: right; }
 .select-heading, .select-cell { text-align: center; }
 .select-heading input, .select-cell input { width: 15px; height: 15px; margin: 0; accent-color: var(--green); cursor: pointer; }
@@ -335,6 +349,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .status-badge.resume_available { color: var(--amber); background: var(--amber-soft); }
 .status-badge.refreshing { color: var(--blue); background: var(--blue-soft); }
 .status-badge.totp_starting { color: var(--blue); background: var(--blue-soft); }
+.status-badge.password_add_starting { color: var(--blue); background: var(--blue-soft); }
 
 .step-cell { padding-top: 10px; padding-bottom: 10px; }
 .prompt-line { color: #44504c; font-size: 12px; }
@@ -441,6 +456,9 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .text-action:hover { color: var(--green); }
 .time-cell { color: #727d79; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.operation-time-cell { color: #4f5b57; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.operation-time-cell time { display: block; font-size: 12px; }
+.operation-time-cell span { display: block; margin-top: 4px; color: #8a9490; font-size: 10px; white-space: normal; }
 .row-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; white-space: nowrap; }
 .row-actions > button { flex: 0 0 auto; white-space: nowrap; }
 .download-button { height: 32px; padding: 0 11px; font-size: 12px; }
@@ -621,7 +639,15 @@ tbody tr:last-child td { border-bottom: 0; }
 .provider-tabs button:hover { color: var(--green-strong); background: #f5f8f7; }
 .provider-tabs button.active { color: var(--green-strong); border-bottom-color: var(--green); }
 .provider-config-section { padding: 18px 0 4px; }
-.provider-description { margin-bottom: 14px; color: var(--muted); font-size: 12px; }
+.provider-description-row {
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.provider-description { color: var(--muted); font-size: 12px; }
 .provider-config-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .settings-field:first-child { grid-column: 1 / -1; }
 .settings-field { display: grid; gap: 6px; color: #53605b; font-size: 12px; font-weight: 700; }

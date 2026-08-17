@@ -250,6 +250,9 @@ function defaultSentinelEnv(deviceProfile) {
   };
 }
 async function fetchSentinelToken(options) {
+  return (await fetchSentinelTokens(options)).token;
+}
+async function fetchSentinelTokens(options) {
   const profile = resolveSentinelDeviceProfile(options.deviceProfile);
   const env = defaultSentinelEnv({
     ...profile,
@@ -289,13 +292,16 @@ async function fetchSentinelToken(options) {
   const requirements = await response.json();
   const proof = await generator.getEnforcementToken(requirements);
   const turnstile = requirements.turnstile?.dx ? await computeTurnstileDx(requirements, reqToken, env) : null;
-  return JSON.stringify({
-    p: proof,
-    t: turnstile,
-    c: requirements.token,
-    id: options.deviceID,
-    flow: options.flow
-  });
+  return {
+    token: JSON.stringify({
+      p: proof,
+      t: turnstile,
+      c: requirements.token,
+      id: options.deviceID,
+      flow: options.flow
+    }),
+    soToken: typeof requirements.so === "string" && requirements.so ? requirements.so : null
+  };
 }
 function resolveSentinelDeviceProfile(deviceProfile) {
   const fallbackProfile = defaultDeviceProfile();
@@ -1497,5 +1503,6 @@ function randomUUID2() {
 export {
   defaultSentinelEnv,
   fetchSentinelToken,
+  fetchSentinelTokens,
   resolveSentinelDeviceProfile
 };

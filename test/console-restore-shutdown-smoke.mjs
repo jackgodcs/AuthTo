@@ -15,6 +15,11 @@ const restoredDir = path.join(outputRoot, restoredId);
 const restoredEmail = "restore-failed@example.com";
 const interruptedId = "22222222-2222-4222-8222-222222222222";
 const interruptedEmail = "restore-interrupted@example.com";
+const interruptedPasswordId = "33333333-3333-4333-8333-333333333333";
+const interruptedPasswordEmail = "restore-password@example.com";
+const interruptedTotpId = "44444444-4444-4444-8444-444444444444";
+const interruptedTotpEmail = "restore-totp@example.com";
+const restoredOperationAt = "2026-08-12T08:30:00.000Z";
 const port = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
 const sub2apiPort = await findAvailablePort();
@@ -49,6 +54,8 @@ await fs.writeFile(path.join(restoredDir, "job-meta.json"), `${JSON.stringify({
   result_saved: true,
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
+  last_operation_at: restoredOperationAt,
+  last_operation_type: "relogin",
 }, null, 2)}\n`);
 await fs.mkdir(path.join(outputRoot, interruptedId), { recursive: true });
 await fs.writeFile(path.join(outputRoot, interruptedId, "job-meta.json"), `${JSON.stringify({
@@ -60,6 +67,59 @@ await fs.writeFile(path.join(outputRoot, interruptedId, "job-meta.json"), `${JSO
   result_saved: false,
   created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
+}, null, 2)}\n`);
+const interruptedPasswordDir = path.join(outputRoot, interruptedPasswordId);
+await fs.mkdir(interruptedPasswordDir, { recursive: true });
+await fs.writeFile(path.join(interruptedPasswordDir, "login-checkpoint.json"), `${JSON.stringify({
+  version: 1,
+  stage: "email_verified",
+  updated_at: new Date().toISOString(),
+  email: interruptedPasswordEmail,
+  cookies: [],
+}, null, 2)}\n`, { mode: 0o600 });
+await fs.writeFile(path.join(interruptedPasswordDir, "password-add-result.json"), `${JSON.stringify({
+  version: 1,
+  email: interruptedPasswordEmail,
+  password: "Recovered_Test_4826!",
+  added_at: "2026-08-17T05:00:00.000Z",
+}, null, 2)}\n`, { mode: 0o600 });
+await fs.writeFile(path.join(interruptedPasswordDir, "job-meta.json"), `${JSON.stringify({
+  version: 1,
+  email: interruptedPasswordEmail,
+  status: "password_add_starting",
+  prompt: "正在添加密码",
+  result_saved: false,
+  created_at: new Date().toISOString(),
+  updated_at: new Date().toISOString(),
+  login_checkpoint_available: true,
+}, null, 2)}\n`);
+const interruptedTotpDir = path.join(outputRoot, interruptedTotpId);
+await fs.mkdir(interruptedTotpDir, { recursive: true });
+await fs.writeFile(path.join(interruptedTotpDir, "login-checkpoint.json"), `${JSON.stringify({
+  version: 1,
+  stage: "email_verified",
+  updated_at: new Date().toISOString(),
+  email: interruptedTotpEmail,
+  cookies: [],
+}, null, 2)}\n`, { mode: 0o600 });
+await fs.writeFile(path.join(interruptedTotpDir, "totp-setup-result.json"), `${JSON.stringify({
+  version: 1,
+  activation_mode: "automatic",
+  activation_succeeded: true,
+  activated_at: "2026-08-17T05:10:00.000Z",
+  email: interruptedTotpEmail,
+  secret: "NB2W45DFOIZAQWER",
+  otpauth_uri: `otpauth://totp/OpenAI%3A${encodeURIComponent(interruptedTotpEmail)}?secret=NB2W45DFOIZAQWER&issuer=OpenAI`,
+}, null, 2)}\n`, { mode: 0o600 });
+await fs.writeFile(path.join(interruptedTotpDir, "job-meta.json"), `${JSON.stringify({
+  version: 1,
+  email: interruptedTotpEmail,
+  status: "totp_starting",
+  prompt: "正在设置 2FA",
+  result_saved: false,
+  created_at: new Date().toISOString(),
+  updated_at: new Date().toISOString(),
+  login_checkpoint_available: true,
 }, null, 2)}\n`);
 
 const child = spawn(process.execPath, [
@@ -95,11 +155,31 @@ try {
   assert.equal(restored.canDownload, true);
   assert.equal(restored.prompt, "本次重新授权失败");
   assert.equal(restored.lastError, "模拟的最近错误");
+  assert.equal(restored.lastOperationAt, restoredOperationAt);
+  assert.equal(restored.lastOperationType, "relogin");
   const interrupted = page.jobs.find((job) => job.id === interruptedId);
   assert.equal(interrupted.status, "failed");
   assert.equal(interrupted.canDownload, false);
   assert.equal(interrupted.canRetry, true);
+  assert.equal(interrupted.lastOperationType, "initial_authorization");
   assert.match(interrupted.prompt, /服务重启中断/);
+  const recoveredPassword = page.jobs.find((job) => job.id === interruptedPasswordId);
+  assert.equal(recoveredPassword.status, "resume_available");
+  assert.equal(recoveredPassword.loginMode, "password");
+  assert.equal(recoveredPassword.canAddPassword, false);
+  assert.equal(recoveredPassword.canRetry, true);
+  assert.equal(recoveredPassword.passwordAddError, null);
+  assert.equal(recoveredPassword.passwordAddedAt, "2026-08-17T05:00:00.000Z");
+  assert.match(recoveredPassword.prompt, /已恢复成功添加的新密码/);
+  await assert.rejects(fs.access(path.join(interruptedPasswordDir, "password-add-result.json")));
+  const recoveredTotp = page.jobs.find((job) => job.id === interruptedTotpId);
+  assert.equal(recoveredTotp.status, "resume_available");
+  assert.equal(recoveredTotp.hasTotpKey, true);
+  assert.equal(recoveredTotp.canSetupTotp, false);
+  assert.equal(recoveredTotp.canRetry, true);
+  assert.equal(recoveredTotp.totpSetupError, null);
+  assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
+  await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
 
   const createResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",

@@ -10,6 +10,7 @@ import {
   CircleAlert,
   Copy,
   Download,
+  ExternalLink,
   FileText,
   Filter,
   Globe2,
@@ -38,6 +39,16 @@ const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
+const SMS_PROVIDER_EXTERNAL_LINKS = {
+  luban: {
+    href: "https://lubansms.com/",
+    label: "点击获取 API 密钥",
+  },
+  smsbower: {
+    href: "https://smsbower.app/cabinet/profile",
+    label: "点击获取 API 密钥",
+  },
+};
 const REGION_NAMES = typeof Intl.DisplayNames === "function"
   ? new Intl.DisplayNames(["zh-CN"], { type: "region" })
   : null;
@@ -192,6 +203,9 @@ function App() {
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
+  const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
+  const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && passwordAddSelectedCount > 0;
 
   function openSmsSettings() {
     const draft = withSmsProviderDefaults(smsProviderDefinitions, smsSettings);
@@ -540,6 +554,27 @@ function App() {
     }
   }
 
+  async function addPasswordSelected() {
+    if (!canAddPasswordSelected || batchAction) return;
+    const skipped = selectedJobIds.size - passwordAddSelectedCount;
+    const message = `确定为选中的 ${passwordAddSelectedCount} 个无密码账号生成并添加随机强密码吗？${skipped ? `另有 ${skipped} 个账号已有密码或不符合条件，将自动跳过。` : ""}`;
+    if (!window.confirm(message)) return;
+    setBatchAction("add-password");
+    try {
+      const data = await apiFetch(token, "/api/jobs/add-password-batch", {
+        method: "POST",
+        body: JSON.stringify({ ids: [...selectedJobIds], proxyUrl: accountProxyUrl.trim() }),
+      });
+      setUploadNotice(`已开始为 ${data.started} 个账号添加密码${data.skipped ? `，跳过 ${data.skipped} 个` : ""}`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function forceReloginSelected() {
     if (!canForceReloginSelected || batchAction) return;
     const skipped = selectedJobIds.size - forceReloginSelectedCount;
@@ -747,6 +782,15 @@ function App() {
             {accountProxyUrl.trim() ? <Check size={14} /> : <CircleAlert size={14} />}
             {accountProxyUrl.trim() ? "已配置，按账号检测出口" : "未配置，使用本地 IP"}
           </span>
+          <a
+            className="provider-external-link"
+            href="https://invite.zooproxy.com/share/ez2v2jdb7"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <ExternalLink size={13} aria-hidden="true" />
+            点击获取代理 IP
+          </a>
         </div>
 
         {error && (
@@ -819,6 +863,12 @@ function App() {
                   批量设置 2FA
                 </button>
               )}
+              {features.passwordAdd && (
+                <button type="button" className="secondary-button bulk-button" onClick={addPasswordSelected} disabled={!canAddPasswordSelected || Boolean(batchAction)}>
+                  {batchAction === "add-password" ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}
+                  批量添加密码
+                </button>
+              )}
               <button type="button" className="delete-button" onClick={deleteSelected} disabled={!selectedJobIds.size || Boolean(batchAction)}>
                 {batchAction === "delete" ? <LoaderCircle className="spin" size={16} /> : <Trash2 size={16} />}
                 批量删除
@@ -844,6 +894,7 @@ function App() {
                 <th>状态</th>
                 <th>当前操作</th>
                 <th>开始时间</th>
+                <th>最近操作时间</th>
                 <th className="actions-heading">操作</th>
               </tr>
             </thead>
@@ -865,12 +916,13 @@ function App() {
                     onUpload={() => uploadSelected([job.id])}
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
+                    passwordAddAvailable={Boolean(features.passwordAdd)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
-                      <td colSpan="6"><JobLogs token={token} jobId={job.id} /></td>
+                      <td colSpan="7"><JobLogs token={token} jobId={job.id} /></td>
                     </tr>
                   )}
                 </React.Fragment>
@@ -928,7 +980,20 @@ function App() {
 
             {draftSmsProvider.definition && (
               <div className="provider-config-section">
-                <div className="provider-description">{draftSmsProvider.definition.description}</div>
+                <div className="provider-description-row">
+                  <div className="provider-description">{draftSmsProvider.definition.description}</div>
+                  {SMS_PROVIDER_EXTERNAL_LINKS[draftSmsProvider.id] && (
+                    <a
+                      className="provider-external-link"
+                      href={SMS_PROVIDER_EXTERNAL_LINKS[draftSmsProvider.id].href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      <ExternalLink size={13} aria-hidden="true" />
+                      {SMS_PROVIDER_EXTERNAL_LINKS[draftSmsProvider.id].label}
+                    </a>
+                  )}
+                </div>
                 <div className="provider-config-grid">
                   {draftSmsProvider.definition.fields.filter((field) => field.type !== "hidden").map((field) => (
                     <label key={field.key} className={`settings-field ${["price-select", "textarea"].includes(field.type) ? "wide-settings-field" : ""}`}>
@@ -1194,12 +1259,12 @@ function App() {
                 <X size={18} />
               </button>
             </div>
-            <label className="batch-label" htmlFor="batch-input">每行一条：邮箱 + 密码/收码接口，可继续添加邮件接收 API 和 2FA 密钥</label>
+            <label className="batch-label" htmlFor="batch-input">每行一个账号：自动识别邮箱、密码、邮件 API 和 2FA，字段顺序不限</label>
             <textarea
               id="batch-input"
               value={batchText}
               onChange={(event) => setBatchText(event.target.value)}
-              placeholder={"name@icloud.com----https://mail.example/messages/token/name%40icloud.com\nname2@example.com----账号密码----https://mail.example/messages/name2\nname3@example.com----账号密码----https://mail.example/messages/name3----BASE32二步验证密钥"}
+              placeholder={"name@icloud.com----https://mail.example/messages/name\nhttps://mail.example/messages/name2|账号密码|name2@example.co.uk|BASE32二步验证密钥\nBASE32二步验证密钥::name3@example.dev::账号密码"}
               spellCheck="false"
               autoFocus
             />
@@ -1254,7 +1319,7 @@ function App() {
 function EmptyState({ filtered = false }) {
   return (
     <tr>
-      <td colSpan="6">
+      <td colSpan="7">
         <div className="empty-state">
           <div><Mail size={24} /></div>
           <h3>{filtered ? "没有匹配账号" : "暂无授权任务"}</h3>
@@ -1265,7 +1330,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -1358,6 +1423,22 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
+  async function addPassword() {
+    if (!window.confirm("确定为该账号生成并添加随机强密码吗？成功后会自动更新账号原始信息。")) return;
+    setSubmitting(true);
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/add-password`, {
+        method: "POST",
+        body: JSON.stringify({ proxyUrl: accountProxyUrl.trim() }),
+      });
+      onError("");
+    } catch (requestError) {
+      onError(requestError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   async function copyTotpSecret() {
     try {
       await navigator.clipboard.writeText(job.totpSetupSecret || "");
@@ -1424,6 +1505,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
         )}
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
+        {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
           <div className="phone-target"><Smartphone size={13} />当前手机号：<strong>{job.currentPhone}</strong></div>
@@ -1503,7 +1585,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           </div>
         )}
       </td>
-      <td className="time-cell">{formatTime(job.createdAt)}</td>
+      <td className="time-cell"><time dateTime={job.createdAt}>{formatDateTime(job.createdAt)}</time></td>
+      <td className="operation-time-cell">
+        <time dateTime={job.lastOperationAt || job.createdAt}>{formatDateTime(job.lastOperationAt || job.createdAt)}</time>
+        <span>{operationLabel(job.lastOperationType)}</span>
+      </td>
       <td>
         <div className="row-actions">
           {job.canDownload && (
@@ -1531,6 +1617,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+            </button>
+          )}
+          {passwordAddAvailable && job.canAddPassword && (
+            <button type="button" className="icon-button" onClick={addPassword} disabled={submitting} title="添加密码">
+              {submitting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}
             </button>
           )}
           {job.canRetry && (
@@ -1591,6 +1682,7 @@ function StatusBadge({ status }) {
     password: ["待密码", <KeyRound size={14} />],
     mfa_otp: ["待 2FA", <ShieldCheck size={14} />],
     totp_starting: ["准备 2FA", <LoaderCircle className="spin" size={14} />],
+    password_add_starting: ["准备密码", <LoaderCircle className="spin" size={14} />],
     totp_setup_otp: ["激活 2FA", <ShieldCheck size={14} />],
     email_otp: ["待邮箱码", <Mail size={14} />],
     phone: ["待手机号", <Smartphone size={14} />],
@@ -1747,13 +1839,34 @@ function shortId(id) {
   return `任务 ${id.slice(0, 8)}`;
 }
 
-function formatTime(value) {
+function formatDateTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  const now = new Date();
+  const isToday = date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
   return new Intl.DateTimeFormat("zh-CN", {
+    ...(isToday ? {} : { month: "2-digit", day: "2-digit" }),
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
-  }).format(new Date(value));
+  }).format(date);
+}
+
+function operationLabel(type) {
+  return ({
+    initial_authorization: "首次授权",
+    reauthorize: "重新授权",
+    relogin: "重新登录并授权",
+    automatic_relogin: "号池自动重登并授权",
+    resume: "继续中断流程",
+    setup_2fa: "设置 2FA",
+    add_password: "添加密码",
+    account_update: "更新账号资料",
+    proxy_update: "更新代理 IP",
+  })[type] || "账号操作";
 }
 
 function countBatchLines(value) {

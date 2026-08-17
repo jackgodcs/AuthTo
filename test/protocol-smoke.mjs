@@ -61,6 +61,69 @@ try {
   assert.equal(firstExport.type, "sub2api-data");
   assert.equal(firstExport.accounts?.[0]?.credentials?.email, "add-phone-page@example.com");
 
+  const passwordAddResultPath = path.join(tempRoot, "password-add-result.json");
+  const newPassword = "Added_Test_4826!";
+  const passwordAdd = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "add-password@example.com",
+    "--add-password",
+    "--password-add-result",
+    passwordAddResultPath,
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--verbose",
+  ], [
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+  ], { CHATGPT_NEW_PASSWORD: newPassword });
+  assert.equal(passwordAdd.code, 0, processFailure("add password", passwordAdd));
+  assert.equal(passwordAdd.completedInputSteps, 2, processFailure("add password input", passwordAdd));
+  assert.match(passwordAdd.output, /Account password added and saved securely/);
+  assert.doesNotMatch(passwordAdd.output, new RegExp(newPassword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  const passwordAddResult = JSON.parse(await fs.readFile(passwordAddResultPath, "utf8"));
+  assert.equal(passwordAddResult.email, "add-password@example.com");
+  assert.equal(passwordAddResult.password, newPassword);
+
+  const passwordCheckpointPath = path.join(tempRoot, "password-add-checkpoint.json");
+  const checkpointPasswordResultPath = path.join(tempRoot, "checkpoint-password-add-result.json");
+  await fs.writeFile(passwordCheckpointPath, `${JSON.stringify({
+    version: 1,
+    stage: "phone_required",
+    updated_at: new Date().toISOString(),
+    email: "checkpoint-password@example.com",
+    chatgpt_base: baseUrl,
+    auth_base: baseUrl,
+    cookies: [],
+    web: { deviceId: "11111111-2222-4333-8444-555555555555" },
+    oauth: { codeVerifier: "stale-verifier", state: "stale-state" },
+  }, null, 2)}\n`, { mode: 0o600 });
+  const checkpointPasswordAdd = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "checkpoint-password@example.com",
+    "--add-password",
+    "--password-add-result",
+    checkpointPasswordResultPath,
+    "--resume-checkpoint",
+    passwordCheckpointPath,
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--verbose",
+  ], [
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+  ], { CHATGPT_NEW_PASSWORD: "Checkpoint_Test_4826!" });
+  assert.equal(checkpointPasswordAdd.code, 0, processFailure("checkpoint add password", checkpointPasswordAdd));
+  assert.equal(checkpointPasswordAdd.completedInputSteps, 1, processFailure("checkpoint add password input", checkpointPasswordAdd));
+  assert.match(checkpointPasswordAdd.output, /Reusing verified login checkpoint from phone_required/);
+  const updatedPasswordCheckpoint = JSON.parse(await fs.readFile(passwordCheckpointPath, "utf8"));
+  assert.equal(updatedPasswordCheckpoint.stage, "email_verified");
+  assert.equal(Object.hasOwn(updatedPasswordCheckpoint, "oauth"), false);
+
   const wrongEmailOtpOutputPath = path.join(tempRoot, "wrong-email-otp-sub2api.json");
   const wrongEmailOtpLogin = await runNode([
     path.join(projectRoot, "src", "protocol-login.mjs"),
@@ -253,10 +316,10 @@ try {
   await fs.rm(tempRoot, { recursive: true, force: true });
 }
 
-async function runNode(args, inputSteps = []) {
+async function runNode(args, inputSteps = [], extraEnv = {}) {
   const child = spawn(process.execPath, args, {
     cwd: projectRoot,
-    env: { ...process.env, CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS: "0" },
+    env: { ...process.env, CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS: "0", ...extraEnv },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });

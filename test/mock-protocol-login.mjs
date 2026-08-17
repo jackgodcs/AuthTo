@@ -26,6 +26,11 @@ try {
 
   if (args.setupTotp) {
     const secret = "NB2W45DFOIZAQWER";
+    const reusingCheckpoint = Boolean(args.resumeCheckpoint && await fileExists(args.resumeCheckpoint));
+    if (reusingCheckpoint) {
+      const checkpoint = JSON.parse(await fs.readFile(args.resumeCheckpoint, "utf8"));
+      console.log(`[2fa] Reusing verified login checkpoint from ${checkpoint.stage}.`);
+    }
     await fs.mkdir(path.dirname(args.totpResult), { recursive: true });
     await fs.writeFile(args.totpResult, `${JSON.stringify({
       version: 1,
@@ -39,6 +44,48 @@ try {
     console.log("[2fa-setup-ready] 2FA key created; activating it automatically.");
     console.log("[2fa] Generated a current 6-digit activation code from the new 2FA key.");
     console.log("[ok] 2FA setup activated");
+    if (reusingCheckpoint) {
+      const checkpoint = JSON.parse(await fs.readFile(args.resumeCheckpoint, "utf8"));
+      await fs.writeFile(args.resumeCheckpoint, `${JSON.stringify({
+        ...checkpoint,
+        stage: "email_verified",
+        updated_at: new Date().toISOString(),
+        oauth: undefined,
+      }, null, 2)}\n`, { mode: 0o600 });
+      console.log("[checkpoint] Updated verified login state after setting 2FA.");
+    }
+    return;
+  }
+
+  if (args.addPassword) {
+    const newPassword = process.env.CHATGPT_NEW_PASSWORD || "";
+    if (!newPassword) throw new Error("missing CHATGPT_NEW_PASSWORD");
+    const reusingCheckpoint = Boolean(args.resumeCheckpoint && await fileExists(args.resumeCheckpoint));
+    if (reusingCheckpoint) {
+      const checkpoint = JSON.parse(await fs.readFile(args.resumeCheckpoint, "utf8"));
+      console.log(`[password-add] Reusing verified login checkpoint from ${checkpoint.stage}.`);
+    } else {
+      await rl.question("Email OTP (r=resend, q=quit): ");
+    }
+    await rl.question("Email OTP (r=resend, q=quit): ");
+    await fs.mkdir(path.dirname(args.passwordAddResult), { recursive: true });
+    await fs.writeFile(args.passwordAddResult, `${JSON.stringify({
+      version: 1,
+      email: args.email,
+      password: newPassword,
+      added_at: new Date().toISOString(),
+    }, null, 2)}\n`, { mode: 0o600 });
+    if (reusingCheckpoint) {
+      const checkpoint = JSON.parse(await fs.readFile(args.resumeCheckpoint, "utf8"));
+      await fs.writeFile(args.resumeCheckpoint, `${JSON.stringify({
+        ...checkpoint,
+        stage: "email_verified",
+        updated_at: new Date().toISOString(),
+        oauth: undefined,
+      }, null, 2)}\n`, { mode: 0o600 });
+      console.log("[checkpoint] Updated verified login state after adding the password.");
+    }
+    console.log("[ok] Account password added and saved securely");
     return;
   }
 
@@ -251,6 +298,8 @@ function parseArgs(argv) {
     else if (argv[index] === "--resume-checkpoint") parsed.resumeCheckpoint = argv[++index];
     else if (argv[index] === "--setup-totp") parsed.setupTotp = true;
     else if (argv[index] === "--totp-result") parsed.totpResult = argv[++index];
+    else if (argv[index] === "--add-password") parsed.addPassword = true;
+    else if (argv[index] === "--password-add-result") parsed.passwordAddResult = argv[++index];
   }
   return parsed;
 }

@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { fetchSentinelToken } from "./sentinel.mjs";
+import { fetchSentinelToken, fetchSentinelTokens } from "./sentinel.mjs";
 import {
   browserIdentityForTlsProfile,
   shouldUseTlsTransport,
@@ -18,6 +18,7 @@ const DEFAULT_CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback";
 const DEFAULT_OUT = "tmp/chatgpt-protocol-session.json";
 const DEFAULT_SUB2API_OUT = "tmp/sub2api-import-oauth.json";
 const DEFAULT_TOTP_RESULT = "tmp/chatgpt-totp-setup.json";
+const DEFAULT_PASSWORD_ADD_RESULT = "tmp/chatgpt-password-add-result.json";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PROFILE_MIN_AGE = 20;
 const PROFILE_MAX_AGE = 50;
@@ -320,34 +321,178 @@ async function run() {
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    if (args.addPassword) {
+      const resultPath = path.resolve(args.passwordAddResult || DEFAULT_PASSWORD_ADD_RESULT);
+      const newPassword = validateNewAccountPassword(process.env.CHATGPT_NEW_PASSWORD || "");
+      const rl = readline.createInterface({ input, output });
+      try {
+        let client = null;
+        let web = null;
+        let checkpoint = null;
+        let email = args.email || "";
+        const checkpointPath = args.resumeCheckpoint ? path.resolve(args.resumeCheckpoint) : null;
+        if (checkpointPath) {
+          try {
+            checkpoint = await readProtocolCheckpoint(checkpointPath);
+            if (email && checkpoint.email.toLowerCase() !== email.toLowerCase()) {
+              throw new Error("CHECKPOINT_INVALID: checkpoint email does not match the requested account");
+            }
+            email = checkpoint.email;
+            client = new ProtocolClient({
+              verbose: args.verbose,
+              jar: CookieJar.fromJSON(checkpoint.cookies),
+              transport,
+            });
+            web = checkpoint.web || null;
+            console.log(`[password-add] Reusing verified login checkpoint from ${checkpoint.stage}.`);
+          } catch (error) {
+            if (error?.code !== "ENOENT") {
+              console.log(`[password-add] Saved login checkpoint cannot be reused: ${error.message}`);
+            }
+            checkpoint = null;
+            client = null;
+          }
+        }
+        email = email || (await ask(rl, "Email: "));
+        if (!email) throw new Error("Email is required");
+        if (client) {
+          try {
+            console.log("[2/4] Start post-login add-password flow with saved login state");
+            await addChatgptPassword(client, {
+              chatgptBase,
+              authBase,
+              email,
+              rl,
+              deviceId: web?.deviceId || client.jar.value("oai-did", `${chatgptBase}/`) || crypto.randomUUID(),
+              password: newPassword,
+              resultPath,
+            });
+          } catch (error) {
+            if (!isExpiredCheckpointError(error)) throw error;
+            console.log("[password-add] Saved login state expired; falling back to a fresh account login.");
+            checkpoint = null;
+            client = null;
+          }
+        }
+        if (!client) {
+          client = new ProtocolClient({ verbose: args.verbose, transport });
+          console.log("[1/4] Sign in to the existing account before adding a password");
+          web = await loginChatgptWeb(client, {
+            chatgptBase,
+            authBase,
+            email,
+            rl,
+            password: process.env.CHATGPT_LOGIN_PASSWORD || "",
+            totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
+          });
+          console.log("[2/4] Start post-login add-password flow");
+          await addChatgptPassword(client, {
+            chatgptBase,
+            authBase,
+            email,
+            rl,
+            deviceId: web.deviceId,
+            password: newPassword,
+            resultPath,
+          });
+        }
+        if (checkpointPath) {
+          const saveCheckpoint = createCheckpointWriter(checkpointPath, {
+            client,
+            email,
+            chatgptBase,
+            authBase,
+            web,
+          });
+          await saveCheckpoint("email_verified", {});
+          console.log("[checkpoint] Updated verified login state after adding the password.");
+        }
+      } finally {
+        rl.close();
+      }
+      return;
+    }
     if (args.setupTotp) {
       const resultPath = path.resolve(args.totpResult || DEFAULT_TOTP_RESULT);
       const rl = readline.createInterface({ input, output });
       try {
-        const client = new ProtocolClient({ verbose: args.verbose, transport });
-        const email = args.email || (await ask(rl, "Email: "));
+        let client = null;
+        let web = null;
+        let email = args.email || "";
+        const checkpointPath = args.resumeCheckpoint ? path.resolve(args.resumeCheckpoint) : null;
+        if (checkpointPath) {
+          try {
+            const checkpoint = await readProtocolCheckpoint(checkpointPath);
+            if (email && checkpoint.email.toLowerCase() !== email.toLowerCase()) {
+              throw new Error("CHECKPOINT_INVALID: checkpoint email does not match the requested account");
+            }
+            email = checkpoint.email;
+            client = new ProtocolClient({
+              verbose: args.verbose,
+              jar: CookieJar.fromJSON(checkpoint.cookies),
+              transport,
+            });
+            web = checkpoint.web || null;
+            console.log(`[2fa] Reusing verified login checkpoint from ${checkpoint.stage}.`);
+          } catch (error) {
+            if (error?.code !== "ENOENT") {
+              console.log(`[2fa] Saved login checkpoint cannot be reused: ${error.message}`);
+            }
+            client = null;
+          }
+        }
+        email = email || (await ask(rl, "Email: "));
         if (!email) throw new Error("Email is required");
-        console.log("[1/3] Sign in to verify the account before setting 2FA");
-        const web = await loginChatgptWeb(client, {
-          chatgptBase,
-          authBase,
-          email,
-          rl,
-          password: process.env.CHATGPT_LOGIN_PASSWORD || "",
-          totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
-        });
+        if (client) {
+          try {
+            await setupChatgptTotp(client, {
+              chatgptBase,
+              email,
+              rl,
+              deviceId: web?.deviceId || client.jar.value("oai-did", `${chatgptBase}/`) || crypto.randomUUID(),
+              resultPath,
+            });
+          } catch (error) {
+            if (!isExpiredCheckpointError(error)) throw error;
+            console.log("[2fa] Saved login state expired; falling back to a fresh account login.");
+            client = null;
+          }
+        }
+        if (!client) {
+          client = new ProtocolClient({ verbose: args.verbose, transport });
+          console.log("[1/3] Sign in to verify the account before setting 2FA");
+          web = await loginChatgptWeb(client, {
+            chatgptBase,
+            authBase,
+            email,
+            rl,
+            password: process.env.CHATGPT_LOGIN_PASSWORD || "",
+            totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
+          });
+          await setupChatgptTotp(client, {
+            chatgptBase,
+            email,
+            rl,
+            deviceId: web.deviceId,
+            resultPath,
+          });
+        }
         console.log(
           client.jar.has("__Secure-next-auth.session-token")
             ? "[ok] ChatGPT web session cookie received"
             : "[warn] ChatGPT session cookie not found; continue with auth cookies",
         );
-        await setupChatgptTotp(client, {
-          chatgptBase,
-          email,
-          rl,
-          deviceId: web.deviceId,
-          resultPath,
-        });
+        if (checkpointPath) {
+          const saveCheckpoint = createCheckpointWriter(checkpointPath, {
+            client,
+            email,
+            chatgptBase,
+            authBase,
+            web,
+          });
+          await saveCheckpoint("email_verified", {});
+          console.log("[checkpoint] Updated verified login state after setting 2FA.");
+        }
       } finally {
         rl.close();
       }
@@ -509,6 +654,152 @@ async function run() {
     }
   } finally {
     await transport.close();
+  }
+}
+
+async function addChatgptPassword(client, {
+  chatgptBase,
+  authBase,
+  email,
+  rl,
+  deviceId,
+  password,
+  resultPath,
+}) {
+  const { data: csrf } = await client.getJson("GET", `${chatgptBase}/api/auth/csrf`, {
+    referer: `${chatgptBase}/`,
+  });
+  if (!csrf.csrfToken) throw new Error("ADD_PASSWORD_CSRF_MISSING: ChatGPT did not return a CSRF token");
+
+  const signinUrl = `${chatgptBase}/api/auth/signin/openai?${new URLSearchParams({
+    connection: "password",
+    login_hint: email,
+    reauth: "password",
+    post_login_add_password: "true",
+    max_age: "0",
+    "ext-oai-did": deviceId,
+  })}`;
+  const { data: signin } = await client.getJson("POST", signinUrl, {
+    origin: chatgptBase,
+    referer: `${chatgptBase}/`,
+    form: {
+      callbackUrl: `${chatgptBase}/`,
+      csrfToken: csrf.csrfToken,
+      json: "true",
+    },
+  });
+  if (!signin.url) throw new Error("ADD_PASSWORD_AUTHORIZE_URL_MISSING: signin/openai did not return a URL");
+
+  const authPage = await client.follow(signin.url, { referer: `${chatgptBase}/` });
+  let passwordPageUrl = authPage.finalUrl;
+  if (isEmailVerificationPage(authPage.finalUrl)) {
+    console.log("[3/4] Add-password email verification reached. Enter code, or type r to resend.");
+    const verified = await verifyAddPasswordEmailOtp(client, {
+      authBase,
+      rl,
+      deviceId,
+      referer: authPage.finalUrl,
+    });
+    passwordPageUrl = getContinueUrl(verified) || `${authBase}/reset-password/new-password`;
+    if (!isNewPasswordPage(passwordPageUrl)) {
+      throw new Error("ADD_PASSWORD_FLOW_INVALID: Email verification did not advance to the new-password page");
+    }
+    await client.follow(passwordPageUrl, { referer: authPage.finalUrl });
+  } else if (!isNewPasswordPage(authPage.finalUrl)) {
+    if (isAuthLoginPage(authPage.finalUrl)) {
+      throw new Error("ADD_PASSWORD_LOGIN_REQUIRED: Saved login session has expired");
+    }
+    let pathname = authPage.finalUrl;
+    try {
+      pathname = new URL(authPage.finalUrl).pathname;
+    } catch {}
+    throw new Error(`ADD_PASSWORD_PAGE_INVALID: Expected email verification, received ${pathname}`);
+  }
+
+  console.log("[4/4] Submit the new account password");
+  const sentinelHeaders = await createSentinelHeaders(client, {
+    authBase,
+    deviceId,
+    flow: "password_reset",
+  });
+  const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/password/add", {
+    password,
+  }, {
+    referer: passwordPageUrl,
+    headers: sentinelHeaders,
+  });
+  if (data?.page?.type !== "external_url" && !getContinueUrl(data)) {
+    throw new Error("ADD_PASSWORD_RESULT_INVALID: Password submission did not complete the flow");
+  }
+
+  await writePrivateJson(resultPath, {
+    version: 1,
+    email,
+    password,
+    added_at: new Date().toISOString(),
+  });
+  console.log("[ok] Account password added and saved securely");
+}
+
+async function verifyAddPasswordEmailOtp(client, { authBase, rl, deviceId, referer }) {
+  for (;;) {
+    const emailCode = await askEmailOtp(rl, client, authBase);
+    try {
+      const sentinelHeaders = await createSentinelHeaders(client, {
+        authBase,
+        deviceId,
+        flow: "email_otp_validate",
+      });
+      const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/email-otp/validate", {
+        code: emailCode,
+      }, {
+        referer,
+        headers: sentinelHeaders,
+      });
+      return data;
+    } catch (error) {
+      if (!isRejectedEmailOtpError(error)) throw error;
+      console.log("[email-otp-rejected] 邮箱验证码错误，请重新输入，或输入 r 重新发送。");
+    }
+  }
+}
+
+async function createSentinelHeaders(client, { authBase, deviceId, flow }) {
+  console.log(`[sentinel] Requesting a fresh security token for ${flow}.`);
+  const tokens = await fetchSentinelTokens({
+    flow,
+    deviceID: deviceId,
+    fetch: (url, options) => client.rawFetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+    }),
+    reqEndpoint: sentinelRequirementsEndpoint(authBase),
+    deviceProfile: browserIdentityForTransport(client.transport),
+    sendClientHints: !client.transport?.enabled,
+  });
+  return {
+    "openai-sentinel-token": tokens.token,
+    ...(tokens.soToken ? { "openai-sentinel-so-token": tokens.soToken } : {}),
+  };
+}
+
+function validateNewAccountPassword(value) {
+  const password = String(value || "");
+  if (password.length < 12 || password.length > 128) {
+    throw new Error("CHATGPT_NEW_PASSWORD must contain 12 to 128 characters");
+  }
+  if (!/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/\d/.test(password) || !/[^A-Za-z0-9]/.test(password)) {
+    throw new Error("CHATGPT_NEW_PASSWORD must include uppercase, lowercase, number, and symbol characters");
+  }
+  return password;
+}
+
+function isNewPasswordPage(value) {
+  try {
+    return new URL(value).pathname === "/reset-password/new-password";
+  } catch {
+    return false;
   }
 }
 
@@ -1826,7 +2117,7 @@ async function removeProtocolCheckpoint(checkpointPath) {
 }
 
 function isExpiredCheckpointError(error) {
-  return /CHECKPOINT_INVALID|SESSION_SELECTION_INVALID|CODEX_AUTH_LOGIN_REQUIRED|invalid_state|no longer valid|session.+(?:invalid|expired)|expired.+session/i.test(
+  return /CHECKPOINT_INVALID|SESSION_SELECTION_INVALID|CODEX_AUTH_LOGIN_REQUIRED|TOTP_ACCESS_TOKEN_MISSING|invalid_state|no longer valid|session.+(?:invalid|expired)|expired.+session/i.test(
     String(error?.message || ""),
   );
 }
@@ -1860,6 +2151,9 @@ function parseArgs(argv) {
     else if (item === "--debug-auth") args.debugAuth = true;
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
+    else if (item === "--add-password") args.addPassword = true;
+    else if (item.startsWith("--password-add-result=")) args.passwordAddResult = item.slice("--password-add-result=".length);
+    else if (item === "--password-add-result") args.passwordAddResult = argv[++i];
     else if (item.startsWith("--totp-result=")) args.totpResult = item.slice("--totp-result=".length);
     else if (item === "--totp-result") args.totpResult = argv[++i];
     else if (item.startsWith("--email=")) args.email = item.slice("--email=".length);
@@ -2000,6 +2294,8 @@ Options:
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
+  --add-password                  Sign in and add a password to a passwordless account.
+  --password-add-result <file>    Private add-password result. Default: ${DEFAULT_PASSWORD_ADD_RESULT}
   --out <file>                    Output JSON path. Default: ${DEFAULT_OUT}
   --sub2api-out <file>            sub2api import JSON path. Default: ${DEFAULT_SUB2API_OUT}
   --output-mode <mode>            both, session, or sub2api. Default: both
@@ -2022,8 +2318,9 @@ Options:
   --debug-auth                    Print auth cookie/page state diagnostics.
 
 Notes:
-  Set CHATGPT_LOGIN_PASSWORD for password login and CHATGPT_TOTP_SECRET for automatic
-  6-digit TOTP generation. These values are read from the environment and are not logged.
+  Set CHATGPT_LOGIN_PASSWORD for password login, CHATGPT_TOTP_SECRET for automatic
+  6-digit TOTP generation, and CHATGPT_NEW_PASSWORD for --add-password. These values
+  are read from the environment and are not logged.
   Existing phone-bound accounts are supported. If session/select returns workspaces,
   the script skips add-phone/send and goes directly to workspace selection.
   OAuth code can only be exchanged once; rerun login if token exchange fails with invalid_grant.

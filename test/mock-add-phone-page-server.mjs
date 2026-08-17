@@ -12,6 +12,7 @@ const idTokenPayload = Buffer.from(JSON.stringify({
 })).toString("base64url");
 
 let lastLoginHint = "";
+let addPasswordMode = false;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
@@ -28,6 +29,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/auth/csrf") return sendJson(res, 200, { csrfToken: "mock-csrf" });
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
     lastLoginHint = url.searchParams.get("login_hint") || "";
+    addPasswordMode = url.searchParams.get("post_login_add_password") === "true";
     return sendJson(res, 200, { url: `${publicBase}/api/accounts/authorize` });
   }
   if (req.method === "GET" && url.pathname === "/api/accounts/authorize") {
@@ -71,6 +73,18 @@ const server = http.createServer(async (req, res) => {
         "oai-client-auth-session": { email_verified: true },
       });
     }
+    if (addPasswordMode) {
+      const sentinel = parseJson(req.headers["openai-sentinel-token"]);
+      if (sentinel?.flow !== "email_otp_validate" || req.headers["openai-sentinel-so-token"] !== "mock-so-token") {
+        return sendJson(res, 400, { error: { message: "missing add-password email OTP sentinel token" } });
+      }
+      return sendJson(res, 200, {
+        continue_url: `${publicBase}/reset-password/new-password`,
+        method: "GET",
+        page: { type: "reset_password_new_password" },
+        "oai-client-auth-session": { email_verified: true, post_login_add_password: true },
+      });
+    }
     return sendJson(res, 200, {
       continue_url: `${publicBase}/web-callback`,
       "oai-client-auth-session": { email_verified: true },
@@ -84,13 +98,36 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/backend-api/sentinel/req") {
     const payload = JSON.parse(body || "{}");
-    if (payload.flow !== "oauth_create_account" || typeof payload.id !== "string" || !payload.id) {
+    if (!["oauth_create_account", "email_otp_validate", "password_reset"].includes(payload.flow) || typeof payload.id !== "string" || !payload.id) {
       return sendJson(res, 400, { error: { message: "invalid sentinel request" } });
     }
     return sendJson(res, 200, {
       token: "mock-sentinel-challenge",
+      so: "mock-so-token",
       proofofwork: { required: false },
       turnstile: { required: false },
+    });
+  }
+  if (req.method === "GET" && url.pathname === "/reset-password/new-password") {
+    return sendText(res, 200, "<html><title>Add password</title></html>", "text/html");
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/password/add") {
+    const payload = parseJson(body);
+    const sentinel = parseJson(req.headers["openai-sentinel-token"]);
+    if (
+      !addPasswordMode
+      || sentinel?.flow !== "password_reset"
+      || sentinel?.c !== "mock-sentinel-challenge"
+      || typeof payload?.password !== "string"
+      || payload.password.length < 12
+    ) {
+      return sendJson(res, 400, { error: { message: "invalid add-password submission" } });
+    }
+    addPasswordMode = false;
+    return sendJson(res, 200, {
+      continue_url: `${publicBase}/web-callback`,
+      method: "GET",
+      page: { type: "external_url" },
     });
   }
   if (req.method === "POST" && url.pathname === "/api/accounts/create_account") {
