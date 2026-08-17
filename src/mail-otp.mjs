@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-const OTP_PATTERN = /(?:^|\s)(\d{6})(?=$|\s)/g;
+const OTP_PATTERN = /(?:^|\D)(\d{6})(?!\d)/g;
 const CONTENT_KEY_PATTERN = /(?:body|content|text|html|message|subject|snippet|preview|payload|data|mail)/i;
 const CODE_KEY_PATTERN = /(?:code|otp|verification|verify|验证码|校验码)/i;
 const CODE_CONTEXT_PATTERN = /(?:openai|chatgpt|verification|verify|security\s*code|one[- ]time|\botp\b|验证码|校验码|一次性)/i;

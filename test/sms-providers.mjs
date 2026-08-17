@@ -114,6 +114,25 @@ const customOrder = await customClient.getNumber();
 assert.equal(customOrder.number, "+8613822222222");
 assert.deepEqual(await customClient.getSms(customOrder.requestId), { status: "received", code: "654321" });
 assert.equal(await customClient.release(customOrder.requestId), true);
+
+let customJsonChecks = 0;
+const customJsonClient = createCustomSmsClient({
+  entries: "+8613912345678----https://sms.example/json-code",
+  fetchImpl: async () => {
+    customJsonChecks += 1;
+    return new Response(JSON.stringify({
+      code: 1,
+      msg: "ok",
+      data: {
+        code: "您的验证代码是：766448",
+        code_time: customJsonChecks === 1 ? "2026-08-17 23:30:00" : "2026-08-17 23:37:03",
+        expired_date: "2026-08-25 00:00:00",
+      },
+    }), { status: 200 });
+  },
+});
+const customJsonOrder = await customJsonClient.getNumber();
+assert.deepEqual(await customJsonClient.getSms(customJsonOrder.requestId), { status: "received", code: "766448" });
 assert.throws(() => createSmsProvider("unknown", {}), /受支持/);
 
 console.log("sms provider tests passed");
