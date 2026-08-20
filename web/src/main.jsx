@@ -1167,6 +1167,18 @@ function App() {
                   {sub2apiProxies.map((proxy) => <option key={proxy.id} value={String(proxy.id)}>{formatSub2ApiProxy(proxy)}</option>)}
                 </select>
               </label>
+              <label className="settings-field wide-settings-field">
+                <span>Codex 指纹收敛</span>
+                <select
+                  value={sub2apiSettingsDraft.codexFingerprintMode}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, codexFingerprintMode: event.target.value }))}
+                >
+                  <option value="off">关闭（透传）</option>
+                  <option value="device">仅设备</option>
+                  <option value="session">设备+会话（推荐）</option>
+                  <option value="full">完全收敛</option>
+                </select>
+              </label>
               <label className="settings-field">
                 <span>并发数</span>
                 <input
@@ -1215,7 +1227,7 @@ function App() {
                 />
               </label>
             </div>
-            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。</div>
+            <div className="dialog-hint">分组为空时，上传使用 Sub2API 默认号池，监控检查全部 OpenAI 账号；选择分组后只监控这些号池。Codex 指纹收敛会写入每个上传或巡检更新的 OpenAI OAuth 账号。</div>
             {features.sub2apiMonitor && sub2apiMonitorStatus.configured && (
               <div className={`sub2api-monitor-status ${sub2apiMonitorStatus.lastError ? "error" : ""}`}>
                 <ShieldCheck size={15} />
@@ -1966,6 +1978,9 @@ function normalizeSub2ApiSettings(value) {
     loadFactor: String(stored.loadFactor ?? ""),
     priority: String(stored.priority ?? ""),
     modelWhitelist: String(stored.modelWhitelist || ""),
+    codexFingerprintMode: ["off", "device", "session", "full"].includes(stored.codexFingerprintMode)
+      ? stored.codexFingerprintMode
+      : "session",
     monitorEnabled: stored.monitorEnabled === true,
   };
 }

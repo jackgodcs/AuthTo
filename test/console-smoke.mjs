@@ -556,7 +556,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id, "missing-job-is-filtered-by-selection-limit"],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full" },
     }),
   });
   assert.equal(uploadResponse.status, 404);
@@ -566,7 +566,7 @@ try {
     headers,
     body: JSON.stringify({
       ids: [profileJob.id],
-      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini" },
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", groupIds: ["7", "8"], proxyId: "3", concurrency: "10", loadFactor: "100", priority: "1", modelWhitelist: "gpt-5\ngpt-5-mini", codexFingerprintMode: "full" },
     }),
   });
   const validUploadText = await validUploadResponse.text();
@@ -581,8 +581,41 @@ try {
   assert.equal(uploadedAccounts[0].priority, 1);
   assert.equal(uploadedAccounts[0].status, "active");
   assert.equal(uploadedAccounts[0].schedulable, true);
+  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "full");
   assert.deepEqual(uploadedAccounts[0].credentials.model_mapping, { "gpt-5": "gpt-5", "gpt-5-mini": "gpt-5-mini" });
   assert.equal(uploadedAccounts[0].credentials.email, "account-profile@example.com");
+
+  const legacyUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key" },
+    }),
+  });
+  assert.equal(legacyUploadResponse.status, 200, await legacyUploadResponse.text());
+  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "session", "旧配置未填写时应使用 Sub2API 的推荐默认值");
+
+  const disabledFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", codexFingerprintMode: "off" },
+    }),
+  });
+  assert.equal(disabledFingerprintUploadResponse.status, 200, await disabledFingerprintUploadResponse.text());
+  assert.equal(uploadedAccounts[0].extra.codex_fingerprint_mode, "off", "关闭模式必须显式写入，不能退回默认值");
+
+  const invalidFingerprintUploadResponse = await fetch(`${baseUrl}/api/sub2api/upload`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ids: [profileJob.id],
+      config: { baseUrl: sub2apiUrl, adminApiKey: "test-admin-key", codexFingerprintMode: "invalid" },
+    }),
+  });
+  assert.equal(invalidFingerprintUploadResponse.status, 400, await invalidFingerprintUploadResponse.text());
 
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [
@@ -728,6 +761,7 @@ try {
     baseUrl: sub2apiUrl,
     adminApiKey: "test-admin-key",
     groupIds: ["7"],
+    codexFingerprintMode: "device",
   };
   const monitorSaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
     method: "POST",
@@ -748,6 +782,7 @@ try {
     status: "error",
     error_message: "refresh token expired",
     credentials: { email: "password-mail@example.com", model_mapping: { "gpt-5": "gpt-5" } },
+    extra: { existing_setting: "preserved", codex_fingerprint_mode: "off" },
     group_ids: [7],
   }];
   failClearOnce.add(91);
@@ -784,6 +819,10 @@ try {
   assert.equal(scheduledRemoteAccounts.get(91), true);
   assert.match(updatedRemoteAccounts.get(91).credentials.access_token, /^test-access-password-mail@example\.com$/);
   assert.deepEqual(updatedRemoteAccounts.get(91).credentials.model_mapping, { "gpt-5": "gpt-5" });
+  assert.deepEqual(updatedRemoteAccounts.get(91).extra, {
+    existing_setting: "preserved",
+    codex_fingerprint_mode: "device",
+  });
 
   const bannedCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",

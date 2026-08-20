@@ -419,12 +419,17 @@ async function handleApi(req, res, requestUrl) {
     const accounts = payload.accounts.map((account) => {
       const { proxy_key: _proxyKey, ...accountData } = account;
       const credentials = { ...(account.credentials || {}) };
+      const extra = {
+        ...(account.extra && typeof account.extra === "object" ? account.extra : {}),
+        codex_fingerprint_mode: config.codexFingerprintMode,
+      };
       if (config.modelWhitelist.length) {
         credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
       }
       return {
         ...accountData,
         credentials,
+        extra,
         status: "active",
         schedulable: true,
         group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
@@ -1493,7 +1498,7 @@ function consumeOutput(job, rawText) {
 
   const sessionErrorLines = [...scan.matchAll(/^\[error\]\s*([^\r\n]+)/gim)];
   const latestSessionError = sessionErrorLines.at(-1)?.[1] || "";
-  if (/Your sign-in session is no longer valid|["']code["']\s*:\s*["']invalid_state["']/i.test(latestSessionError)) {
+  if (/Your sign-in session is no longer valid|["']code["']\s*:\s*["'](?:invalid_state|invalid_auth_step)["']|Invalid authorization step/i.test(latestSessionError)) {
     if (job.runMode === "totp_setup") {
       job.totpSetupError = "设置 2FA 时登录状态失效，请稍后重试";
       touch(job);
@@ -2352,7 +2357,11 @@ function normalizeSub2ApiConfig(value) {
   const loadFactor = parseOptionalSub2ApiInteger(config.loadFactor, "负载因子", 0, 10000);
   const priority = parseOptionalSub2ApiInteger(config.priority, "优先级", 0, 10000);
   const modelWhitelist = parseSub2ApiModelWhitelist(config.modelWhitelist);
-  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist };
+  const codexFingerprintMode = String(config.codexFingerprintMode || "session").trim().toLowerCase();
+  if (!["off", "device", "session", "full"].includes(codexFingerprintMode)) {
+    throw httpError(400, "Codex 指纹收敛模式无效");
+  }
+  return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, codexFingerprintMode };
 }
 
 function readDurationEnv(name, fallback, minimum) {
@@ -2475,6 +2484,7 @@ async function persistSub2ApiMonitorConfiguration() {
       loadFactor: sub2ApiMonitorConfig.loadFactor,
       priority: sub2ApiMonitorConfig.priority,
       modelWhitelist: sub2ApiMonitorConfig.modelWhitelist,
+      codexFingerprintMode: sub2ApiMonitorConfig.codexFingerprintMode,
     },
     state: {
       lastCheckAt: sub2ApiMonitorState.lastCheckAt,
@@ -2795,9 +2805,13 @@ async function performSub2ApiAutoRepairSuccess(job) {
         ...(remoteAccount.credentials && typeof remoteAccount.credentials === "object" ? remoteAccount.credentials : {}),
         ...localAccount.credentials,
       };
+      const extra = {
+        ...(remoteAccount.extra && typeof remoteAccount.extra === "object" ? remoteAccount.extra : {}),
+        codex_fingerprint_mode: operation.config.codexFingerprintMode,
+      };
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}`, {
         method: "PUT",
-        body: JSON.stringify({ credentials }),
+        body: JSON.stringify({ credentials, extra }),
       });
       await requestSub2Api(operation.config, `/api/v1/admin/accounts/${accountId}/clear-error`, {
         method: "POST",

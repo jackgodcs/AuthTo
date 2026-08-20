@@ -191,6 +191,15 @@ const server = http.createServer(async (req, res) => {
     if (!/\badd_phone_ready=1\b/.test(req.headers.cookie || "")) {
       return sendJson(res, 409, { error: { message: "missing add-phone page state", code: "invalid_state" } });
     }
+    if (lastLoginHint === "phone-change-invalid-step@example.com" && payload.phone_number === "+60122222222") {
+      return sendJson(res, 400, {
+        error: {
+          message: "Invalid authorization step.",
+          code: "invalid_auth_step",
+          redirect_uri: `${publicBase}/log-in`,
+        },
+      });
+    }
     if ("channel" in payload) {
       return sendJson(res, 400, { error: { message: "unexpected channel field" } });
     }

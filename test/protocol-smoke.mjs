@@ -211,6 +211,36 @@ try {
   assert.doesNotMatch(phoneInvalidStateLogin.output, /\[proxy-risk-retry\]/);
   assert.equal(await fileExists(phoneInvalidStateOutputPath), true);
 
+  const phoneChangeInvalidStepOutputPath = path.join(tempRoot, "phone-change-invalid-step-sub2api.json");
+  const phoneChangeInvalidStepLogin = await runNode([
+    path.join(projectRoot, "src", "protocol-login.mjs"),
+    "--email",
+    "phone-change-invalid-step@example.com",
+    "--chatgpt-base",
+    baseUrl,
+    "--auth-base",
+    baseUrl,
+    "--output-mode",
+    "sub2api",
+    "--sub2api-out",
+    phoneChangeInvalidStepOutputPath,
+    "--verbose",
+  ], [
+    { pattern: /Email OTP \(r=resend/, value: "123456" },
+    { pattern: /Phone number, E\.164 format/, value: "+60111111111" },
+    { pattern: /Phone OTP \(r=resend/, value: "p" },
+    { pattern: /Phone number, E\.164 format/, value: "+60122222222" },
+  ]);
+  assert.equal(phoneChangeInvalidStepLogin.code, 1, processFailure("invalid phone authorization step", phoneChangeInvalidStepLogin));
+  assert.match(phoneChangeInvalidStepLogin.output, /invalid_auth_step/);
+  assert.doesNotMatch(phoneChangeInvalidStepLogin.output, /Enter another phone number/);
+  assert.equal(
+    (phoneChangeInvalidStepLogin.output.match(/> POST .*\/api\/accounts\/add-phone\/send/g) || []).length,
+    3,
+    "the first phone uses the channel fallback, while invalid_auth_step must stop after one request",
+  );
+  assert.equal(await fileExists(phoneChangeInvalidStepOutputPath), false);
+
   const unexpectedPageOutputPath = path.join(tempRoot, "unexpected-page-sub2api.json");
   const unexpectedPageLogin = await runNode([
     path.join(projectRoot, "src", "protocol-login.mjs"),

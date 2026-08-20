@@ -1018,6 +1018,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     authenticated = await verifyPassword(client, {
       authBase,
       rl,
+      deviceId,
       password,
       referer: authPage.finalUrl,
     });
@@ -1045,6 +1046,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
   authenticated = await completeTotpMfaIfNeeded(client, {
     authBase,
     rl,
+    deviceId,
     payload: authenticated,
     totpSecret,
     referer: authPage.finalUrl,
@@ -1084,26 +1086,31 @@ async function selectChatgptLoginWorkspaceIfNeeded(client, { authBase, payload }
   return data;
 }
 
-async function verifyPassword(client, { authBase, rl, password, referer }) {
+async function verifyPassword(client, { authBase, rl, deviceId, password, referer }) {
   let nextPassword = password;
   for (;;) {
     const value = nextPassword || (await ask(rl, "Password (q=quit): "));
     nextPassword = "";
     if (!value || value.toLowerCase() === "q") throw new Error("Stopped before password validation");
     try {
+      const sentinelHeaders = await createSentinelHeaders(client, {
+        authBase,
+        deviceId,
+        flow: "password_verify",
+      });
       const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/password/verify", {
         password: value,
-      }, { referer });
+      }, { referer, headers: sentinelHeaders });
       console.log("[ok] Password accepted");
       return data;
     } catch (error) {
-      if (!/HTTP 401|invalid.*password|incorrect.*password/i.test(String(error?.message || ""))) throw error;
+      if (!isRejectedPasswordError(error)) throw error;
       console.log("[warn] Password was rejected. Enter it again, or q to quit.");
     }
   }
 }
 
-async function completeTotpMfaIfNeeded(client, { authBase, rl, payload, totpSecret, referer }) {
+async function completeTotpMfaIfNeeded(client, { authBase, rl, deviceId, payload, totpSecret, referer }) {
   if (!isMfaChallengePayload(payload)) return payload;
   const factor = pickTotpFactor(payload);
   if (!factor?.id) throw new Error("2FA is required, but the response does not contain a TOTP factor ID");
@@ -1127,15 +1134,20 @@ async function completeTotpMfaIfNeeded(client, { authBase, rl, payload, totpSecr
   const challengeUrl = getContinueUrl(payload) || `${authBase}/mfa-challenge/${factor.id}`;
   for (;;) {
     try {
+      const sentinelHeaders = await createSentinelHeaders(client, {
+        authBase,
+        deviceId,
+        flow: "password_verify",
+      });
       const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/mfa/verify", {
         type: "totp",
         id: factor.id,
         code,
-      }, { referer: challengeUrl });
+      }, { referer: challengeUrl, headers: sentinelHeaders });
       console.log("[ok] 2FA verification accepted");
       return data;
     } catch (error) {
-      if (!/HTTP (400|401)|invalid.*(?:totp|code)|incorrect.*code/i.test(String(error?.message || ""))) throw error;
+      if (!isRejectedTotpError(error)) throw error;
       console.log(
         generatedFromSecret
           ? "[warn] The code generated from the configured 2FA key was rejected; enter a current code manually."
@@ -1145,6 +1157,18 @@ async function completeTotpMfaIfNeeded(client, { authBase, rl, payload, totpSecr
       code = await askTotpOtp(rl);
     }
   }
+}
+
+function isRejectedPasswordError(error) {
+  return /(?:invalid|incorrect|wrong)[_\s-]*password|password[_\s-]*(?:invalid|incorrect|wrong)/i.test(
+    String(error?.message || ""),
+  );
+}
+
+function isRejectedTotpError(error) {
+  return /(?:invalid|incorrect|wrong)[_\s-]*(?:totp|otp|code)|(?:totp|otp|code)[_\s-]*(?:invalid|incorrect|wrong)/i.test(
+    String(error?.message || ""),
+  );
 }
 
 function isPasswordLoginPage(url) {
@@ -1508,6 +1532,9 @@ async function bindPhoneIfNeeded(client, options, current, addPhoneUrl) {
 
       const sent = await trySendPhoneOtp(client, options.authBase, phone, addPhoneReferer);
       if (!sent.ok) {
+        if (isInvalidPhoneAuthorizationStepError(sent.message)) {
+          throw new Error(sent.message);
+        }
         console.log(`[warn] Could not send SMS to ${phone}: ${sent.message}`);
         console.log("[info] Enter another phone number, or q to quit.");
         continue;
@@ -2128,6 +2155,14 @@ function shouldRetryAddPhoneWithoutChannel(message) {
     text.includes("/api/accounts/add-phone/send") &&
     /HTTP (400|409)/i.test(text) &&
     /channel|invalid_state|no longer valid|session/i.test(text)
+  );
+}
+
+function isInvalidPhoneAuthorizationStepError(message) {
+  const text = String(message || "");
+  return (
+    text.includes("/api/accounts/add-phone/send")
+    && /(?:invalid_auth_step|Invalid authorization step)/i.test(text)
   );
 }
 

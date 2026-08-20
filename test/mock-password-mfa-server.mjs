@@ -14,6 +14,7 @@ let chatgptLoginComplete = false;
 let workspaceSelectionCount = 0;
 let selectedEmail = "mfa-test@example.com";
 let totpEnabled = false;
+let passwordVerifySentinelCount = 0;
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || "/", base);
@@ -35,7 +36,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/auth/providers") return sendJson(res, 200, {});
   if (req.method === "GET" && url.pathname === "/api/auth/csrf") return sendJson(res, 200, { csrfToken: "mock-csrf" });
   if (req.method === "GET" && url.pathname === "/__test/state") {
-    return sendJson(res, 200, { chatgptLoginComplete, chatgptWorkspaceSelected, workspaceSelectionCount });
+    return sendJson(res, 200, {
+      chatgptLoginComplete,
+      chatgptWorkspaceSelected,
+      workspaceSelectionCount,
+      passwordVerifySentinelCount,
+    });
   }
   if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
     chatgptWorkspaceSelected = false;
@@ -50,9 +56,21 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && ["/log-in/password", "/email-verification"].includes(url.pathname)) {
     return sendText(res, 200, `<html><title>${url.pathname === "/log-in/password" ? "Enter password" : "Check inbox"}</title></html>`, "text/html");
   }
+  if (req.method === "POST" && url.pathname === "/backend-api/sentinel/req") {
+    const payload = parseJson(body);
+    if (payload.flow !== "password_verify" || typeof payload.id !== "string" || !payload.id) {
+      return sendJson(res, 400, { error: { message: "invalid sentinel request" } });
+    }
+    passwordVerifySentinelCount += 1;
+    return sendJson(res, 200, {
+      token: "mock-password-verify-challenge",
+      proofofwork: { required: false },
+      turnstile: { required: false },
+    });
+  }
   if (req.method === "POST" && url.pathname === "/api/accounts/password/verify") {
     const payload = parseJson(body);
-    if (payload.password !== password || Object.keys(payload).length !== 1) {
+    if (!hasPasswordVerifySentinel(req) || payload.password !== password || Object.keys(payload).length !== 1) {
       return sendJson(res, 401, { error: { message: "invalid password" } });
     }
     if (selectedEmail === "setup-totp@example.com") return sendJson(res, 200, { continue_url: `${base}/web-callback`, page: { type: "external_url" } });
@@ -102,7 +120,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/api/accounts/mfa/verify") {
     const payload = parseJson(body);
     const acceptedCodes = [-1, 0, 1].map((offset) => generateTotp(totpSecret, Date.now() + offset * 30_000));
-    if (payload.type !== "totp" || payload.id !== factorId || !acceptedCodes.includes(payload.code)) {
+    if (!hasPasswordVerifySentinel(req) || payload.type !== "totp" || payload.id !== factorId || !acceptedCodes.includes(payload.code)) {
       return sendJson(res, 400, { error: { message: "invalid totp" } });
     }
     if (selectedEmail === "skip-workspace@example.com") {
@@ -227,6 +245,14 @@ function generateTotp(secret, timestamp) {
 
 function parseJson(value) {
   try { return JSON.parse(value || "{}"); } catch { return {}; }
+}
+
+function hasPasswordVerifySentinel(req) {
+  const sentinel = parseJson(req.headers["openai-sentinel-token"]);
+  return sentinel.flow === "password_verify"
+    && sentinel.c === "mock-password-verify-challenge"
+    && typeof sentinel.id === "string"
+    && Boolean(sentinel.id);
 }
 
 function redirect(res, location) {

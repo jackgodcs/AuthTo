@@ -60,6 +60,7 @@ try {
   const state = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
   assert.equal(state.chatgptWorkspaceSelected, true);
   assert.equal(state.workspaceSelectionCount, 2);
+  assert.equal(state.passwordVerifySentinelCount, 2);
 
   const exported = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(exported.type, "sub2api-data");
