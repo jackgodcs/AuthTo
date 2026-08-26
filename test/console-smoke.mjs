@@ -702,6 +702,7 @@ try {
     `space-group@example.org  grouped-password  JBSW  Y3DP  EHPK  3PXP`,
     `base32-password@example.org----ABCDEFGHIJKLMNOP----${mailApiUrl}`,
     "biers.ellipse.case@icloud.com----aBCD2345eFGH6723----JBSWY3DPEHPK3PXPNB2W45DFOIZAQWER",
+    "dot-password@example.com----r7.UjRUWVVS----JBSWY3DPEHPK3PXP",
   ];
   const batchResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
     method: "POST",
@@ -711,7 +712,7 @@ try {
   const batchText = await batchResponse.text();
   assert.equal(batchResponse.status, 201, batchText);
   const batch = JSON.parse(batchText);
-  assert.equal(batch.jobs.length, 12);
+  assert.equal(batch.jobs.length, 13);
   batch.jobs
     .filter((item) => !["manual-totp@example.net", "reverse.api-order@example.xyz"].includes(item.email))
     .forEach((item) => assert.equal(item.loginMode, "password"));
@@ -737,6 +738,8 @@ try {
   assert.equal(batch.jobs.find((item) => item.email === "base32-password@example.org").loginMode, "password");
   assert.equal(batch.jobs.find((item) => item.email === "biers.ellipse.case@icloud.com").hasTotpKey, true);
   assert.equal(batch.jobs.find((item) => item.email === "biers.ellipse.case@icloud.com").loginMode, "password");
+  assert.equal(batch.jobs.find((item) => item.email === "dot-password@example.com").hasTotpKey, true);
+  assert.equal(batch.jobs.find((item) => item.email === "dot-password@example.com").loginMode, "password");
   await Promise.all(batch.jobs.map((item) => waitForJob(headers, item.id, (value) => value.status === "completed")));
 
   const sourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
@@ -759,6 +762,7 @@ try {
     `user---tag@example.com----hyphen-email-password`,
     `base32-password@example.org----ABCDEFGHIJKLMNOP----${mailApiUrl}`,
     "biers.ellipse.case@icloud.com----aBCD2345eFGH6723----JBSWY3DPEHPK3PXPNB2W45DFOIZAQWER",
+    "dot-password@example.com----r7.UjRUWVVS----JBSWY3DPEHPK3PXP",
   ].sort());
 
   const ambiguousBatchLines = [
@@ -1023,7 +1027,7 @@ try {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 25);
+  assert.equal(deleted.deleted, 26);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);

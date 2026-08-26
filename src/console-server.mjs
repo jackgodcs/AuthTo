@@ -4149,7 +4149,10 @@ function findLongestEmailRange(split) {
   if (!candidates.length) return null;
   const leadingCandidates = candidates.filter((candidate) => candidate.start === 0);
   const standaloneCandidates = candidates.filter((candidate) => candidate.start === candidate.end);
-  const preferred = leadingCandidates.length ? leadingCandidates : standaloneCandidates;
+  // A complete segment is a stronger signal than a longer range. Otherwise a
+  // dotted password can be appended to a valid email and still look like a
+  // valid domain (for example, email----r7.UjRUWVVS).
+  const preferred = standaloneCandidates.length ? standaloneCandidates : leadingCandidates;
   if (!preferred.length) return null;
   preferred.sort((left, right) => (
     right.value.length - left.value.length
