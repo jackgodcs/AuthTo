@@ -60,7 +60,7 @@ try {
   const state = await fetch(`${baseUrl}/__test/state`).then((response) => response.json());
   assert.equal(state.chatgptWorkspaceSelected, true);
   assert.equal(state.workspaceSelectionCount, 2);
-  assert.equal(state.passwordVerifySentinelCount, 2);
+  assert.equal(state.passwordVerifySentinelCount, 0, "test tokens should not call the legacy requirements endpoint");
 
   const exported = JSON.parse(await fs.readFile(outputPath, "utf8"));
   assert.equal(exported.type, "sub2api-data");
@@ -177,7 +177,13 @@ try {
 async function runNode(args, extraEnv, inputSteps = []) {
   const child = spawn(process.execPath, args, {
     cwd: projectRoot,
-    env: { ...process.env, ...extraEnv },
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      TOSUB2_TEST_SENTINEL_TOKEN: "mock-password-verify-challenge",
+      TOSUB2_TEST_SENTINEL_SO_TOKEN: "mock-so-token",
+      ...extraEnv,
+    },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });

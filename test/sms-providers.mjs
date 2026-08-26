@@ -3,6 +3,11 @@ import assert from "node:assert/strict";
 import { createSmsProvider, publicSmsProviderDefinitions } from "../src/sms-providers.mjs";
 import { createSmsBowerClient, SmsBowerError } from "../src/smsbower.mjs";
 import { createCustomSmsClient, parseCustomSmsEntries } from "../src/custom-sms.mjs";
+import {
+  extractMailboxOtpCandidates,
+  fetchMailboxOtpCandidates,
+  filterMailboxOtpCandidatesByRequestTime,
+} from "../src/mail-otp.mjs";
 
 const requests = [];
 let smsChecks = 0;
@@ -133,6 +138,74 @@ const customJsonClient = createCustomSmsClient({
 });
 const customJsonOrder = await customJsonClient.getNumber();
 assert.deepEqual(await customJsonClient.getSms(customJsonOrder.requestId), { status: "received", code: "766448" });
+
+const mailboxCandidates = extractMailboxOtpCandidates(JSON.stringify({
+  data: [
+    {
+      id: "8662a68c-8d5e-4b94-9508-e6c3f676715c",
+      subject: "New sign-in to your OpenAI account",
+      body_text: "New sign-in details for your OpenAI account.",
+      received_at: "2026-08-21T07:03:20.48048Z",
+    },
+    {
+      id: "233381cc-38cd-49c0-bac5-490580bb9125",
+      subject: "Your temporary ChatGPT login code",
+      body_text: "Enter this temporary verification code to continue: 866483",
+      received_at: "2026-08-21T07:03:13.197752Z",
+    },
+    {
+      id: "4b38e61d-7c5f-4988-8e9b-80a1f1ebb7b8",
+      subject: "Your temporary OpenAI verification code",
+      body_text: "Enter this temporary verification code to continue: 606195",
+      received_at: "2026-08-20T23:56:22.341347Z",
+    },
+  ],
+  page: 1,
+  size: 20,
+  total: 3,
+}));
+assert.deepEqual(mailboxCandidates.map(({ code }) => code), ["866483", "606195"]);
+assert.ok(mailboxCandidates[0].receivedAt > mailboxCandidates[1].receivedAt);
+assert.deepEqual(
+  filterMailboxOtpCandidatesByRequestTime(mailboxCandidates, Date.parse("2026-08-21T07:03:00Z"))
+    .map(({ code }) => code),
+  ["866483"],
+);
+assert.deepEqual(
+  filterMailboxOtpCandidatesByRequestTime(mailboxCandidates, Date.parse("2026-08-21T07:04:00Z")),
+  [],
+);
+
+let mailboxRequestOptions;
+const configuredMailboxCandidates = await fetchMailboxOtpCandidates("https://mail.example/messages", {
+  request: {
+    method: "POST",
+    headers: {
+      authorization: "Bearer test-mail-token",
+      referer: "https://mail.example/private/inbox",
+      "content-type": "application/json",
+    },
+    body: "mailbox_id%3Daccount-specific-id%26page%3D1",
+  },
+  fetchImpl: async (_url, options) => {
+    mailboxRequestOptions = options;
+    return new Response(JSON.stringify({ data: [{
+      id: "new-message",
+      body_text: "Your ChatGPT verification code is 752941",
+      received_at: "2026-08-21T08:00:00Z",
+    }] }), { status: 200 });
+  },
+});
+assert.equal(mailboxRequestOptions.method, "POST");
+assert.equal(mailboxRequestOptions.headers.get("authorization"), "Bearer test-mail-token");
+assert.equal(mailboxRequestOptions.headers.get("referer"), "https://mail.example/private/inbox");
+assert.equal(mailboxRequestOptions.headers.get("content-type"), "application/json");
+assert.equal(
+  mailboxRequestOptions.body,
+  "mailbox_id%3Daccount-specific-id%26page%3D1",
+);
+assert.equal(configuredMailboxCandidates[0].code, "752941");
+
 assert.throws(() => createSmsProvider("unknown", {}), /受支持/);
 
 console.log("sms provider tests passed");

@@ -13,7 +13,15 @@ const port = await findAvailablePort();
 const mailboxPort = await findAvailablePort();
 const baseUrl = `http://127.0.0.1:${port}`;
 const mailboxUrl = `http://127.0.0.1:${mailboxPort}/messages`;
-const mailbox = http.createServer((_req, res) => {
+let latestMailboxRequest = null;
+const mailbox = http.createServer(async (req, res) => {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  latestMailboxRequest = {
+    method: req.method,
+    authorization: req.headers.authorization,
+    body: Buffer.concat(chunks).toString("utf8"),
+  };
   res.writeHead(200, { "content-type": "application/json" });
   res.end("[]");
 });
@@ -48,6 +56,16 @@ const childExit = new Promise((resolve) => child.once("exit", resolve));
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
+  const mailConfigResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: {
+      method: "POST",
+      url: mailboxUrl,
+      headers: { Authorization: "Bearer mailbox-test-token", "Content-Type": "application/json" },
+    } }),
+  });
+  assert.equal(mailConfigResponse.status, 200, await mailConfigResponse.text());
   const requests = Array.from({ length: 10 }, () => fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
@@ -63,10 +81,16 @@ try {
   const updateResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ email: "same-email@example.com", mailApiUrl: mailboxUrl }),
+    body: JSON.stringify({
+      email: "same-email@example.com",
+      mailRequestBody: '{"mailbox_id":"same-email-mailbox"}',
+    }),
   });
   assert.equal(updateResponse.status, 200, await updateResponse.text());
   await waitForJob(headers, jobId, (job) => job.attempt === 2 && job.status === "email_otp");
+  await waitFor(() => latestMailboxRequest?.body === '{"mailbox_id":"same-email-mailbox"}');
+  assert.equal(latestMailboxRequest.method, "POST");
+  assert.equal(latestMailboxRequest.authorization, "Bearer mailbox-test-token");
 
   const logsAfterRestart = await (await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers })).json();
   assert.equal(countOccurrences(logsAfterRestart.logs, "Mock queued login started"), 2);
@@ -74,7 +98,10 @@ try {
   const unchangedResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,
-    body: JSON.stringify({ email: "same-email@example.com", mailApiUrl: mailboxUrl }),
+    body: JSON.stringify({
+      email: "same-email@example.com",
+      mailRequestBody: '{"mailbox_id":"same-email-mailbox"}',
+    }),
   });
   assert.equal(unchangedResponse.status, 200, await unchangedResponse.text());
   await delay(300);
@@ -133,6 +160,15 @@ async function waitForJob(headers, jobId, predicate) {
     await delay(100);
   }
   throw new Error(`job ${jobId} did not reach the expected state`);
+}
+
+async function waitFor(predicate) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await delay(50);
+  }
+  throw new Error("condition did not become true before timeout");
 }
 
 function findAvailablePort() {

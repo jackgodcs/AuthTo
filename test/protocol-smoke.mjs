@@ -349,7 +349,14 @@ try {
 async function runNode(args, inputSteps = [], extraEnv = {}) {
   const child = spawn(process.execPath, args, {
     cwd: projectRoot,
-    env: { ...process.env, CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS: "0", ...extraEnv },
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      TOSUB2_TEST_SENTINEL_TOKEN: "mock-sentinel-challenge",
+      TOSUB2_TEST_SENTINEL_SO_TOKEN: "mock-so-token",
+      CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS: "0",
+      ...extraEnv,
+    },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });

@@ -66,6 +66,13 @@ const server = http.createServer(async (req, res) => {
         },
       });
     }
+    const emailOtpSentinel = parseJson(req.headers["openai-sentinel-token"]);
+    if (
+      emailOtpSentinel?.flow !== "email_otp_validate"
+      || req.headers["openai-sentinel-so-token"] !== "mock-so-token"
+    ) {
+      return sendJson(res, 400, { error: { message: "missing email OTP sentinel headers" } });
+    }
     if (lastLoginHint === "account-profile@example.com") {
       return sendJson(res, 200, {
         continue_url: `${publicBase}/about-you`,
@@ -136,6 +143,7 @@ const server = http.createServer(async (req, res) => {
     if (
       sentinel?.flow !== "oauth_create_account"
       || sentinel?.c !== "mock-sentinel-challenge"
+      || req.headers["openai-sentinel-so-token"] !== "mock-so-token"
       || typeof sentinel?.id !== "string"
       || !sentinel.id
     ) {
@@ -148,10 +156,12 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 400, { error: { message: "generated age must be between 20 and 50" } });
     }
     return sendJson(res, 200, {
-      continue_url: `${publicBase}/web-callback`,
+      continue_url: `${publicBase}/api/auth/callback/openai?code=profile-code&state=profile-state`,
+      page: { type: "external_url" },
       "oai-client-auth-session": { email_verified: true, profile_completed: true },
     });
   }
+  if (req.method === "GET" && url.pathname === "/api/auth/callback/openai") return redirect(res, `${publicBase}/`);
   if (req.method === "GET" && url.pathname === "/web-callback") return redirect(res, `${publicBase}/`);
   if (req.method === "GET" && url.pathname === "/oauth/authorize") {
     return redirect(res, `${publicBase}/choose-an-account`);

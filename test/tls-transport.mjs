@@ -10,7 +10,6 @@ import {
   rotateProxySession,
   TlsFingerprintTransport,
 } from "../src/tls-transport.mjs";
-import { defaultSentinelEnv, fetchSentinelToken, resolveSentinelDeviceProfile } from "../src/sentinel.mjs";
 
 const server = http.createServer(async (req, res) => {
   let body = "";
@@ -53,6 +52,8 @@ try {
   assert.equal(fallbackResponse.status, 200, "unsupported TLS profiles should fall back to a supported profile");
   await fallbackTransport.close();
   await testConfigureStageProfileFallback();
+  testCloudflareWorkerSessionReuse();
+  testSentinelWorkerSessionReuse();
   testProfileProbeWorker();
   testBrowserIdentity();
   await testSharedDirectProfileProbe();
@@ -83,15 +84,7 @@ try {
   });
   assert.deepEqual(JSON.parse(await postResponse.text()), { method: "POST", body: "value=ok" });
 
-  const sentinelToken = JSON.parse(await fetchSentinelToken({
-    deviceID: "test-device-id",
-    flow: "oauth_create_account",
-    fetch: transport.fetch.bind(transport),
-    reqEndpoint: `http://127.0.0.1:${address.port}/sentinel`,
-  }));
-  assert.equal(sentinelToken.c, "test-sentinel");
-  assert.equal(sentinelToken.flow, "oauth_create_account");
-  await testSentinelBrowserIdentity();
+  await testDynamicSentinelTransportMessage();
 
   const original = "socks5h://account-region-JP-sid-oldValue-t-20:password@proxy.example:5000";
   const rotated = new URL(rotateProxySession(original));
@@ -187,6 +180,49 @@ try {
   );
   assert.equal(badRequestResponse.status, 400);
   assert.equal(ordinaryBadRequestCount, 1, "ordinary JSON 400 responses must not be retried as proxy risk control");
+
+  const solvedChallenge = new TlsFingerprintTransport({
+    enabled: true,
+    sameProxyRiskRetries: 3,
+    sameProxyRiskRetryDelayMs: 0,
+  });
+  const supportedChallenge = {
+    status: 403,
+    headers: [["content-type", "text/html"], ["cf-mitigated", "challenge"]],
+    body: Buffer.from("<html><script>window._cf_chl_opt={};</script><div>Just a moment</div></html>").toString("base64"),
+    cookies: [],
+  };
+  let solvedChallengeRequests = 0;
+  let solveOperations = 0;
+  solvedChallenge.send = async (message) => {
+    if (message.operation === "configure") return {};
+    if (message.operation === "solve_cloudflare") {
+      solveOperations += 1;
+      assert.equal(message.url, "https://chatgpt.com/");
+      assert.match(Buffer.from(message.challengeBody, "base64").toString("utf8"), /_cf_chl_opt/);
+      assert.match(message.userAgent, /Chrome\/146/);
+      assert.equal(message.browserIdentity.platform, "MacIntel");
+      assert.equal(message.browserIdentity.locale, "zh-CN");
+      assert.equal(message.browserIdentity.languages[0], "zh-CN");
+      return { ok: true, status: 200, clearance: true };
+    }
+    solvedChallengeRequests += 1;
+    return solvedChallengeRequests === 1
+      ? supportedChallenge
+      : {
+          status: 200,
+          headers: [["content-type", "text/html"]],
+          body: Buffer.from("<html>ChatGPT</html>").toString("base64"),
+          cookies: [],
+        };
+  };
+  await solvedChallenge.configure(fixed);
+  const solvedChallengeResponse = await solvedChallenge.request("GET", "https://chatgpt.com/", {
+    retryRiskControl: true,
+  });
+  assert.equal(solvedChallengeResponse.status, 200);
+  assert.equal(solveOperations, 1, "a supported challenge should invoke the solver once");
+  assert.equal(solvedChallengeRequests, 2, "successful solving should replay the original request once");
 
   const challenge400 = new TlsFingerprintTransport({
     enabled: true,
@@ -313,11 +349,110 @@ assert FakeRequests.attempts[:2] == ["chrome146", "chrome145"], FakeRequests.att
   transport.send = async (message) => {
     assert.equal(message.operation, "configure");
     assert.equal(message.impersonate, "chrome146");
+    assert.equal(message.verifyTls, true);
     return { configured: true, profile: "chrome145" };
   };
   await transport.configure(null);
   assert.equal(transport.profile, "chrome145");
   assert.equal(transport.configuredProfile, "chrome145");
+}
+
+function testCloudflareWorkerSessionReuse() {
+  const python = findTestPython();
+  assert.ok(python, "a Python interpreter is required for Cloudflare worker tests");
+  const workerPath = fileURLToPath(new URL("../src/tls_transport.py", import.meta.url));
+  const script = String.raw`
+import base64
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("tosub2_tls_transport", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+active_session = object()
+captured = {}
+
+class FakeSolver:
+    @staticmethod
+    def solve_challenge(session, **kwargs):
+        assert session is active_session
+        captured.update(kwargs)
+        return {"ok": True, "status": 200, "clearance": True}
+
+module.CLOUDFLARE_SOLVER = FakeSolver()
+worker = module.Worker()
+worker.session = active_session
+result = worker.solve_cloudflare({
+    "url": "https://chatgpt.com/api/test",
+    "challengeBody": base64.b64encode(b"<script>window._cf_chl_opt={}</script>").decode("ascii"),
+    "userAgent": "Mozilla/5.0 Chrome/146.0.0.0 Safari/537.36",
+    "nodeCommand": "/usr/local/bin/node",
+    "solverTimeoutMs": 70000,
+})
+assert result["ok"] is True
+assert captured["challenge_url"] == "https://chatgpt.com/api/test"
+assert captured["verification_url"] == "https://chatgpt.com/"
+assert captured["timeout_seconds"] == 70
+assert captured["node_command"] == "/usr/local/bin/node"
+`;
+  const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `Cloudflare worker session reuse test failed:\n${result.stderr || result.stdout}`);
+}
+
+function testSentinelWorkerSessionReuse() {
+  const python = findTestPython();
+  assert.ok(python, "a Python interpreter is required for Sentinel worker tests");
+  const workerPath = fileURLToPath(new URL("../src/tls_transport.py", import.meta.url));
+  const script = String.raw`
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("tosub2_tls_transport", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+active_session = object()
+captured = {}
+
+class FakeSentinelClient:
+    def __init__(self, **kwargs):
+        assert kwargs["client"] is active_session
+        captured.update(kwargs)
+    def token(self, flow):
+        return '{"p":"proof","t":null,"c":"token","id":"device","flow":"' + flow + '"}'
+    def session_observer_token(self, flow):
+        return '{"so":{"required":true},"c":"collector","id":"device","flow":"' + flow + '"}'
+    def close(self):
+        captured["closed"] = True
+
+module.SentinelClient = FakeSentinelClient
+worker = module.Worker()
+worker.session = active_session
+result = worker.generate_sentinel_tokens({
+    "flow": "password_verify",
+    "deviceID": "device",
+    "pageUrl": "https://auth.openai.com/log-in/password",
+    "userAgent": "Mozilla/5.0 Chrome/145.0.0.0 Safari/537.36",
+    "browserIdentity": {"platform": "MacIntel", "languages": ["zh-CN", "zh"]},
+    "nodeCommand": "/usr/local/bin/node",
+})
+assert '"flow":"password_verify"' in result["token"]
+assert result["soToken"] is not None
+assert captured["device_id"] == "device"
+assert captured["page_url"].endswith("/log-in/password")
+assert captured["closed"] is True
+`;
+  const result = spawnSync(python.command, [...python.args, "-c", script, workerPath], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `Sentinel worker session reuse test failed:\n${result.stderr || result.stdout}`);
 }
 
 function testProfileProbeWorker() {
@@ -467,12 +602,6 @@ function testBrowserIdentity() {
   assert.equal(modern.secChUaPlatform, '"macOS"');
   assert.equal(modern.platform, "MacIntel");
   assert.equal(modern.browserMajorVersion, 145);
-  const sentinel = defaultSentinelEnv(resolveSentinelDeviceProfile(modern));
-  assert.match(sentinel.userAgent, /Chrome\/145\.0\.0\.0/);
-  assert.equal(sentinel.platform, "MacIntel");
-  assert.equal(sentinel.locale, "zh-CN");
-  assert.equal(sentinel.timezoneId, "Asia\/Shanghai");
-
   const legacy = browserIdentityForTlsProfile("chrome116");
   assert.match(legacy.userAgent, /Windows NT 10\.0; Win64; x64/);
   assert.match(legacy.userAgent, /Chrome\/116\.0\.0\.0/);
@@ -480,34 +609,24 @@ function testBrowserIdentity() {
   assert.equal(legacy.platform, "Win32");
 }
 
-async function testSentinelBrowserIdentity() {
-  const identity = browserIdentityForTlsProfile("chrome145");
-  let requestOptions;
-  const token = JSON.parse(await fetchSentinelToken({
-    deviceID: "identity-device-id",
+async function testDynamicSentinelTransportMessage() {
+  const sentinelTransport = new TlsFingerprintTransport({ enabled: true, profile: "chrome145" });
+  sentinelTransport.send = async (message) => {
+    assert.equal(message.operation, "generate_sentinel_tokens");
+    assert.equal(message.flow, "oauth_create_account");
+    assert.equal(message.deviceID, "identity-device-id");
+    assert.equal(message.pageUrl, "https://auth.openai.com/about-you");
+    assert.match(message.userAgent, /Chrome\/145\.0\.0\.0/);
+    assert.equal(message.browserIdentity.platform, "MacIntel");
+    assert.equal(message.browserIdentity.languages[0], "zh-CN");
+    return { token: '{"c":"dynamic-token"}', soToken: '{"so":true}' };
+  };
+  const tokens = await sentinelTransport.generateSentinelTokens({
     flow: "oauth_create_account",
-    deviceProfile: identity,
-    sendClientHints: false,
-    reqEndpoint: "https://sentinel.openai.com/backend-api/sentinel/req",
-    fetch: async (_url, options) => {
-      requestOptions = options;
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { token: "identity-sentinel-token", proofofwork: { required: false }, turnstile: { required: false } };
-        },
-      };
-    },
-  }));
-  assert.equal(token.c, "identity-sentinel-token");
-  assert.match(requestOptions.headers["user-agent"], /Chrome\/145\.0\.0\.0/);
-  assert.equal(requestOptions.headers["accept-language"], "zh-CN,zh;q=0.9,en;q=0.8");
-  assert.equal(requestOptions.headers["sec-ch-ua"], undefined);
-  const requirements = JSON.parse(requestOptions.body);
-  assert.equal(requirements.flow, "oauth_create_account");
-  assert.equal(requirements.id, "identity-device-id");
-  assert.match(requirements.p, /^gAAAAAC/);
+    deviceID: "identity-device-id",
+    pageUrl: "https://auth.openai.com/about-you",
+  });
+  assert.deepEqual(tokens, { token: '{"c":"dynamic-token"}', soToken: '{"so":true}' });
 }
 
 function findTestPython() {

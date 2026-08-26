@@ -10,13 +10,18 @@ import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { createServer as createViteServer } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
-import { fetchMailboxOtpCandidates, validateMailApiUrl } from "./mail-otp.mjs";
+import {
+  fetchMailboxOtpCandidates,
+  filterMailboxOtpCandidatesByRequestTime,
+  validateMailApiUrl,
+} from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
+const DEFAULT_TLS_PROFILE = "chrome146";
 const MAX_BATCH_JOBS = 500;
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
@@ -33,6 +38,20 @@ const SUB2API_MONITOR_INTERVAL_MS = readDurationEnv("SUB2API_MONITOR_INTERVAL_MS
 const SUB2API_AUTO_REPAIR_COOLDOWN_MS = readDurationEnv("SUB2API_AUTO_REPAIR_COOLDOWN_MS", 5 * 60_000, 0);
 const MAIL_POLL_INTERVAL_MS = 2_500;
 const MAIL_POLL_TIMEOUT_MS = 10 * 60_000;
+const MAX_MAIL_REQUEST_BODY_BYTES = 64 * 1024;
+const MAX_MAIL_REQUEST_HEADERS = 64;
+const FORBIDDEN_MAIL_REQUEST_HEADERS = new Set([
+  "connection",
+  "content-length",
+  "host",
+  "keep-alive",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 const SMS_POLL_INTERVAL_MS = Number(process.env.SMS_POLL_INTERVAL_MS || process.env.LUBAN_SMS_POLL_INTERVAL_MS || 3_000);
 const SMS_POLL_TIMEOUT_MS = Number(process.env.SMS_POLL_TIMEOUT_MS || process.env.LUBAN_SMS_POLL_TIMEOUT_MS || 10 * 60_000);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +76,7 @@ let shutdownPromise = null;
 let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
+let mailRequestConfig = { method: "GET", url: null, headers: {} };
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
 const sub2ApiAutoRepairPromises = new Set();
@@ -100,9 +120,6 @@ await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
-void directTlsProfileProbe.resolve().catch((error) => {
-  console.warn(`[warn] 本机直连 TLS 指纹预探测失败，将在无代理任务启动时重试：${error.message}`);
-});
 
 const vite = await createViteServer({
   root: WEB_ROOT,
@@ -222,6 +239,19 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/mail-request-config") {
+    const body = await readJson(req);
+    mailRequestConfig = normalizeMailRequestConfig(body.config);
+    sendJson(res, 200, {
+      config: {
+        method: mailRequestConfig.method,
+        urlConfigured: Boolean(mailRequestConfig.url),
+        headerCount: Object.keys(mailRequestConfig.headers).length,
+      },
+    });
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs") {
     const body = await readJson(req);
     const email = String(body.email || "").trim();
@@ -229,7 +259,7 @@ async function handleApi(req, res, requestUrl) {
       sendJson(res, 400, { error: "Please enter a valid email address" });
       return;
     }
-    const hasCredentialUpdate = ["password", "mailApiUrl", "totpSecret"].some((key) => Object.hasOwn(body, key));
+    const hasCredentialUpdate = ["password", "mailApiUrl", "mailRequestBody", "totpSecret"].some((key) => Object.hasOwn(body, key));
     const credentials = normalizeLoginCredentials(body);
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
@@ -248,7 +278,7 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/batch") {
     const body = await readJson(req);
-    const entries = parseBatchEntries(body.text);
+    const entries = parseBatchEntries(body.text, mailRequestConfig);
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
@@ -614,7 +644,7 @@ function normalizeEmailFilter(value) {
 }
 
 async function startJob(email, credentials = {}, proxyUrl = null) {
-  const { loginMode, mailApiUrl, password, totpSecret } = normalizeLoginCredentials(credentials);
+  const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
   const outputDir = path.join(OUTPUT_ROOT, id);
@@ -651,12 +681,14 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     hasTotpCredential: Boolean(totpSecret),
     proxyUrl,
     mailApiUrl,
+    mailRequestBody,
     mailSeenCandidateKeys: new Set(),
     mailCandidateCounts: new Map(),
     mailStatus: mailApiUrl ? "baseline" : "manual",
     mailApiError: null,
     mailPollRunning: false,
     mailPollToken: null,
+    mailOtpRequestedAt: null,
     currentPhone: null,
     phoneError: null,
     restartRequired: false,
@@ -666,6 +698,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     queuedMode: "full",
     queuedAt: new Date().toISOString(),
     queuedStartPrompt: "正在建立登录会话",
+    directTlsFallbackAttempted: false,
     fallbackInProgress: false,
     totpSetupSecret: null,
     totpSetupUri: null,
@@ -746,14 +779,7 @@ async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
     if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
-    let tlsProfile = "";
-    if (["full", "totp_setup", "password_add"].includes(mode) && !job.proxyUrl) {
-      job.prompt = "正在等待本机直连 TLS 指纹探测";
-      touch(job);
-      tlsProfile = await directTlsProfileProbe.resolve();
-      if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
-    }
-    launchJob(job, { mode, tlsProfile });
+    launchJob(job, { mode });
   } catch (error) {
     if (mode === "totp_setup") {
       restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
@@ -786,6 +812,7 @@ function launchJob(job, options = {}) {
   const runId = crypto.randomUUID();
   job.runId = runId;
   job.runMode = mode;
+  job.mailOtpRequestedAt = null;
   const args = mode === "refresh"
     ? [
         PROTOCOL_SCRIPT,
@@ -842,7 +869,7 @@ function launchJob(job, options = {}) {
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
       TOSUB2_TLS_PROFILE:
         String(process.env.TOSUB2_TLS_PROFILE || "").trim()
-        || (!job.proxyUrl ? String(options.tlsProfile || directTlsProfileProbe.profile || "") : ""),
+        || (!job.proxyUrl ? String(options.tlsProfile || DEFAULT_TLS_PROFILE) : ""),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -1418,6 +1445,9 @@ function consumeOutput(job, rawText) {
   if (scan.includes("[3/5] Email OTP page reached.")) {
     markAuthorizationRequirement(job, "emailOtp");
   }
+  const mailRequestMarkers = [...scan.matchAll(/\[email-otp-requested-at\]\s+(\S+)/g)];
+  const latestMailRequestAt = Date.parse(mailRequestMarkers.at(-1)?.[1] || "");
+  if (Number.isFinite(latestMailRequestAt)) job.mailOtpRequestedAt = latestMailRequestAt;
   if (scan.includes("[checkpoint] Saved verified email login state.")
     || scan.includes("[checkpoint] Updated verified login state after adding the password.")
     || scan.includes("[checkpoint] Updated verified login state after setting 2FA.")) {
@@ -1642,12 +1672,18 @@ async function restartAfterProxyRisk(job, options = {}) {
   job.proxyRiskRestarting = true;
   const mode = job.runMode || job.queuedMode || "full";
   try {
-    if (!job.proxyUrl || !proxySupportsSessionRotation(job.proxyUrl)) {
+    if (!job.proxyUrl) {
+      if (job.directTlsFallbackAttempted) {
+        finishProxyRiskRetries(job, "Cloudflare 安全校验未能完成，直连 TLS 指纹筛选已经使用过，请稍后重试");
+        return;
+      }
+      job.directTlsFallbackAttempted = true;
+      const fallbackProfile = await directTlsProfileProbe.resolve();
+      appendJobLog(job, `[tls] Cloudflare 求解未完成，正在启用直连 TLS 指纹筛选兜底（${fallbackProfile}）。\n`);
+    } else if (!proxySupportsSessionRotation(job.proxyUrl)) {
       finishProxyRiskRetries(
         job,
-        job.proxyUrl
-          ? "当前代理没有可识别的会话编号，无法自动轮换；请更换代理配置后重试"
-          : "当前使用本地 IP，无法自动更换出口；请配置可轮换代理后重试",
+        "当前代理没有可识别的会话编号，无法自动轮换；请更换代理配置后重试",
       );
       return;
     }
@@ -2882,9 +2918,16 @@ async function exportSourceAccounts(res, ids) {
     }
     if (password) {
       const parts = [job.email, password];
-      if (job.mailApiUrl) parts.push(job.mailApiUrl);
+      if (job.mailRequestBody) parts.push(job.mailRequestBody);
+      else if (job.mailApiUrl) parts.push(job.mailApiUrl);
       if (totpSecret) parts.push(totpSecret);
       lines.push(parts.join("----"));
+      continue;
+    }
+    if (job.mailRequestBody) {
+      lines.push(totpSecret
+        ? `${job.email}----${job.mailRequestBody}----${totpSecret}`
+        : `${job.email}----${job.mailRequestBody}`);
       continue;
     }
     if (job.mailApiUrl) {
@@ -3273,6 +3316,7 @@ async function syncCompletedOutputs(force = false) {
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
           proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
@@ -3365,6 +3409,7 @@ async function syncCompletedOutputs(force = false) {
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
           proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
@@ -3454,6 +3499,7 @@ async function syncCompletedOutputs(force = false) {
           totpSecret: storedCredentials.totpSecret,
           ...restoredCredentialFlags(metadata, storedCredentials),
           mailApiUrl,
+          mailRequestBody: typeof metadata.mail_request_body === "string" ? metadata.mail_request_body : "",
           proxyUrl: storedCredentials.proxyUrl,
           mailSeenCandidateKeys: new Set(),
           mailCandidateCounts: new Map(),
@@ -3682,10 +3728,18 @@ function normalizeProxyUrl(value) {
 
 function normalizeLoginCredentials(value = {}) {
   const password = typeof value.password === "string" ? value.password : "";
-  const mailApiUrl = validateMailApiUrl(value.mailApiUrl) ? String(value.mailApiUrl).trim() : null;
+  const mailRequestBody = typeof value.mailRequestBody === "string" ? value.mailRequestBody : "";
+  const configuredPostUrl = mailRequestConfig.method === "POST" && validateMailApiUrl(mailRequestConfig.url)
+    ? mailRequestConfig.url
+    : null;
+  const mailApiUrl = validateMailApiUrl(value.mailApiUrl)
+    ? String(value.mailApiUrl).trim()
+    : mailRequestBody && configuredPostUrl
+      ? configuredPostUrl
+      : null;
   const totpSecret = value.totpSecret ? normalizeTotpSecret(value.totpSecret) : "";
   const loginMode = password ? "password" : "email_otp";
-  return { loginMode, mailApiUrl, password, totpSecret };
+  return { loginMode, mailApiUrl, mailRequestBody, password, totpSecret };
 }
 
 function restoredCredentialFlags(metadata = {}, credentials = {}) {
@@ -3780,7 +3834,7 @@ function normalizeTotpSecret(value, lineNumber = null) {
   return normalized;
 }
 
-function parseBatchEntries(value) {
+function parseBatchEntries(value, requestConfig = {}) {
   const lines = String(value || "")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -3788,11 +3842,78 @@ function parseBatchEntries(value) {
   if (!lines.length) throw httpError(400, "请至少输入一行账号信息");
   if (lines.length > MAX_BATCH_JOBS) throw httpError(400, `一次最多添加 ${MAX_BATCH_JOBS} 条任务`);
 
-  const entries = lines.map((line, index) => parseSmartAccountLine(line, index + 1));
+  const entries = lines.map((line, index) => (
+    requestConfig.method === "POST" && !isEmail(line)
+      ? parsePostMailAccountLine(line, index + 1, requestConfig)
+      : parseSmartAccountLine(line, index + 1)
+  ));
 
   const unique = new Map();
   entries.forEach((entry) => unique.set(entry.email.toLowerCase(), entry));
   return [...unique.values()];
+}
+
+function parsePostMailAccountLine(line, lineNumber, requestConfig) {
+  if (!validateMailApiUrl(requestConfig.url)) {
+    throw httpError(400, "POST 邮件接码模式需要先在控制台配置统一请求 URL");
+  }
+  const fields = line.split("----").map((value) => value.trim());
+  if (fields.length < 2) {
+    throw httpError(400, `第 ${lineNumber} 行格式错误，POST 邮件接码请使用 邮箱----编码请求体`);
+  }
+  const emailFields = fields.map((value, index) => ({ value, index })).filter((field) => isEmail(field.value));
+  if (emailFields.length !== 1) throw httpError(400, `第 ${lineNumber} 行必须包含一个独立邮箱`);
+  const emailField = emailFields[0];
+  const remaining = fields
+    .map((value, index) => ({ value, index }))
+    .filter((field) => field.index !== emailField.index && field.value);
+  if (!remaining.length) throw httpError(400, `第 ${lineNumber} 行缺少 POST 请求体`);
+
+  let totpField = null;
+  if (remaining.length >= 2) {
+    const totpCandidates = remaining.filter((field) => isTotpSecretCandidate(field.value));
+    if (totpCandidates.length === 1) totpField = totpCandidates[0];
+  }
+  const bodyAndPassword = remaining.filter((field) => field !== totpField);
+  const recognizableBodies = bodyAndPassword.filter((field) => looksLikeEncodedMailRequestBody(field.value));
+  const bodyField = recognizableBodies.length === 1 ? recognizableBodies[0] : bodyAndPassword.at(-1);
+  const passwordFields = bodyAndPassword.filter((field) => field !== bodyField);
+  if (passwordFields.length > 1) {
+    throw httpError(400, `第 ${lineNumber} 行无法区分密码和 POST 请求体，请将编码请求体放在最后`);
+  }
+  const mailRequestBody = bodyField?.value || "";
+  const password = passwordFields[0]?.value || "";
+  if (Buffer.byteLength(mailRequestBody) > MAX_MAIL_REQUEST_BODY_BYTES) {
+    throw httpError(400, `第 ${lineNumber} 行 POST 请求体不能超过 64 KB`);
+  }
+  return {
+    email: emailField.value,
+    loginMode: password ? "password" : "email_otp",
+    mailApiUrl: requestConfig.url,
+    mailRequestBody,
+    password,
+    totpSecret: totpField ? normalizeTotpSecret(totpField.value, lineNumber) : "",
+  };
+}
+
+function looksLikeEncodedMailRequestBody(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (/^[{\[]/.test(text)) {
+    try {
+      JSON.parse(text);
+      return true;
+    } catch {}
+  }
+  if (/(?:^|&)[^=&\s]+=[^&]*(?:&|$)/.test(text) || /%[0-9A-F]{2}/i.test(text)) return true;
+  const compact = text.replace(/\s+/g, "");
+  if (/^[A-Za-z0-9+/_-]+={0,2}$/.test(compact) && compact.length >= 12) {
+    try {
+      const decoded = Buffer.from(compact.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8").trim();
+      return /^[{\[]/.test(decoded) || /(?:^|&)[^=&\s]+=[^&]*(?:&|$)/.test(decoded);
+    } catch {}
+  }
+  return false;
 }
 
 function parseSmartAccountLine(line, lineNumber) {
@@ -4099,8 +4220,8 @@ function compareAccountParseCandidates(left, right) {
 }
 
 function accountParseSignature(candidate) {
-  const { email, mailApiUrl, password, totpSecret } = candidate.entry;
-  return JSON.stringify({ email: email.toLowerCase(), mailApiUrl, password, totpSecret });
+  const { email, mailApiUrl, mailRequestBody, password, totpSecret } = candidate.entry;
+  return JSON.stringify({ email: email.toLowerCase(), mailApiUrl, mailRequestBody, password, totpSecret });
 }
 
 function escapeRegExp(value) {
@@ -4113,12 +4234,14 @@ async function updateJobCredentials(job, credentials, options = {}) {
     ? normalizeLoginCredentials({
         password: job.password,
         mailApiUrl: job.mailApiUrl,
+        mailRequestBody: job.mailRequestBody,
         totpSecret: job.totpSecret,
       })
     : normalizeLoginCredentials(credentials);
   const nextProxyUrl = options.hasProxyUpdate ? normalizeProxyUrl(options.proxyUrl) : job.proxyUrl;
   const changed = job.loginMode !== normalized.loginMode
     || job.mailApiUrl !== normalized.mailApiUrl
+    || job.mailRequestBody !== normalized.mailRequestBody
     || job.password !== normalized.password
     || job.totpSecret !== normalized.totpSecret
     || job.proxyUrl !== nextProxyUrl;
@@ -4127,6 +4250,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
   stopMailPolling(job);
   job.loginMode = normalized.loginMode;
   job.mailApiUrl = normalized.mailApiUrl;
+  job.mailRequestBody = normalized.mailRequestBody;
   job.password = normalized.password;
   job.totpSecret = normalized.totpSecret;
   job.hasPasswordCredential = Boolean(normalized.password);
@@ -4202,6 +4326,8 @@ async function saveJobMetadata(job) {
         last_operation_at: job.lastOperationAt || job.createdAt,
         last_operation_type: job.lastOperationType || "initial_authorization",
         login_mode: job.loginMode || null,
+        mail_api_url: job.mailApiUrl || null,
+        mail_request_body: job.mailRequestBody || null,
         has_stored_credentials: Boolean(job.password || job.totpSecret),
         has_password: Boolean(job.password || job.hasPasswordCredential),
         has_totp_key: Boolean(job.totpSecret || job.hasTotpCredential),
@@ -4212,7 +4338,6 @@ async function saveJobMetadata(job) {
         proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
         proxy_configured: Boolean(job.proxyUrl),
-        mail_api_url: job.mailApiUrl || null,
         sms_provider_id: job.smsProviderId || null,
         sms_provider_name: job.smsProviderName || null,
         sms_service_label: job.smsServiceLabel || null,
@@ -4276,7 +4401,9 @@ async function deleteStoredLoginCredentials(email) {
 
 async function loadMailboxBaseline(job) {
   try {
-    const candidates = await fetchMailboxOtpCandidates(job.mailApiUrl);
+    const candidates = await fetchMailboxOtpCandidates(mailApiUrlForJob(job), {
+      request: mailRequestForJob(job),
+    });
     candidates.forEach((candidate) => job.mailSeenCandidateKeys.add(candidate.key));
     job.mailStatus = "ready";
     job.mailApiError = null;
@@ -4290,7 +4417,7 @@ async function loadMailboxBaseline(job) {
 }
 
 async function beginMailPolling(job) {
-  if (!job.mailApiUrl || job.mailPollRunning || job.status !== "email_otp") return;
+  if (!mailApiUrlForJob(job) || job.mailPollRunning || job.status !== "email_otp") return;
   job.mailPollRunning = true;
   job.mailStatus = "polling";
   job.mailApiError = null;
@@ -4307,7 +4434,12 @@ async function beginMailPolling(job) {
       Date.now() - startedAt < MAIL_POLL_TIMEOUT_MS
     ) {
       try {
-        const candidates = await fetchMailboxOtpCandidates(job.mailApiUrl);
+        const candidates = filterMailboxOtpCandidatesByRequestTime(
+          await fetchMailboxOtpCandidates(mailApiUrlForJob(job), {
+            request: mailRequestForJob(job),
+          }),
+          job.mailOtpRequestedAt,
+        );
         if (job.mailPollToken !== pollToken || job.status !== "email_otp" || !job.child) return;
         const unseen = candidates.filter((candidate) => !job.mailSeenCandidateKeys.has(candidate.key));
         let fresh = unseen.find((candidate) => candidate.score >= 12);
@@ -4368,6 +4500,54 @@ function appendJobLog(job, text) {
 function safeMailError(error) {
   const message = String(error?.message || "读取收码接口失败");
   return message.replace(/https?:\/\/\S+/gi, "<已隐藏接口地址>").slice(0, 180);
+}
+
+function normalizeMailRequestConfig(value) {
+  const config = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const method = String(config.method || "GET").trim().toUpperCase();
+  if (!["GET", "POST"].includes(method)) throw httpError(400, "邮件接码请求方式只支持 GET 或 POST");
+
+  const sourceHeaders = config.headers == null ? {} : config.headers;
+  if (!sourceHeaders || typeof sourceHeaders !== "object" || Array.isArray(sourceHeaders)) {
+    throw httpError(400, "邮件接码请求头必须是 JSON 对象");
+  }
+  const entries = Object.entries(sourceHeaders);
+  if (entries.length > MAX_MAIL_REQUEST_HEADERS) {
+    throw httpError(400, `邮件接码请求头最多配置 ${MAX_MAIL_REQUEST_HEADERS} 项`);
+  }
+  const headers = {};
+  for (const [rawName, rawValue] of entries) {
+    const name = String(rawName || "").trim().toLowerCase();
+    if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name)) throw httpError(400, `无效的请求头名称：${rawName}`);
+    if (FORBIDDEN_MAIL_REQUEST_HEADERS.has(name)) throw httpError(400, `请求头 ${rawName} 由请求库自动管理，不能手动配置`);
+    if (typeof rawValue !== "string" && typeof rawValue !== "number" && typeof rawValue !== "boolean") {
+      throw httpError(400, `请求头 ${rawName} 的值必须是文本或数字`);
+    }
+    const headerValue = String(rawValue);
+    if (/\r|\n/.test(headerValue)) throw httpError(400, `请求头 ${rawName} 不能包含换行符`);
+    if (Buffer.byteLength(headerValue) > 8 * 1024) throw httpError(400, `请求头 ${rawName} 的值过长`);
+    headers[name] = headerValue;
+  }
+
+  const url = String(config.url || "").trim();
+  if (method === "POST" && !validateMailApiUrl(url)) {
+    throw httpError(400, "POST 邮件接码模式必须配置有效的 HTTP 或 HTTPS 请求 URL");
+  }
+  return { method, url: validateMailApiUrl(url) ? url : null, headers };
+}
+
+function mailRequestForJob(job) {
+  return {
+    method: mailRequestConfig.method,
+    headers: mailRequestConfig.headers,
+    body: mailRequestConfig.method === "POST" ? job.mailRequestBody || "" : "",
+  };
+}
+
+function mailApiUrlForJob(job) {
+  return mailRequestConfig.method === "POST" && validateMailApiUrl(mailRequestConfig.url)
+    ? mailRequestConfig.url
+    : job.mailApiUrl;
 }
 
 function delay(ms) {

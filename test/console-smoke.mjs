@@ -156,6 +156,77 @@ try {
   assert.equal(pageResponse.status, 200);
   assert.match(pageResponse.headers.get("content-type") || "", /text\/html;\s*charset=utf-8/i);
 
+  const mailRequestConfigResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: {
+      method: "POST",
+      url: `${baseUrl}/api/bootstrap`,
+      headers: { Authorization: "Bearer private-mail-token", Referer: "https://mail.example/private" },
+    } }),
+  });
+  const mailRequestConfigText = await mailRequestConfigResponse.text();
+  assert.equal(mailRequestConfigResponse.status, 200, mailRequestConfigText);
+  assert.deepEqual(JSON.parse(mailRequestConfigText).config, {
+    method: "POST",
+    urlConfigured: true,
+    headerCount: 2,
+  });
+
+  const postMailSourceLines = [
+    "post-body@example.com----eyJtYWlsYm94X2lkIjoiaWQtYSJ9",
+    "post-password@example.com----test-password----opaque-account-body",
+    '{"mailbox_id":"id-c"}----post-unordered@example.com----test-password-c',
+  ];
+  const postMailBatchResponse = await fetch(`${baseUrl}/api/jobs/batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ text: postMailSourceLines.join("\n") }),
+  });
+  const postMailBatchText = await postMailBatchResponse.text();
+  assert.equal(postMailBatchResponse.status, 201, postMailBatchText);
+  const postMailBatch = JSON.parse(postMailBatchText);
+  assert.equal(postMailBatch.jobs.length, 3);
+  assert.equal(postMailBatch.jobs.find((job) => job.email === "post-body@example.com").loginMode, "email_otp");
+  assert.equal(postMailBatch.jobs.find((job) => job.email === "post-password@example.com").loginMode, "password");
+  assert.equal(postMailBatch.jobs.find((job) => job.email === "post-unordered@example.com").loginMode, "password");
+  postMailBatch.jobs.forEach((job) => assert.equal(job.autoEmailOtp, true));
+
+  const postMailSourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: postMailBatch.jobs.map((job) => job.id) }),
+  });
+  const postMailSourceText = await postMailSourceResponse.text();
+  assert.equal(postMailSourceResponse.status, 200, postMailSourceText);
+  const postMailSourceExport = postMailSourceText.replace(/^\uFEFF/, "").trim().split("\n").sort();
+  assert.deepEqual(postMailSourceExport, [
+    "post-body@example.com----eyJtYWlsYm94X2lkIjoiaWQtYSJ9",
+    "post-password@example.com----test-password----opaque-account-body",
+    'post-unordered@example.com----test-password-c----{"mailbox_id":"id-c"}',
+  ].sort());
+
+  const deletePostMailJobsResponse = await fetch(`${baseUrl}/api/jobs/delete-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: postMailBatch.jobs.map((job) => job.id) }),
+  });
+  assert.equal(deletePostMailJobsResponse.status, 200, await deletePostMailJobsResponse.text());
+
+  const forbiddenMailHeaderResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: { method: "GET", headers: { Host: "mail.example" } } }),
+  });
+  assert.equal(forbiddenMailHeaderResponse.status, 400, await forbiddenMailHeaderResponse.text());
+
+  const resetMailRequestConfigResponse = await fetch(`${baseUrl}/api/mail-request-config`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ config: { method: "GET", headers: {} } }),
+  });
+  assert.equal(resetMailRequestConfigResponse.status, 200, await resetMailRequestConfigResponse.text());
+
   const createdResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
     headers,

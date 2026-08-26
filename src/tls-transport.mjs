@@ -12,6 +12,7 @@ const PROFILE_PROBE_TOTAL_TIMEOUT_MS = 300_000;
 const PROFILE_PROBE_CONCURRENCY = 4;
 const DEFAULT_SAME_PROXY_RISK_RETRIES = 3;
 const DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS = 1_000;
+const DEFAULT_CLOUDFLARE_SOLVER_TIMEOUT_MS = 70_000;
 const UNCONFIGURED = Symbol("unconfigured");
 
 export function browserIdentityForTlsProfile(profile = DEFAULT_PROFILE) {
@@ -51,9 +52,12 @@ export class TlsFingerprintTransport {
     maxProxySessionAttempts = 10,
     sameProxyRiskRetries = DEFAULT_SAME_PROXY_RISK_RETRIES,
     sameProxyRiskRetryDelayMs = DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS,
+    cloudflareSolver = true,
+    cloudflareSolverTimeoutMs = DEFAULT_CLOUDFLARE_SOLVER_TIMEOUT_MS,
   } = {}) {
     this.enabled = Boolean(enabled);
     this.profile = profile || DEFAULT_PROFILE;
+    this.identityProfile = this.profile;
     this.verbose = Boolean(verbose);
     this.child = null;
     this.stdoutBuffer = "";
@@ -69,14 +73,26 @@ export class TlsFingerprintTransport {
       sameProxyRiskRetryDelayMs,
       DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS,
     );
+    this.cloudflareSolver = Boolean(cloudflareSolver);
+    this.cloudflareSolverTimeoutMs = normalizeRetryLimit(
+      cloudflareSolverTimeoutMs,
+      DEFAULT_CLOUDFLARE_SOLVER_TIMEOUT_MS,
+    );
   }
 
   async configure(proxy, { force = false } = {}) {
     if (!this.enabled) return;
     if (!force && this.configuredProxy === (proxy || null) && this.configuredProfile === this.profile) return;
-    const result = await this.send({ operation: "configure", proxy: proxy || null, impersonate: this.profile });
+    const result = await this.send({
+      operation: "configure",
+      proxy: proxy || null,
+      impersonate: this.profile,
+      verifyTls: shouldVerifyTlsForProxy(proxy),
+    });
     const actualProfile = String(result?.profile || "").trim();
     if (/^chrome\d+[a-z]?$/i.test(actualProfile)) this.profile = actualProfile;
+    const identityProfile = String(result?.identityProfile || actualProfile || this.profile).trim();
+    this.identityProfile = /^chrome\d+[a-z]?$/i.test(identityProfile) ? identityProfile : this.profile;
     this.configuredProxy = proxy || null;
     this.configuredProfile = this.profile;
   }
@@ -99,6 +115,7 @@ export class TlsFingerprintTransport {
           timeoutMs: PROFILE_PROBE_TOTAL_TIMEOUT_MS,
         });
         this.profile = String(result.profile);
+        this.identityProfile = this.profile;
         this.configuredProxy = null;
         this.configuredProfile = this.profile;
         console.log(
@@ -126,9 +143,14 @@ export class TlsFingerprintTransport {
       }
       try {
         await this.configure(proxy, { force: true });
+        const identity = browserIdentityForTlsProfile(this.identityProfile);
         const response = await this.request("GET", validationUrl, {
           timeoutMs: DEFAULT_TIMEOUT_MS,
-          discardBody: true,
+          discardBody: false,
+          headers: {
+            "user-agent": identity.userAgent,
+            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+          },
         });
         if (canRotate) console.log(`[proxy-session-attempt] ${randomUUID()}`);
         const challenge = response.headers.get("cf-mitigated") || response.headers.get("x-cf-mitigated");
@@ -181,6 +203,7 @@ export class TlsFingerprintTransport {
     };
     let result;
     let retries = 0;
+    let cloudflareSolveAttempted = false;
     for (;;) {
       try {
         result = await this.send(request);
@@ -192,6 +215,28 @@ export class TlsFingerprintTransport {
           );
         }
         throw error;
+      }
+      const riskControl = isRiskControlResult(result);
+      if (
+        riskControl
+        && this.cloudflareSolver
+        && !cloudflareSolveAttempted
+        && isSupportedCloudflareChallenge(result)
+      ) {
+        cloudflareSolveAttempted = true;
+        try {
+          const solved = await this.solveCloudflareChallenge(url, result, headers);
+          if (solved?.ok) {
+            console.log(`[cloudflare] 安全校验已完成，正在使用原代理会话重放 ${method} 请求。`);
+            result = await this.send(request);
+            if (!isRiskControlResult(result)) break;
+            console.log("[cloudflare] 校验后重放仍返回安全校验，继续执行代理兜底流程。");
+          } else {
+            console.log(`[cloudflare] 安全校验未通过（HTTP ${Number(solved?.status) || 0}），继续执行代理兜底流程。`);
+          }
+        } catch (error) {
+          console.log(`[cloudflare] 安全校验处理失败：${safeCloudflareError(error)}，继续执行代理兜底流程。`);
+        }
       }
       if (!options.retryRiskControl || !isRiskControlResult(result)) break;
       if (!this.hasConfiguredProxy() || retries >= this.sameProxyRiskRetries) {
@@ -229,6 +274,39 @@ export class TlsFingerprintTransport {
 
   async fetch(url, options = {}) {
     return this.request(options.method || "GET", url, options);
+  }
+
+  async solveCloudflareChallenge(url, result, headers) {
+    const userAgent = headers.find(([name]) => String(name).toLowerCase() === "user-agent")?.[1]
+      || browserIdentityForTlsProfile(this.identityProfile || this.profile).userAgent;
+    return this.send({
+      operation: "solve_cloudflare",
+      url,
+      challengeBody: result.body || "",
+      userAgent: String(userAgent),
+      browserIdentity: browserIdentityForTlsProfile(this.identityProfile || this.profile),
+      nodeCommand: process.execPath,
+      solverTimeoutMs: this.cloudflareSolverTimeoutMs,
+      timeoutMs: this.cloudflareSolverTimeoutMs,
+    });
+  }
+
+  async generateSentinelTokens({ flow, deviceID, pageUrl, includeSessionObserver = true } = {}) {
+    if (!this.enabled) {
+      throw new Error("动态 Sentinel 令牌需要启用 Python TLS 传输层");
+    }
+    const identity = browserIdentityForTlsProfile(this.identityProfile || this.profile);
+    return this.send({
+      operation: "generate_sentinel_tokens",
+      flow: String(flow || "default"),
+      deviceID: String(deviceID || ""),
+      pageUrl: String(pageUrl || "https://auth.openai.com/create-account/password"),
+      includeSessionObserver: Boolean(includeSessionObserver),
+      userAgent: identity.userAgent,
+      browserIdentity: identity,
+      nodeCommand: process.execPath,
+      timeoutMs: 120_000,
+    });
   }
 
   hasConfiguredProxy() {
@@ -272,6 +350,7 @@ export class TlsFingerprintTransport {
       this.child = null;
       this.configuredProxy = UNCONFIGURED;
       this.configuredProfile = null;
+      this.identityProfile = this.profile;
       if (!this.closed) this.failPending(new Error(`TLS worker exited unexpectedly with ${signal || code}`));
     });
   }
@@ -458,6 +537,31 @@ function isRiskControlResult(result) {
   if (status === 403) return /text\/html/i.test(contentType) || challengePage;
   const htmlPage = /text\/html/i.test(contentType) || /<(?:!doctype\s+html|html|head|body)\b/i.test(body);
   return [400, 409].includes(status) && htmlPage && challengePage;
+}
+
+function isSupportedCloudflareChallenge(result) {
+  if (!result?.body) return false;
+  try {
+    return /\b_cf_chl_opt\b/.test(Buffer.from(result.body, "base64").toString("utf8"));
+  } catch {
+    return false;
+  }
+}
+
+function safeCloudflareError(error) {
+  return String(error?.message || error || "未知错误")
+    .replace(/https?:\/\/\S+/gi, "<已隐藏地址>")
+    .slice(0, 220);
+}
+
+function shouldVerifyTlsForProxy(proxyUrl) {
+  if (!proxyUrl) return true;
+  try {
+    const hostname = new URL(proxyUrl).hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return !["localhost", "127.0.0.1", "::1"].includes(hostname);
+  } catch {
+    return true;
+  }
 }
 
 function isRetryableProxyConnectionError(error) {

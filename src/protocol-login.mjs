@@ -4,7 +4,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { fetchSentinelToken, fetchSentinelTokens } from "./sentinel.mjs";
 import {
   browserIdentityForTlsProfile,
   shouldUseTlsTransport,
@@ -57,7 +56,7 @@ function userAgentForTransport(transport) {
 }
 
 function browserIdentityForTransport(transport) {
-  return browserIdentityForTlsProfile(transport?.profile || "chrome146");
+  return browserIdentityForTlsProfile(transport?.identityProfile || transport?.profile || "chrome146");
 }
 
 function browserHeadersForTransport(transport) {
@@ -298,7 +297,7 @@ async function run() {
     profile:
       args.tlsProfile
       || process.env.TOSUB2_TLS_PROFILE
-      || (proxyTemplate || args.refreshSub2api ? "chrome146" : "auto"),
+      || "chrome146",
     verbose: Boolean(args.verbose),
     maxProxySessionAttempts: process.env.CHATGPT_PROXY_MAX_ATTEMPTS || 10,
     sameProxyRiskRetryDelayMs: process.env.CHATGPT_SAME_PROXY_RISK_RETRY_DELAY_MS,
@@ -690,9 +689,11 @@ async function addChatgptPassword(client, {
   });
   if (!signin.url) throw new Error("ADD_PASSWORD_AUTHORIZE_URL_MISSING: signin/openai did not return a URL");
 
+  const authRequestStartedAt = new Date().toISOString();
   const authPage = await client.follow(signin.url, { referer: `${chatgptBase}/` });
   let passwordPageUrl = authPage.finalUrl;
   if (isEmailVerificationPage(authPage.finalUrl)) {
+    console.log(`[email-otp-requested-at] ${authRequestStartedAt}`);
     console.log("[3/4] Add-password email verification reached. Enter code, or type r to resend.");
     const verified = await verifyAddPasswordEmailOtp(client, {
       authBase,
@@ -766,22 +767,40 @@ async function verifyAddPasswordEmailOtp(client, { authBase, rl, deviceId, refer
 
 async function createSentinelHeaders(client, { authBase, deviceId, flow }) {
   console.log(`[sentinel] Requesting a fresh security token for ${flow}.`);
-  const tokens = await fetchSentinelTokens({
-    flow,
-    deviceID: deviceId,
-    fetch: (url, options) => client.rawFetch(url, {
-      ...options,
-      signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
-      timeoutMs: DEFAULT_TIMEOUT_MS,
-    }),
-    reqEndpoint: sentinelRequirementsEndpoint(authBase),
-    deviceProfile: browserIdentityForTransport(client.transport),
-    sendClientHints: !client.transport?.enabled,
-  });
+  const tokens = await dynamicSentinelTokens(client, { authBase, deviceId, flow });
   return {
     "openai-sentinel-token": tokens.token,
     ...(tokens.soToken ? { "openai-sentinel-so-token": tokens.soToken } : {}),
   };
+}
+
+async function dynamicSentinelTokens(client, { authBase, deviceId, flow }) {
+  if (process.env.NODE_ENV === "test" && process.env.TOSUB2_TEST_SENTINEL_TOKEN) {
+    return {
+      token: JSON.stringify({ p: "test-proof", t: null, c: process.env.TOSUB2_TEST_SENTINEL_TOKEN, id: deviceId, flow }),
+      soToken: process.env.TOSUB2_TEST_SENTINEL_SO_TOKEN || null,
+    };
+  }
+  if (!client.transport?.enabled || typeof client.transport.generateSentinelTokens !== "function") {
+    throw new Error("动态 Sentinel 令牌需要启用 Python curl_cffi 传输层");
+  }
+  return client.transport.generateSentinelTokens({
+    flow,
+    deviceID: deviceId,
+    pageUrl: sentinelPageUrl(authBase, flow),
+    includeSessionObserver: true,
+  });
+}
+
+function sentinelPageUrl(authBase, flow) {
+  const pathname = {
+    email_otp_validate: "/email-verification",
+    oauth_create_account: "/about-you",
+    password_reset: "/reset-password/new-password",
+    password_verify: "/log-in/password",
+    username_password_create: "/create-account/password",
+  }[flow] || "/log-in";
+  return `${authBase}${pathname}`;
 }
 
 function validateNewAccountPassword(value) {
@@ -1004,6 +1023,7 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
   });
   if (!signin.url) throw new Error("signin/openai did not return url");
 
+  const authRequestStartedAt = new Date().toISOString();
   const authPage = await client.follow(signin.url, { referer: `${chatgptBase}/` });
   console.log(`[info] Auth page: ${safeUrl(authPage.finalUrl)}`);
   if (authPage.last?.text) {
@@ -1024,10 +1044,12 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     });
   } else if (isEmailVerificationPage(authPage.finalUrl)) {
     loginMethod = "email_otp";
+    console.log(`[email-otp-requested-at] ${authRequestStartedAt}`);
     console.log("[3/5] Email OTP page reached. Enter code, or type r to resend.");
     authenticated = await verifyEmailOtp(client, {
       authBase,
       rl,
+      deviceId,
       referer: authPage.finalUrl,
     });
   } else if (isCompletedChatgptLoginPage(authPage.finalUrl, chatgptBase, client)) {
@@ -1235,20 +1257,18 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
     `[profile] Account profile is incomplete; generating a name and an age between ${PROFILE_MIN_AGE} and ${PROFILE_MAX_AGE}.`,
   );
   console.log("[sentinel] Requesting a fresh security token for account profile creation.");
-  let sentinelToken;
+  let sentinelHeaders;
   try {
-    sentinelToken = await fetchSentinelToken({
+    const tokens = await dynamicSentinelTokens(client, {
+      authBase,
+      deviceId,
       flow: "oauth_create_account",
-      deviceID: deviceId,
-      fetch: (url, options) => client.rawFetch(url, {
-        ...options,
-        signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
-        timeoutMs: DEFAULT_TIMEOUT_MS,
-      }),
-      reqEndpoint: sentinelRequirementsEndpoint(authBase),
-      deviceProfile: browserIdentityForTransport(client.transport),
-      sendClientHints: !client.transport?.enabled,
     });
+    sentinelHeaders = {
+      "openai-sentinel-token": tokens.token,
+      ...(tokens.soToken ? { "openai-sentinel-so-token": tokens.soToken } : {}),
+    };
+    console.log(`[sentinel] Dynamic SDK token ready${tokens.soToken ? " with Session Observer token" : " without Session Observer token"}.`);
   } catch (error) {
     throw new Error(
       `[profile-security-check-required] Could not generate the Sentinel security token: ${error.message}`,
@@ -1265,7 +1285,7 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
       profile,
       {
         referer: profileUrl,
-        headers: { "openai-sentinel-token": sentinelToken },
+        headers: sentinelHeaders,
       },
     ));
   } catch (error) {
@@ -1279,16 +1299,23 @@ async function completeAccountProfileIfNeeded(client, { authBase, deviceId, payl
   if (isAccountProfileRequired(data)) {
     throw new Error("ACCOUNT_PROFILE_REQUIRED: Account profile submission did not advance the login flow.");
   }
+  const continueUrl = getContinueUrl(data);
+  let profileCompleted = data?.page?.type === "external_url";
+  try {
+    const target = new URL(continueUrl);
+    const authHost = new URL(authBase).hostname;
+    const expectedHost = authHost === "auth.openai.com" ? "chatgpt.com" : authHost;
+    profileCompleted = profileCompleted
+      && target.hostname === expectedHost
+      && target.pathname === "/api/auth/callback/openai";
+  } catch {
+    profileCompleted = false;
+  }
+  if (!profileCompleted) {
+    throw new Error("ACCOUNT_PROFILE_RESULT_INVALID: Profile submission did not return the ChatGPT callback.");
+  }
   console.log("[ok] Account profile completed");
   return data;
-}
-
-function sentinelRequirementsEndpoint(authBase) {
-  const target = new URL(authBase);
-  if (target.hostname === "auth.openai.com") {
-    return "https://sentinel.openai.com/backend-api/sentinel/req";
-  }
-  return new URL("/backend-api/sentinel/req", target).toString();
 }
 
 function generateAccountProfile(now = new Date()) {
@@ -1875,13 +1902,18 @@ async function askEmailOtp(rl, client, authBase) {
   }
 }
 
-async function verifyEmailOtp(client, { authBase, rl, referer }) {
+async function verifyEmailOtp(client, { authBase, rl, deviceId, referer }) {
   for (;;) {
     const emailCode = await askEmailOtp(rl, client, authBase);
     try {
+      const sentinelHeaders = await createSentinelHeaders(client, {
+        authBase,
+        deviceId,
+        flow: "email_otp_validate",
+      });
       const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/email-otp/validate", {
         code: emailCode,
-      }, { referer });
+      }, { referer, headers: sentinelHeaders });
       return data;
     } catch (error) {
       if (!isRejectedEmailOtpError(error)) throw error;
@@ -1897,6 +1929,7 @@ function isRejectedEmailOtpError(error) {
 }
 
 async function resendEmailOtp(client, authBase) {
+  const requestStartedAt = new Date().toISOString();
   const result = await client.request("POST", `${authBase}/api/accounts/email-otp/resend`, {
     origin: authBase,
     referer: `${authBase}/email-verification`,
@@ -1909,6 +1942,7 @@ async function resendEmailOtp(client, authBase) {
     throw new Error("Too many email OTP resend attempts. Wait a while before retrying.");
   }
   assertOk(result, `POST ${authBase}/api/accounts/email-otp/resend`);
+  console.log(`[email-otp-requested-at] ${requestStartedAt}`);
 }
 
 async function continueFlow(client, payload) {
@@ -2343,7 +2377,7 @@ Options:
   --priority <number>             sub2api priority. Default: 1
   --rate-multiplier <number>      sub2api rate_multiplier. Default: 1
   --proxy <url>                   Account proxy; supports http, socks5 and socks5h.
-  --tls-profile <name>            curl_cffi browser profile. Default: auto-probe without proxy; chrome146 with proxy
+  --tls-profile <name>            curl_cffi browser profile. Default: chrome146; use auto to enable probing
   --native-http                   Disable the Python TLS fingerprint transport.
   --chatgpt-base <url>            Default: ${DEFAULT_CHATGPT_BASE}
   --auth-base <url>               Default: ${DEFAULT_AUTH_BASE}

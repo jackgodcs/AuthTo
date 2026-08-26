@@ -23,16 +23,22 @@ export async function fetchMailboxOtpCandidates(url, options = {}) {
   if (!validateMailApiUrl(url)) throw new Error("收码接口必须是有效的 HTTP 或 HTTPS 地址");
 
   const fetchImpl = options.fetchImpl || fetch;
+  const request = options.request && typeof options.request === "object" ? options.request : {};
+  const method = String(request.method || "GET").toUpperCase();
+  const requestBody = method === "POST" ? String(request.body || "") : "";
+  const headers = new Headers({
+    accept: "application/json, text/plain, text/html, */*",
+    "user-agent": "Mozilla/5.0 ChatGPT-Onboarding-Console/1.0",
+  });
+  Object.entries(request.headers || {}).forEach(([name, value]) => headers.set(name, String(value)));
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), options.timeoutMs || DEFAULT_TIMEOUT_MS);
   let response;
   try {
     response = await fetchImpl(url, {
-      method: "GET",
-      headers: {
-        accept: "application/json, text/plain, text/html, */*",
-        "user-agent": "Mozilla/5.0 ChatGPT-Onboarding-Console/1.0",
-      },
+      method,
+      headers,
+      ...(method === "POST" && requestBody ? { body: requestBody } : {}),
       redirect: "follow",
       signal: controller.signal,
     });
@@ -47,14 +53,21 @@ export async function fetchMailboxOtpCandidates(url, options = {}) {
   }
 }
 
+export function filterMailboxOtpCandidatesByRequestTime(candidates, requestedAt) {
+  const cutoff = Number(requestedAt);
+  if (!Number.isFinite(cutoff) || cutoff <= 0) return candidates;
+  return candidates.filter((candidate) => !candidate.receivedAt || candidate.receivedAt >= cutoff);
+}
+
 export function extractMailboxOtpCandidates(raw) {
   const input = String(raw || "");
-  const sources = [{ path: "$raw", text: input, messageId: null, receivedAt: null }];
+  let sources;
 
   try {
+    sources = [];
     collectTextSources(JSON.parse(input), "$", sources, new WeakSet(), {});
   } catch {
-    // Plain text and HTML responses are scanned through the raw source.
+    sources = [{ path: "$raw", text: input, messageId: null, receivedAt: null }];
   }
 
   const candidates = new Map();
@@ -70,9 +83,11 @@ export function extractMailboxOtpCandidates(raw) {
         const context = normalized.slice(start, end);
         let score = 0;
         if (CODE_CONTEXT_PATTERN.test(context)) score += 40;
-        if (CODE_KEY_PATTERN.test(source.path)) score += 40;
-        if (CONTENT_KEY_PATTERN.test(source.path)) score += 12;
+        const fieldName = source.path.match(/\.([^.[\]]+)$/)?.[1] || source.path;
+        if (CODE_KEY_PATTERN.test(fieldName)) score += 40;
+        if (CONTENT_KEY_PATTERN.test(fieldName)) score += 12;
         if (normalized.trim() === code) score += 30;
+        if (score <= 0) continue;
         if (normalized.length <= 500) score += 4;
         score -= Math.min(sourceIndex, 20) * 0.01;
 
@@ -93,7 +108,11 @@ export function extractMailboxOtpCandidates(raw) {
   });
 
   return [...candidates.values()]
-    .sort((a, b) => b.score - a.score || (b.receivedAt || 0) - (a.receivedAt || 0))
+    .sort((a, b) => {
+      if (a.receivedAt && b.receivedAt && a.receivedAt !== b.receivedAt) return b.receivedAt - a.receivedAt;
+      if (Boolean(a.receivedAt) !== Boolean(b.receivedAt)) return b.receivedAt ? 1 : -1;
+      return b.score - a.score;
+    })
     .map(({ code, score, key, receivedAt }) => ({ code, score, key, receivedAt }));
 }
 

@@ -37,6 +37,7 @@ const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
 const LUBAN_SERVICE_ID_STORAGE_KEY = "chatgpt-onboarding.luban-service-id";
 const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
+const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const SMS_PROVIDER_EXTERNAL_LINKS = {
@@ -81,6 +82,11 @@ function App() {
   const [smsSettingsError, setSmsSettingsError] = useState("");
   const [smsNumberOptions, setSmsNumberOptions] = useState([]);
   const [smsOptionsLoading, setSmsOptionsLoading] = useState(false);
+  const [mailRequestSettings, setMailRequestSettings] = useState(readMailRequestSettings);
+  const [mailRequestSettingsDraft, setMailRequestSettingsDraft] = useState(readMailRequestSettings);
+  const [mailRequestSettingsOpen, setMailRequestSettingsOpen] = useState(false);
+  const [mailRequestSettingsError, setMailRequestSettingsError] = useState("");
+  const [mailRequestSettingsSaving, setMailRequestSettingsSaving] = useState(false);
   const [sub2apiSettings, setSub2apiSettings] = useState(readSub2ApiSettings);
   const [sub2apiSettingsDraft, setSub2apiSettingsDraft] = useState(readSub2ApiSettings);
   const [sub2apiGroups, setSub2apiGroups] = useState([]);
@@ -104,6 +110,7 @@ function App() {
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
+  useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
   useEffect(() => writeLocalJson(SUB2API_UPLOAD_SETTINGS_KEY, sub2apiSettings), [sub2apiSettings]);
   useEffect(() => writeLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY, accountProxyUrl.trim()), [accountProxyUrl]);
 
@@ -122,6 +129,14 @@ function App() {
       stopped = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!token) return;
+    void apiFetch(token, "/api/mail-request-config", {
+      method: "POST",
+      body: JSON.stringify({ config: buildMailRequestConfig(mailRequestSettings) }),
+    }).catch((requestError) => setError(requestError.message));
+  }, [token]);
 
   useEffect(() => {
     if (!token) return undefined;
@@ -212,6 +227,37 @@ function App() {
     setSmsSettingsDraft(draft);
     setSmsSettingsError("");
     setSmsSettingsOpen(true);
+  }
+
+  function openMailRequestSettings() {
+    setMailRequestSettingsDraft({ ...mailRequestSettings });
+    setMailRequestSettingsError("");
+    setMailRequestSettingsOpen(true);
+  }
+
+  async function saveMailRequestSettings(event) {
+    event.preventDefault();
+    let config;
+    try {
+      config = buildMailRequestConfig(mailRequestSettingsDraft);
+    } catch (requestError) {
+      setMailRequestSettingsError(requestError.message);
+      return;
+    }
+    setMailRequestSettingsSaving(true);
+    setMailRequestSettingsError("");
+    try {
+      await apiFetch(token, "/api/mail-request-config", {
+        method: "POST",
+        body: JSON.stringify({ config }),
+      });
+      setMailRequestSettings(normalizeMailRequestSettings(mailRequestSettingsDraft));
+      setMailRequestSettingsOpen(false);
+    } catch (requestError) {
+      setMailRequestSettingsError(requestError.message);
+    } finally {
+      setMailRequestSettingsSaving(false);
+    }
   }
 
   function openSub2ApiSettings() {
@@ -727,6 +773,18 @@ function App() {
           </button>
         </div>
 
+        <div className="provider-toolbar mail-request-toolbar" aria-label="邮件接码请求配置">
+          <div className="provider-heading"><MailCheck size={17} /><strong>邮件 API</strong></div>
+          <span className="provider-name">{mailRequestSettings.method}</span>
+          <span className="provider-ready">
+            <Check size={14} />
+            {formatMailRequestSummary(mailRequestSettings)}
+          </span>
+          <button type="button" className="secondary-button provider-settings-button" onClick={openMailRequestSettings} disabled={!token}>
+            <Settings2 size={16} />配置
+          </button>
+        </div>
+
         <div className="provider-toolbar sub2api-toolbar" aria-label="Sub2API 配置与号池监控">
           <div className="provider-heading"><Send size={17} /><strong>Sub2API</strong></div>
           <span className="provider-name">{sub2apiSettings.baseUrl || "未配置后端"}</span>
@@ -1075,6 +1133,80 @@ function App() {
           </form>
         </div>
       )}
+      {mailRequestSettingsOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !mailRequestSettingsSaving) setMailRequestSettingsOpen(false);
+        }}>
+          <form className="batch-dialog mail-request-settings-dialog" onSubmit={saveMailRequestSettings} role="dialog" aria-modal="true" aria-labelledby="mail-request-settings-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="mail-request-settings-title">邮件 API 请求配置</h2>
+                <span>配置保存在当前浏览器，请求内容不会写入任务日志</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setMailRequestSettingsOpen(false)} disabled={mailRequestSettingsSaving} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="provider-tabs mail-method-tabs" role="tablist" aria-label="邮件 API 请求方式">
+              {["GET", "POST"].map((method) => (
+                <button
+                  key={method}
+                  type="button"
+                  role="tab"
+                  aria-selected={mailRequestSettingsDraft.method === method}
+                  className={mailRequestSettingsDraft.method === method ? "active" : ""}
+                  onClick={() => setMailRequestSettingsDraft((current) => ({ ...current, method }))}
+                >
+                  {method}
+                </button>
+              ))}
+            </div>
+
+            <div className="provider-config-grid mail-request-config-grid">
+              {mailRequestSettingsDraft.method === "POST" && (
+                <label className="settings-field wide-settings-field">
+                  <span className="mail-request-url-label">
+                    统一 POST 请求 URL
+                    <small>必填</small>
+                  </span>
+                  <input
+                    className="mail-request-url-input"
+                    type="url"
+                    value={mailRequestSettingsDraft.url}
+                    onChange={(event) => setMailRequestSettingsDraft((current) => ({ ...current, url: event.target.value }))}
+                    placeholder="https://mail.example/api/messages"
+                    autoComplete="off"
+                    spellCheck="false"
+                  />
+                  <small>每个账号自己的请求体请在批量添加账号时一并导入</small>
+                </label>
+              )}
+              <label className="settings-field wide-settings-field">
+                <span>请求头 JSON</span>
+                <textarea
+                  className="settings-textarea"
+                  value={mailRequestSettingsDraft.headersText}
+                  onChange={(event) => setMailRequestSettingsDraft((current) => ({ ...current, headersText: event.target.value }))}
+                  placeholder={'{"Authorization":"Bearer ...","Referer":"https://mail.example/"}'}
+                  rows="7"
+                  autoComplete="off"
+                  spellCheck="false"
+                />
+              </label>
+            </div>
+
+            {mailRequestSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{mailRequestSettingsError}</div>}
+            <div className="dialog-footer">
+              <button type="button" className="cancel-button" onClick={() => setMailRequestSettingsOpen(false)} disabled={mailRequestSettingsSaving}>取消</button>
+              <button type="submit" className="primary-button" disabled={mailRequestSettingsSaving || !token}>
+                {mailRequestSettingsSaving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
+                保存配置
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
       {sub2apiSettingsOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setSub2apiSettingsOpen(false);
@@ -1271,12 +1403,18 @@ function App() {
                 <X size={18} />
               </button>
             </div>
-            <label className="batch-label" htmlFor="batch-input">每行一个账号：自动识别邮箱、密码、邮件 API 和 2FA，字段顺序不限</label>
+            <label className="batch-label" htmlFor="batch-input">
+              {mailRequestSettings.method === "POST"
+                ? "每行：邮箱----编码请求体，或 邮箱----密码----编码请求体；邮箱及可识别字段顺序不限"
+                : "每行一个账号：自动识别邮箱、密码、邮件 API 和 2FA，字段顺序不限"}
+            </label>
             <textarea
               id="batch-input"
               value={batchText}
               onChange={(event) => setBatchText(event.target.value)}
-              placeholder={"name@icloud.com----https://mail.example/messages/name\nhttps://mail.example/messages/name2|账号密码|name2@example.co.uk|BASE32二步验证密钥\nBASE32二步验证密钥::name3@example.dev::账号密码"}
+              placeholder={mailRequestSettings.method === "POST"
+                ? "a@example.com----eyJtYWlsYm94X2lkIjoiaWQtYSJ9\nb@example.com----账号密码----mailbox_id%3Did-b"
+                : "name@icloud.com----https://mail.example/messages/name\nhttps://mail.example/messages/name2|账号密码|name2@example.co.uk|BASE32二步验证密钥\nBASE32二步验证密钥::name3@example.dev::账号密码"}
               spellCheck="false"
               autoFocus
             />
@@ -1960,6 +2098,64 @@ function readSmsProviderSettings() {
       },
     },
   };
+}
+
+function normalizeMailRequestSettings(value) {
+  const stored = value && typeof value === "object" ? value : {};
+  let headersText = typeof stored.headersText === "string" ? stored.headersText : "";
+  if (!headersText && stored.headers && typeof stored.headers === "object" && !Array.isArray(stored.headers)) {
+    headersText = JSON.stringify(stored.headers, null, 2);
+  }
+  return {
+    method: String(stored.method || "GET").toUpperCase() === "POST" ? "POST" : "GET",
+    url: typeof stored.url === "string" ? stored.url.trim() : "",
+    headersText: headersText.trim() || "{}",
+  };
+}
+
+function readMailRequestSettings(value) {
+  try {
+    const stored = value || JSON.parse(window.localStorage.getItem(MAIL_REQUEST_SETTINGS_KEY) || "null");
+    return normalizeMailRequestSettings(stored);
+  } catch {
+    return normalizeMailRequestSettings({});
+  }
+}
+
+function buildMailRequestConfig(settings) {
+  const normalized = normalizeMailRequestSettings(settings);
+  let headers;
+  try {
+    headers = JSON.parse(normalized.headersText || "{}");
+  } catch {
+    throw new Error("请求头必须是有效的 JSON 对象");
+  }
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    throw new Error("请求头必须是 JSON 对象，例如 {\"Authorization\":\"Bearer ...\"}");
+  }
+  if (normalized.method === "POST") {
+    try {
+      const parsedUrl = new URL(normalized.url);
+      if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new Error();
+    } catch {
+      throw new Error("POST 模式必须填写有效的 HTTP 或 HTTPS 请求 URL");
+    }
+  }
+  return {
+    method: normalized.method,
+    url: normalized.method === "POST" ? normalized.url : "",
+    headers,
+  };
+}
+
+function formatMailRequestSummary(settings) {
+  try {
+    const config = buildMailRequestConfig(settings);
+    const headerCount = Object.keys(config.headers).length;
+    return `${config.method === "POST" ? "已配置统一 URL · " : ""}${headerCount} 个请求头`;
+  } catch {
+    return "配置需要检查";
+  }
 }
 
 function normalizeSub2ApiSettings(value) {
