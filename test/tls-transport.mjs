@@ -53,6 +53,7 @@ try {
   await fallbackTransport.close();
   await testConfigureStageProfileFallback();
   testCloudflareWorkerSessionReuse();
+  testCloudflareClearanceScope();
   testSentinelWorkerSessionReuse();
   testProfileProbeWorker();
   testBrowserIdentity();
@@ -402,6 +403,46 @@ assert captured["node_command"] == "/usr/local/bin/node"
     windowsHide: true,
   });
   assert.equal(result.status, 0, `Cloudflare worker session reuse test failed:\n${result.stderr || result.stdout}`);
+}
+
+function testCloudflareClearanceScope() {
+  const python = findTestPython();
+  assert.ok(python, "a Python interpreter is required for Cloudflare cookie tests");
+  const solverPath = fileURLToPath(new URL("../src/cloudflare-ctf/cloudflare_solver.py", import.meta.url));
+  const script = String.raw`
+import importlib.util
+import sys
+import time
+from types import SimpleNamespace
+
+spec = importlib.util.spec_from_file_location("tosub2_cloudflare_solver", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+now = time.time()
+cookies = [
+    SimpleNamespace(name="cf_clearance", value="chatgpt-current", domain=".chatgpt.com", path="/", expires=now + 3600),
+    SimpleNamespace(name="cf_clearance", value="auth-expired", domain=".openai.com", path="/", expires=now - 60),
+]
+session = SimpleNamespace(cookies=SimpleNamespace(jar=cookies))
+assert module.clearance_values(session, "https://chatgpt.com/") == {"chatgpt-current"}
+assert module.clearance_values(session, "https://auth.openai.com/api/accounts/authorize") == set()
+
+cookies.append(SimpleNamespace(
+    name="cf_clearance", value="auth-current", domain=".openai.com", path="/", expires=now + 3600,
+))
+baseline = module.clearance_values(session, "https://auth.openai.com/api/accounts/authorize")
+assert baseline == {"auth-current"}
+cookies[-1].value = "auth-refreshed"
+current = module.clearance_values(session, "https://auth.openai.com/api/accounts/authorize")
+assert current - baseline == {"auth-refreshed"}
+`;
+  const result = spawnSync(python.command, [...python.args, "-c", script, solverPath], {
+    encoding: "utf8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    windowsHide: true,
+  });
+  assert.equal(result.status, 0, `Cloudflare cookie scope test failed:\n${result.stderr || result.stdout}`);
 }
 
 function testSentinelWorkerSessionReuse() {

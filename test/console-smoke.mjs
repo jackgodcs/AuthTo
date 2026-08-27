@@ -941,6 +941,27 @@ try {
   assert.equal(blockedCheck.result.started, 0);
   assert.equal(blockedCheck.result.blocked, 1);
 
+  const directRiskResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "direct-risk-retry@example.com" }),
+  });
+  assert.equal(directRiskResponse.status, 201);
+  const directRiskCreated = await directRiskResponse.json();
+  const directRiskFailed = await waitForJob(
+    headers,
+    directRiskCreated.job.id,
+    (value) => value.status === "failed",
+  );
+  assert.match(directRiskFailed.lastError || "", /直连 TLS 指纹筛选已经使用过/);
+  const directRiskReloginResponse = await fetch(`${baseUrl}/api/jobs/${directRiskCreated.job.id}/relogin`, {
+    method: "POST",
+    headers,
+    body: "{}",
+  });
+  assert.equal(directRiskReloginResponse.status, 200, await directRiskReloginResponse.text());
+  await waitForJob(headers, directRiskCreated.job.id, (value) => value.status === "completed");
+
   const rotatingProxy = "socks5h://account-region-JP-sid-initial-t-20:password@proxy.example:5000";
   const proxyRetryResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -1016,6 +1037,7 @@ try {
       proxyAlwaysCreated.job.id,
       proxyConnectionCreated.job.id,
       proxyConnectionAlwaysCreated.job.id,
+      directRiskCreated.job.id,
       bannedJobId,
       manualPhoneJobId,
       phoneFallbackJobId,
@@ -1027,7 +1049,7 @@ try {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 26);
+  assert.equal(deleted.deleted, 27);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);

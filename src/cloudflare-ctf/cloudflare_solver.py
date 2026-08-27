@@ -211,9 +211,28 @@ def write_message(process: subprocess.Popen[str], message: dict[str, Any]) -> No
     process.stdin.flush()
 
 
-def has_clearance(session) -> bool:
+def clearance_values(session, target_url: str) -> set[str]:
     jar = getattr(session.cookies, "jar", None)
-    return bool(jar and any(cookie.name == "cf_clearance" and cookie.value for cookie in jar))
+    if not jar:
+        return set()
+    target = urlparse(target_url)
+    host = (target.hostname or "").lower()
+    path = target.path or "/"
+    now = time.time()
+    values: set[str] = set()
+    for cookie in jar:
+        if cookie.name != "cf_clearance" or not cookie.value:
+            continue
+        domain = str(cookie.domain or "").lstrip(".").lower()
+        cookie_path = str(cookie.path or "/")
+        if not domain or not (host == domain or host.endswith(f".{domain}")):
+            continue
+        if cookie.expires is not None and cookie.expires <= now:
+            continue
+        if not (path == cookie_path or path.startswith(cookie_path.rstrip("/") + "/")):
+            continue
+        values.add(str(cookie.value))
+    return values
 
 
 def solve_challenge(
@@ -231,6 +250,7 @@ def solve_challenge(
     if "_cf_chl_opt" not in challenge_html:
         raise RuntimeError("The response does not contain a supported Cloudflare challenge")
 
+    initial_clearance = clearance_values(session, challenge_url)
     parent: subprocess.Popen[str] | None = None
     child: subprocess.Popen[str] | None = None
     input_files: list[tempfile.NamedTemporaryFile[str]] = []
@@ -346,7 +366,8 @@ def solve_challenge(
                 selector.register(child.stdout, selectors.EVENT_READ, ("child", child))
                 child_started = True
 
-            if has_clearance(session):
+            current_clearance = clearance_values(session, challenge_url)
+            if current_clearance - initial_clearance:
                 verification = session.get(
                     verification_url or challenge_url,
                     headers=navigation_headers(user_agent, browser_identity),

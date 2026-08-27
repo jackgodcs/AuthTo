@@ -988,6 +988,7 @@ async function retryJob(job, options = {}) {
   job.attempt += 1;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
@@ -1025,6 +1026,7 @@ async function regenerateJob(job, options = {}) {
   job.attempt += 1;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
@@ -1068,6 +1070,7 @@ async function forceReloginJob(job, options = {}, context = {}) {
   job.totpSetupError = null;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
@@ -1146,6 +1149,7 @@ async function startTotpSetup(job, options = {}) {
   job.totpSetupResumesAuthorization = resumeAuthorization;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
@@ -1183,6 +1187,7 @@ async function startPasswordAdd(job, options = {}) {
   job.passwordAddError = null;
   job.proxyRiskRetryCount = 0;
   job.proxyConnectionFailureCount = 0;
+  job.directTlsFallbackAttempted = false;
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";

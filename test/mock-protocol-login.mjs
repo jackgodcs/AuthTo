@@ -89,7 +89,7 @@ try {
     return;
   }
 
-  if (["proxy-risk-retry@example.com", "proxy-risk-always@example.com"].includes(args.email)) {
+  if (["proxy-risk-retry@example.com", "proxy-risk-always@example.com", "direct-risk-retry@example.com"].includes(args.email)) {
     console.log(`[proxy-session-attempt] ${crypto.randomUUID()}`);
     const attemptPath = `${args.sub2apiOut}.proxy-risk-attempt`;
     let attempt = 0;
