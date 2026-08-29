@@ -48,7 +48,8 @@ const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
 const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
-const PAGE_SIZE = 20;
+const DEFAULT_PAGE_SIZE = 20;
+const PAGE_SIZES = new Set([20, 50, 100]);
 const MAX_LOG_CHARS = 80_000;
 const JOB_META_FILENAME = "job-meta.json";
 const ACCOUNT_GROUPS_FILENAME = "account-groups.json";
@@ -262,7 +263,8 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "GET" && requestUrl.pathname === "/api/jobs") {
     const requestedPage = Math.max(1, Number.parseInt(requestUrl.searchParams.get("page") || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage);
+    const pageSize = normalizePageSize(requestUrl.searchParams.get("pageSize"));
+    await sendJobsPage(res, requestedPage, { pageSize });
     return;
   }
 
@@ -390,12 +392,16 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/group") {
     const body = await readJson(req);
-    const target = await resolveAccountGroupAssignment(body);
     const selected = resolveSelectedJobs(body.ids);
-    await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
-      job.groupId = target.group?.id || null;
-      touch(job);
-      await saveJobMetadata(job);
+    const target = await resolveAccountGroupAssignment(body);
+    const emails = [...new Set(selected.map((job) => job.email.toLowerCase()))];
+    await Promise.all(emails.map((email) => withEmailJobLock(email, async () => {
+      const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
+      matching.forEach((job) => {
+        job.groupId = target.group?.id || null;
+        touch(job);
+      });
+      await Promise.all(matching.map((job) => saveJobMetadata(job)));
     })));
     sendJson(res, 200, {
       jobs: selected.map(publicJob),
@@ -712,14 +718,15 @@ async function sendJobsPage(res, requestedPage, filters = {}) {
     return true;
   });
   const total = visibleJobs.length;
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const pageSize = filters.pageSize || DEFAULT_PAGE_SIZE;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const page = Math.min(requestedPage, totalPages);
-  const start = (page - 1) * PAGE_SIZE;
+  const start = (page - 1) * pageSize;
   sendJson(res, 200, {
-    jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
+    jobs: visibleJobs.slice(start, start + pageSize).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
     groups: publicAccountGroups(allJobs),
-    pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
+    pagination: { page, pageSize, total, totalPages, totalAll: allJobs.length },
     filter: {
       active: Boolean(emailSet || status || groupId || search),
       requested: filters.emails?.length || 0,
@@ -755,7 +762,17 @@ function normalizeJobsQuery(body = {}) {
   const search = String(body.search || "").trim().toLowerCase();
   if (search.length > 254) throw httpError(400, "账号查找内容不能超过 254 个字符");
   const groupId = normalizeAccountGroupFilter(body.groupId);
-  return { emails, status: status || null, groupId, search };
+  const pageSize = normalizePageSize(body.pageSize);
+  return { emails, status: status || null, groupId, search, pageSize };
+}
+
+function normalizePageSize(value) {
+  if (value === undefined || value === null || value === "") return DEFAULT_PAGE_SIZE;
+  const pageSize = Number.parseInt(String(value), 10);
+  if (!PAGE_SIZES.has(pageSize) || String(pageSize) !== String(value).trim()) {
+    throw httpError(400, "每页显示数量只能是 20、50 或 100");
+  }
+  return pageSize;
 }
 
 function normalizeAccountGroupFilter(value) {

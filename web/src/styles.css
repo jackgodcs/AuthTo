@@ -586,6 +586,9 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .pagination span { min-width: 92px; text-align: center; }
 .pagination strong { color: var(--ink); }
+.page-size-field { display: inline-flex; align-items: center; gap: 7px; color: #596660; font-size: 12px; white-space: nowrap; }
+.page-size-field select { width: 66px; height: 32px; padding: 0 7px; outline: 0; color: var(--ink); background: #fff; border: 1px solid #cdd5d1; border-radius: 5px; font: inherit; cursor: pointer; }
+.page-size-field select:focus { border-color: var(--green); box-shadow: 0 0 0 2px rgba(18, 113, 91, .1); }
 
 .modal-backdrop {
   position: fixed;

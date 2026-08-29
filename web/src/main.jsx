@@ -44,6 +44,7 @@ const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
 const UNGROUPED_ACCOUNT_FILTER = "__ungrouped__";
 const NEW_ACCOUNT_GROUP_OPTION = "__new__";
+const PAGE_SIZE_OPTIONS = [20, 50, 100];
 const STATUS_FILTER_OPTIONS = [
   ["", "全部状态"],
   ["queued", "排队中"],
@@ -108,6 +109,7 @@ function App() {
   const [jobSelectionIndex, setJobSelectionIndex] = useState([]);
   const [batchAction, setBatchAction] = useState("");
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
   const [smsSettings, setSmsSettings] = useState(readSmsProviderSettings);
@@ -183,14 +185,14 @@ function App() {
         const data = hasQuery
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(search ? { search } : {}) }),
+              body: JSON.stringify({ page, pageSize, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(search ? { search } : {}) }),
             })
-          : await apiFetch(token, `/api/jobs?page=${page}`);
+          : await apiFetch(token, `/api/jobs?page=${page}&pageSize=${pageSize}`);
         if (!stopped) {
           setJobs(data.jobs);
           setJobSelectionIndex(data.selection || data.jobs);
           setAccountGroups(Array.isArray(data.groups) ? data.groups : []);
-          setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
+          setPagination(data.pagination || { page, pageSize, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
@@ -206,7 +208,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter, statusFilter, groupFilter, accountSearch]);
+  }, [token, page, pageSize, emailFilter, statusFilter, groupFilter, accountSearch]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -507,7 +509,7 @@ function App() {
         body: JSON.stringify({ email: email.trim(), proxyUrl: accountProxyUrl.trim() }),
       });
       setPage(1);
-      if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
+      if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, pageSize));
       setEmail("");
       setError("");
     } catch (requestError) {
@@ -527,7 +529,7 @@ function App() {
         body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
       });
       setPage(1);
-      if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
+      if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, pageSize));
       setBatchText("");
       setBatchError("");
       setBatchOpen(false);
@@ -1175,15 +1177,33 @@ function App() {
             </tbody>
           </table>
         </div>
-        {features.pagination && pagination.totalPages > 1 && (
+        {features.pagination && (
           <nav className="pagination" aria-label="任务分页">
-            <button type="button" className="icon-button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1} title="上一页">
-              <ChevronLeft size={17} />
-            </button>
-            <span>第 <strong>{pagination.page}</strong> / {pagination.totalPages} 页</span>
-            <button type="button" className="icon-button" onClick={() => setPage((current) => Math.min(pagination.totalPages, current + 1))} disabled={page >= pagination.totalPages} title="下一页">
-              <ChevronRight size={17} />
-            </button>
+            <label className="page-size-field">
+              <span>每页显示</span>
+              <select
+                value={pageSize}
+                onChange={(event) => {
+                  setPageSize(Number(event.target.value));
+                  setPage(1);
+                  setExpandedJobId(null);
+                }}
+                aria-label="每页显示数量"
+              >
+                {PAGE_SIZE_OPTIONS.map((size) => <option key={size} value={size}>{size}</option>)}
+              </select>
+            </label>
+            {pagination.totalPages > 1 && (
+              <>
+                <button type="button" className="icon-button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1} title="上一页">
+                  <ChevronLeft size={17} />
+                </button>
+                <span>第 <strong>{pagination.page}</strong> / {pagination.totalPages} 页</span>
+                <button type="button" className="icon-button" onClick={() => setPage((current) => Math.min(pagination.totalPages, current + 1))} disabled={page >= pagination.totalPages} title="下一页">
+                  <ChevronRight size={17} />
+                </button>
+              </>
+            )}
           </nav>
         )}
       </section>

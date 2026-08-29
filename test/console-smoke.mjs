@@ -189,6 +189,7 @@ try {
   assert.equal(postMailBatchResponse.status, 201, postMailBatchText);
   const postMailBatch = JSON.parse(postMailBatchText);
   assert.equal(postMailBatch.jobs.length, 3);
+  postMailBatch.jobs.forEach((job) => assert.equal(job.groupId, null, "newly imported accounts start ungrouped"));
   assert.equal(postMailBatch.jobs.find((job) => job.email === "post-body@example.com").loginMode, "email_otp");
   assert.equal(postMailBatch.jobs.find((job) => job.email === "post-password@example.com").loginMode, "password");
   assert.equal(postMailBatch.jobs.find((job) => job.email === "post-unordered@example.com").loginMode, "password");
@@ -237,6 +238,7 @@ try {
   assert.equal(createdResponse.status, 201);
   const created = await createdResponse.json();
   assert.equal(created.created, true);
+  assert.equal(created.job.groupId, null, "newly created accounts start ungrouped");
   assert.equal(created.job.lastOperationType, "initial_authorization");
   assert.ok(Date.parse(created.job.lastOperationAt));
   const jobId = created.job.id;
@@ -258,8 +260,25 @@ try {
   assert.equal(filteredJobsResponse.status, 200, filteredJobsText);
   const filteredJobs = JSON.parse(filteredJobsText);
   assert.equal(filteredJobs.pagination.total, 1);
+  assert.equal(filteredJobs.pagination.pageSize, 20);
   assert.equal(filteredJobs.jobs[0].id, jobId);
   assert.deepEqual(filteredJobs.selection.map((item) => item.id), [jobId]);
+
+  const largerPageResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, pageSize: 50, emails: ["cross-platform@example.com"] }),
+  });
+  const largerPageText = await largerPageResponse.text();
+  assert.equal(largerPageResponse.status, 200, largerPageText);
+  assert.equal(JSON.parse(largerPageText).pagination.pageSize, 50);
+
+  const invalidPageSizeResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, pageSize: 30 }),
+  });
+  assert.equal(invalidPageSizeResponse.status, 400, await invalidPageSizeResponse.text());
 
   const createGroupResponse = await fetch(`${baseUrl}/api/account-groups`, {
     method: "POST",
@@ -303,6 +322,25 @@ try {
   assert.equal(secondGroupResult.created, true);
   const secondGroup = secondGroupResult.group;
   assert.equal(secondGroup.name, "第二批账号");
+  assert.equal(secondGroupResult.jobs[0].groupId, secondGroup.id);
+
+  const firstGroupAfterMoveResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, groupId: firstGroup.id }),
+  });
+  const firstGroupAfterMoveText = await firstGroupAfterMoveResponse.text();
+  assert.equal(firstGroupAfterMoveResponse.status, 200, firstGroupAfterMoveText);
+  assert.equal(JSON.parse(firstGroupAfterMoveText).pagination.total, 0, "an account cannot remain in its previous group after moving");
+
+  const secondGroupQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, groupId: secondGroup.id }),
+  });
+  const secondGroupQueryText = await secondGroupQueryResponse.text();
+  assert.equal(secondGroupQueryResponse.status, 200, secondGroupQueryText);
+  assert.equal(JSON.parse(secondGroupQueryText).pagination.total, 1);
 
   const deleteGroupResponse = await fetch(`${baseUrl}/api/account-groups/${secondGroup.id}`, {
     method: "DELETE",
