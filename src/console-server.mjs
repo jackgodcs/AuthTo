@@ -21,8 +21,29 @@ import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-trans
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
-const DEFAULT_TLS_PROFILE = "chrome146";
+const DEFAULT_TLS_PROFILE = "chrome";
+const DEFAULT_CHATGPT_PROXY_URL = String(process.env.CHATGPT_DEFAULT_PROXY_URL || "").trim();
 const MAX_BATCH_JOBS = 500;
+const JOB_STATUSES = new Set([
+  "queued",
+  "starting",
+  "working",
+  "password",
+  "mfa_otp",
+  "totp_starting",
+  "password_add_starting",
+  "totp_setup_otp",
+  "email_otp",
+  "phone",
+  "phone_otp",
+  "finalizing",
+  "refreshing",
+  "completed",
+  "failed",
+  "canceled",
+  "reauth_required",
+  "resume_available",
+]);
 const MAX_PROXY_RISK_RETRIES = 10;
 const MAX_PROXY_CONNECTION_FAILURES = 20;
 const PROXY_CONNECTION_RETRY_BASE_MS = Math.max(1, Number(process.env.PROXY_CONNECTION_RETRY_BASE_MS || 1_000));
@@ -30,6 +51,11 @@ const PROXY_CONNECTION_RETRY_MAX_MS = 15_000;
 const PAGE_SIZE = 20;
 const MAX_LOG_CHARS = 80_000;
 const JOB_META_FILENAME = "job-meta.json";
+const ACCOUNT_GROUPS_FILENAME = "account-groups.json";
+const ACCOUNT_GROUPS_VERSION = 1;
+const ACCOUNT_GROUPS_MAX_COUNT = 200;
+const ACCOUNT_GROUP_NAME_MAX_LENGTH = 64;
+const UNGROUPED_ACCOUNT_FILTER = "__ungrouped__";
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
@@ -63,12 +89,15 @@ const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
+const ACCOUNT_GROUPS_PATH = path.join(OUTPUT_ROOT, ACCOUNT_GROUPS_FILENAME);
 const credentialStore = createCredentialStore();
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
+const accountGroups = new Map();
 const customSmsPoolPositions = new Map();
 const emailJobLocks = new Map();
 let outputSyncPromise = null;
+let accountGroupsWritePromise = Promise.resolve();
 let lastOutputSyncAt = 0;
 let shuttingDown = false;
 let queueSchedulingPaused = false;
@@ -116,6 +145,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 }
 
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+await loadAccountGroups();
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 scheduleQueuedJobs();
@@ -205,6 +235,10 @@ async function handleApi(req, res, requestUrl) {
         batchDownload: true,
         bulkActions: true,
         pagination: true,
+        accountSearch: true,
+        statusFilter: true,
+        accountGroups: true,
+        groupFilter: true,
         uniqueEmail: true,
         smsProviders: publicSmsProviderDefinitions(),
         queue: true,
@@ -235,7 +269,44 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage, normalizeEmailFilter(body.emails));
+    await sendJobsPage(res, requestedPage, normalizeJobsQuery(body));
+    return;
+  }
+
+  if (req.method === "GET" && requestUrl.pathname === "/api/account-groups") {
+    sendJson(res, 200, { groups: publicAccountGroups() });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/account-groups") {
+    const body = await readJson(req);
+    const result = await findOrCreateAccountGroup(body.name);
+    sendJson(res, result.created ? 201 : 200, {
+      group: publicAccountGroup(result.group),
+      created: result.created,
+      groups: publicAccountGroups(),
+    });
+    return;
+  }
+
+  const accountGroupMatch = /^\/api\/account-groups\/([a-f0-9-]+)$/.exec(requestUrl.pathname);
+  if (req.method === "DELETE" && accountGroupMatch) {
+    const groupId = accountGroupMatch[1];
+    const group = accountGroups.get(groupId);
+    if (!group) throw httpError(404, "分组不存在或已经删除");
+    accountGroups.delete(groupId);
+    await persistAccountGroups();
+    const affected = [...jobs.values()].filter((job) => job.groupId === groupId);
+    affected.forEach((job) => {
+      job.groupId = null;
+      touch(job);
+    });
+    await Promise.all(affected.map((job) => saveJobMetadata(job)));
+    sendJson(res, 200, {
+      deleted: publicAccountGroup(group),
+      ungrouped: affected.length,
+      groups: publicAccountGroups(),
+    });
     return;
   }
 
@@ -314,6 +385,24 @@ async function handleApi(req, res, requestUrl) {
     const emails = [...new Set(selected.map((job) => job.email.toLowerCase()))];
     await Promise.all(emails.map((email) => withEmailJobLock(email, () => deleteJobsByEmail(email))));
     sendJson(res, 200, { deleted: emails.length });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/group") {
+    const body = await readJson(req);
+    const target = await resolveAccountGroupAssignment(body);
+    const selected = resolveSelectedJobs(body.ids);
+    await Promise.all(selected.map((job) => withEmailJobLock(job.email, async () => {
+      job.groupId = target.group?.id || null;
+      touch(job);
+      await saveJobMetadata(job);
+    })));
+    sendJson(res, 200, {
+      jobs: selected.map(publicJob),
+      group: target.group ? publicAccountGroup(target.group) : null,
+      created: target.created,
+      groups: publicAccountGroups(),
+    });
     return;
   }
 
@@ -607,13 +696,21 @@ async function handleApi(req, res, requestUrl) {
   sendJson(res, 405, { error: "Method not allowed" });
 }
 
-async function sendJobsPage(res, requestedPage, emailFilter = null) {
+async function sendJobsPage(res, requestedPage, filters = {}) {
   await syncCompletedOutputs();
   const allJobs = listUniqueJobs();
-  const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
-  const visibleJobs = emailSet
-    ? allJobs.filter((job) => emailSet.has(job.email.toLowerCase()))
-    : allJobs;
+  const emailSet = filters.emails?.length ? new Set(filters.emails) : null;
+  const status = filters.status || null;
+  const search = filters.search || "";
+  const groupId = filters.groupId || null;
+  const visibleJobs = allJobs.filter((job) => {
+    if (emailSet && !emailSet.has(job.email.toLowerCase())) return false;
+    if (status && job.status !== status) return false;
+    if (groupId === UNGROUPED_ACCOUNT_FILTER && job.groupId) return false;
+    if (groupId && groupId !== UNGROUPED_ACCOUNT_FILTER && job.groupId !== groupId) return false;
+    if (search && !job.email.toLowerCase().includes(search) && !job.id.toLowerCase().includes(search)) return false;
+    return true;
+  });
   const total = visibleJobs.length;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const page = Math.min(requestedPage, totalPages);
@@ -621,8 +718,16 @@ async function sendJobsPage(res, requestedPage, emailFilter = null) {
   sendJson(res, 200, {
     jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
+    groups: publicAccountGroups(allJobs),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
-    filter: { active: Boolean(emailSet), requested: emailFilter?.length || 0, matched: total },
+    filter: {
+      active: Boolean(emailSet || status || groupId || search),
+      requested: filters.emails?.length || 0,
+      status,
+      groupId,
+      search,
+      matched: total,
+    },
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
       queued: allJobs.filter((job) => job.status === "queued").length,
@@ -643,6 +748,120 @@ function normalizeEmailFilter(value) {
   return [...unique];
 }
 
+function normalizeJobsQuery(body = {}) {
+  const emails = Object.hasOwn(body, "emails") ? normalizeEmailFilter(body.emails) : null;
+  const status = String(body.status || "").trim();
+  if (status && !JOB_STATUSES.has(status)) throw httpError(400, "筛选状态无效");
+  const search = String(body.search || "").trim().toLowerCase();
+  if (search.length > 254) throw httpError(400, "账号查找内容不能超过 254 个字符");
+  const groupId = normalizeAccountGroupFilter(body.groupId);
+  return { emails, status: status || null, groupId, search };
+}
+
+function normalizeAccountGroupFilter(value) {
+  const groupId = String(value || "").trim();
+  if (!groupId) return null;
+  if (groupId === UNGROUPED_ACCOUNT_FILTER) return groupId;
+  if (!accountGroups.has(groupId)) throw httpError(400, "筛选分组不存在");
+  return groupId;
+}
+
+function normalizeAccountGroupName(value) {
+  const name = String(value || "").trim().replace(/\s+/g, " ");
+  if (!name) throw httpError(400, "请输入分组名称");
+  if (name.length > ACCOUNT_GROUP_NAME_MAX_LENGTH) {
+    throw httpError(400, `分组名称不能超过 ${ACCOUNT_GROUP_NAME_MAX_LENGTH} 个字符`);
+  }
+  return name;
+}
+
+function normalizeStoredAccountGroupId(value) {
+  const groupId = String(value || "").trim();
+  return accountGroups.has(groupId) ? groupId : null;
+}
+
+function publicAccountGroup(group, count = 0) {
+  return { id: group.id, name: group.name, createdAt: group.createdAt, count };
+}
+
+function publicAccountGroups(allJobs = listUniqueJobs()) {
+  const counts = new Map();
+  allJobs.forEach((job) => {
+    if (job.groupId && accountGroups.has(job.groupId)) {
+      counts.set(job.groupId, (counts.get(job.groupId) || 0) + 1);
+    }
+  });
+  return [...accountGroups.values()]
+    .map((group) => publicAccountGroup(group, counts.get(group.id) || 0))
+    .sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
+}
+
+async function findOrCreateAccountGroup(value) {
+  const name = normalizeAccountGroupName(value);
+  const normalizedName = name.toLocaleLowerCase("zh-CN");
+  const existing = [...accountGroups.values()].find((group) => group.name.toLocaleLowerCase("zh-CN") === normalizedName);
+  if (existing) return { group: existing, created: false };
+  if (accountGroups.size >= ACCOUNT_GROUPS_MAX_COUNT) {
+    throw httpError(409, `最多只能保留 ${ACCOUNT_GROUPS_MAX_COUNT} 个分组`);
+  }
+  const group = { id: crypto.randomUUID(), name, createdAt: new Date().toISOString() };
+  accountGroups.set(group.id, group);
+  await persistAccountGroups();
+  return { group, created: true };
+}
+
+async function resolveAccountGroupAssignment(body = {}) {
+  const hasGroupId = Object.hasOwn(body, "groupId");
+  const hasGroupName = Object.hasOwn(body, "groupName");
+  if (hasGroupId === hasGroupName) {
+    throw httpError(400, "请选择已有分组、创建新分组，或设为未分组");
+  }
+  if (hasGroupName) return findOrCreateAccountGroup(body.groupName).then((result) => result);
+  const groupId = String(body.groupId || "").trim();
+  if (!groupId) return { group: null, created: false };
+  const group = accountGroups.get(groupId);
+  if (!group) throw httpError(404, "分组不存在或已经删除");
+  return { group, created: false };
+}
+
+async function loadAccountGroups() {
+  let data;
+  try {
+    data = JSON.parse(await fs.readFile(ACCOUNT_GROUPS_PATH, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    console.warn(`[warn] Unable to read account groups: ${error.message}`);
+    return;
+  }
+  if (!Array.isArray(data?.groups)) return;
+  for (const item of data.groups) {
+    const id = String(item?.id || "").trim();
+    const name = String(item?.name || "").trim().replace(/\s+/g, " ");
+    if (!/^[a-f0-9-]{36}$/i.test(id) || !name || name.length > ACCOUNT_GROUP_NAME_MAX_LENGTH || accountGroups.has(id)) continue;
+    accountGroups.set(id, { id, name, createdAt: String(item.created_at || item.createdAt || "") || new Date().toISOString() });
+    if (accountGroups.size >= ACCOUNT_GROUPS_MAX_COUNT) break;
+  }
+}
+
+async function persistAccountGroups() {
+  const data = {
+    version: ACCOUNT_GROUPS_VERSION,
+    groups: [...accountGroups.values()].map((group) => ({
+      id: group.id,
+      name: group.name,
+      created_at: group.createdAt,
+    })),
+  };
+  accountGroupsWritePromise = accountGroupsWritePromise
+    .catch(() => {})
+    .then(async () => {
+      const tempPath = `${ACCOUNT_GROUPS_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      await fs.writeFile(tempPath, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+      await fs.rename(tempPath, ACCOUNT_GROUPS_PATH);
+    });
+  return accountGroupsWritePromise;
+}
+
 async function startJob(email, credentials = {}, proxyUrl = null) {
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
@@ -658,6 +877,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
   const job = {
     id,
     email,
+    groupId: null,
     status: "queued",
     prompt: "已加入任务队列",
     createdAt,
@@ -865,7 +1085,7 @@ function launchJob(job, options = {}) {
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
-      CHATGPT_PROXY_URL: job.proxyUrl || "",
+      CHATGPT_PROXY_URL: job.proxyUrl || DEFAULT_CHATGPT_PROXY_URL,
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
       TOSUB2_TLS_PROFILE:
         String(process.env.TOSUB2_TLS_PROFILE || "").trim()
@@ -2959,9 +3179,12 @@ async function exportSourceAccounts(res, ids) {
 
 function publicJob(job) {
   const autoRepair = getAutoRepairEligibility(job);
+  const group = job.groupId ? accountGroups.get(job.groupId) : null;
   return {
     id: job.id,
     email: job.email,
+    groupId: group?.id || null,
+    groupName: group?.name || null,
     status: job.status,
     prompt: job.status === "queued"
       ? `排队中，前方还有 ${Math.max(0, getQueuePosition(job) - 1)} 条任务`
@@ -3012,9 +3235,12 @@ function publicJob(job) {
 }
 
 function publicSelectionJob(job) {
+  const group = job.groupId ? accountGroups.get(job.groupId) : null;
   return {
     id: job.id,
     email: job.email,
+    groupId: group?.id || null,
+    groupName: group?.name || null,
     status: job.status,
     canDownload: Boolean(job.resultSaved),
     canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
@@ -3300,6 +3526,7 @@ async function syncCompletedOutputs(force = false) {
         jobs.set(entry.name, {
           id: entry.name,
           email,
+          groupId: normalizeStoredAccountGroupId(metadata.group_id),
           status: restoredOperation.status,
           prompt: restoredOperation.prompt,
           createdAt: metadata.created_at || completedAt,
@@ -3379,6 +3606,7 @@ async function syncCompletedOutputs(force = false) {
         jobs.set(entry.name, {
           id: entry.name,
           email,
+          groupId: normalizeStoredAccountGroupId(metadata.group_id),
           status: restoredStatus,
           prompt: totpRecovery.recovered
             ? "已恢复成功激活的 2FA 密钥，可以继续未完成的 Codex 授权"
@@ -3477,6 +3705,7 @@ async function syncCompletedOutputs(force = false) {
         jobs.set(entry.name, {
           id: entry.name,
           email: metadata.email,
+          groupId: normalizeStoredAccountGroupId(metadata.group_id),
           status: restoredStatus,
           prompt: restoredPrompt,
           createdAt: metadata.created_at || restoredAt,
@@ -4321,6 +4550,7 @@ async function saveJobMetadata(job) {
       const data = {
         version: 1,
         email: job.email,
+        group_id: normalizeStoredAccountGroupId(job.groupId),
         status: job.status,
         prompt: job.prompt || null,
         last_error: job.lastError || null,

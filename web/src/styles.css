@@ -211,6 +211,37 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   border-radius: 6px;
   font-size: 12px;
 }
+.job-filter-toolbar {
+  min-height: 46px;
+  margin-bottom: 12px;
+  padding: 6px 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #596660;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.job-search-field {
+  width: min(360px, 42vw);
+  height: 32px;
+  padding: 0 9px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #7c8682;
+  background: #fbfcfb;
+  border: 1px solid #ccd4d0;
+  border-radius: 5px;
+}
+.job-search-field:focus-within { border-color: var(--green); box-shadow: 0 0 0 2px rgba(18, 113, 91, .1); }
+.job-search-field input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 12px; }
+.job-search-field input::placeholder { color: #929b97; }
+.status-filter-field { height: 32px; display: inline-flex; align-items: center; gap: 7px; padding: 0 8px 0 10px; color: #596660; background: #fbfcfb; border: 1px solid #ccd4d0; border-radius: 5px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.status-filter-field select { min-width: 112px; height: 28px; padding: 0 22px 0 0; border: 0; outline: 0; color: var(--ink); background: transparent; font: inherit; font-weight: 500; cursor: pointer; }
+.group-filter-field select { min-width: 138px; }
+.job-filter-match { margin-left: auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .selection-summary { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .selection-text-button {
   padding: 0;
@@ -614,6 +645,41 @@ tbody tr:last-child td { border-bottom: 0; }
 .batch-dialog textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
 .batch-dialog textarea::placeholder { color: #98a19e; }
 .filter-dialog textarea { min-height: 220px; }
+.account-group-dialog { width: min(520px, 100%); }
+.account-group-select, .account-group-input {
+  width: 100%;
+  height: 38px;
+  padding: 0 10px;
+  outline: 0;
+  color: var(--ink);
+  background: #fbfcfb;
+  border: 1px solid #cdd5d1;
+  border-radius: 5px;
+  font-size: 13px;
+}
+.account-group-select:focus, .account-group-input:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.account-group-list {
+  margin-top: 20px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.account-group-list-heading, .account-group-item {
+  min-height: 36px;
+  padding: 6px 8px 6px 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 54px 30px;
+  align-items: center;
+  gap: 8px;
+}
+.account-group-list-heading { color: var(--muted); background: #fafbfa; border-bottom: 1px solid var(--line); font-size: 11px; font-weight: 700; }
+.account-group-list-heading span:last-child { text-align: center; }
+.account-group-item { border-bottom: 1px solid #edf0ef; color: var(--ink); font-size: 12px; }
+.account-group-item:last-child { border-bottom: 0; }
+.account-group-item > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-group-item small { color: var(--muted); text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+.account-group-item .group-delete-button { width: 28px; height: 28px; color: var(--danger); }
+.account-group-empty { padding: 20px 12px; color: var(--muted); text-align: center; font-size: 12px; }
 .sms-settings-dialog { width: min(620px, 100%); }
 .mail-request-settings-dialog { width: min(620px, 100%); }
 .sub2api-settings-dialog { width: min(620px, 100%); }
@@ -926,6 +992,10 @@ tbody tr:last-child td { border-bottom: 0; }
   .secondary-button { width: 38px; padding: 0; font-size: 0; }
   .add-form .clear-filter-button { grid-column: 1 / -1; justify-self: end; width: auto; font-size: 12px; }
   .selection-toolbar { align-items: stretch; flex-direction: column; }
+  .job-filter-toolbar { align-items: stretch; flex-wrap: wrap; }
+  .job-search-field { width: 100%; }
+  .status-filter-field { flex: 1; }
+  .job-filter-match { margin-left: 0; align-self: center; }
   .bulk-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .bulk-actions button { width: 100%; padding-right: 6px; padding-left: 6px; }
   .modal-backdrop { padding: 12px; }

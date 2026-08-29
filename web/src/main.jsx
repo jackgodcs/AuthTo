@@ -13,6 +13,7 @@ import {
   ExternalLink,
   FileText,
   Filter,
+  Folder,
   Globe2,
   KeyRound,
   ListPlus,
@@ -23,6 +24,7 @@ import {
   Plus,
   RefreshCw,
   RotateCcw,
+  Search,
   Send,
   Settings2,
   ShieldCheck,
@@ -40,6 +42,29 @@ const SMS_PROVIDER_SETTINGS_KEY = "chatgpt-onboarding.sms-provider-settings-v1";
 const MAIL_REQUEST_SETTINGS_KEY = "chatgpt-onboarding.mail-request-settings-v1";
 const SUB2API_UPLOAD_SETTINGS_KEY = "chatgpt-onboarding.sub2api-upload-settings-v1";
 const ACCOUNT_PROXY_STORAGE_KEY = "chatgpt-onboarding.account-proxy-v1";
+const UNGROUPED_ACCOUNT_FILTER = "__ungrouped__";
+const NEW_ACCOUNT_GROUP_OPTION = "__new__";
+const STATUS_FILTER_OPTIONS = [
+  ["", "全部状态"],
+  ["queued", "排队中"],
+  ["starting", "启动中"],
+  ["working", "处理中"],
+  ["password", "待密码"],
+  ["mfa_otp", "待 2FA"],
+  ["totp_starting", "准备 2FA"],
+  ["password_add_starting", "准备密码"],
+  ["totp_setup_otp", "激活 2FA"],
+  ["email_otp", "待邮箱码"],
+  ["phone", "待手机号"],
+  ["phone_otp", "待手机码"],
+  ["finalizing", "生成中"],
+  ["refreshing", "刷新授权"],
+  ["completed", "已完成"],
+  ["failed", "失败"],
+  ["canceled", "已取消"],
+  ["reauth_required", "待重新授权"],
+  ["resume_available", "可继续"],
+];
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -68,6 +93,15 @@ function App() {
   const [filterText, setFilterText] = useState("");
   const [filterError, setFilterError] = useState("");
   const [emailFilter, setEmailFilter] = useState([]);
+  const [statusFilter, setStatusFilter] = useState("");
+  const [groupFilter, setGroupFilter] = useState("");
+  const [accountGroups, setAccountGroups] = useState([]);
+  const [groupDialogOpen, setGroupDialogOpen] = useState(false);
+  const [groupTarget, setGroupTarget] = useState("");
+  const [newGroupName, setNewGroupName] = useState("");
+  const [groupDialogError, setGroupDialogError] = useState("");
+  const [groupSaving, setGroupSaving] = useState(false);
+  const [accountSearch, setAccountSearch] = useState("");
   const [error, setError] = useState("");
   const [expandedJobId, setExpandedJobId] = useState(null);
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
@@ -142,17 +176,20 @@ function App() {
     if (!token) return undefined;
     let stopped = false;
     let timer;
+    const search = accountSearch.trim();
+    const hasQuery = emailFilter.length || statusFilter || groupFilter || search;
     const poll = async () => {
       try {
-        const data = emailFilter.length
+        const data = hasQuery
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, emails: emailFilter }),
+              body: JSON.stringify({ page, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(search ? { search } : {}) }),
             })
           : await apiFetch(token, `/api/jobs?page=${page}`);
         if (!stopped) {
           setJobs(data.jobs);
           setJobSelectionIndex(data.selection || data.jobs);
+          setAccountGroups(Array.isArray(data.groups) ? data.groups : []);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
@@ -169,7 +206,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter]);
+  }, [token, page, emailFilter, statusFilter, groupFilter, accountSearch]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -192,6 +229,7 @@ function App() {
   }, [token, features.sub2apiMonitor]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
+  const matchingJobIds = useMemo(() => jobSelectionIndex.map((job) => job.id), [jobSelectionIndex]);
   const smsProviderDefinitions = Array.isArray(features.smsProviders) ? features.smsProviders : [];
   const activeSmsProvider = useMemo(
     () => resolveSmsProvider(smsProviderDefinitions, smsSettings),
@@ -207,6 +245,8 @@ function App() {
   );
   const downloadableSelectedCount = selectedJobs.filter((job) => job.canDownload).length;
   const allPageSelected = pageJobIds.length > 0 && pageJobIds.every((id) => selectedJobIds.has(id));
+  const allMatchingSelected = matchingJobIds.length > 0 && matchingJobIds.every((id) => selectedJobIds.has(id));
+  const hasJobFilters = Boolean(emailFilter.length || statusFilter || groupFilter || accountSearch.trim());
   const canDownloadSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && downloadableSelectedCount > 0;
   const canReauthorizeSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
@@ -514,9 +554,12 @@ function App() {
     }
   }
 
-  function clearEmailFilter() {
+  function clearJobFilters() {
     setEmailFilter([]);
     setFilterText("");
+    setStatusFilter("");
+    setGroupFilter("");
+    setAccountSearch("");
     setSelectedJobIds(new Set());
     setExpandedJobId(null);
     setPage(1);
@@ -541,6 +584,77 @@ function App() {
       });
       return next;
     });
+  }
+
+  function selectAllMatchingJobs() {
+    setSelectedJobIds(new Set(matchingJobIds));
+  }
+
+  function invertMatchingJobSelection() {
+    setSelectedJobIds((current) => new Set(matchingJobIds.filter((id) => !current.has(id))));
+  }
+
+  function openGroupDialog() {
+    setGroupTarget(accountGroups[0]?.id || NEW_ACCOUNT_GROUP_OPTION);
+    setNewGroupName("");
+    setGroupDialogError("");
+    setGroupDialogOpen(true);
+  }
+
+  async function applyAccountGroup(event) {
+    event.preventDefault();
+    if (!selectedJobIds.size || groupSaving) return;
+    if (groupTarget === NEW_ACCOUNT_GROUP_OPTION && !newGroupName.trim()) {
+      setGroupDialogError("请输入新分组名称");
+      return;
+    }
+    setGroupSaving(true);
+    setGroupDialogError("");
+    try {
+      const data = await apiFetch(token, "/api/jobs/group", {
+        method: "POST",
+        body: JSON.stringify({
+          ids: [...selectedJobIds],
+          ...(groupTarget === NEW_ACCOUNT_GROUP_OPTION ? { groupName: newGroupName } : { groupId: groupTarget }),
+        }),
+      });
+      setAccountGroups(Array.isArray(data.groups) ? data.groups : []);
+      setSelectedJobIds(new Set());
+      setGroupDialogOpen(false);
+      setUploadNotice(data.group
+        ? `已将 ${data.jobs.length} 个账号设为“${data.group.name}”`
+        : `已将 ${data.jobs.length} 个账号设为未分组`);
+      setError("");
+    } catch (requestError) {
+      setGroupDialogError(requestError.message);
+    } finally {
+      setGroupSaving(false);
+    }
+  }
+
+  async function deleteAccountGroup(group) {
+    if (groupSaving) return;
+    const affected = Number(group.count || 0);
+    const notice = affected
+      ? `确定删除分组“${group.name}”吗？其中 ${affected} 个账号会变为未分组。`
+      : `确定删除空分组“${group.name}”吗？`;
+    if (!window.confirm(notice)) return;
+    setGroupSaving(true);
+    setGroupDialogError("");
+    try {
+      const data = await apiFetch(token, `/api/account-groups/${group.id}`, { method: "DELETE" });
+      setAccountGroups(Array.isArray(data.groups) ? data.groups : []);
+      if (groupFilter === group.id) {
+        setGroupFilter("");
+        setPage(1);
+      }
+      if (groupTarget === group.id) setGroupTarget("");
+      setUploadNotice(data.ungrouped ? `已删除“${group.name}”，${data.ungrouped} 个账号已设为未分组` : `已删除分组“${group.name}”`);
+    } catch (requestError) {
+      setGroupDialogError(requestError.message);
+    } finally {
+      setGroupSaving(false);
+    }
   }
 
   async function downloadSelected() {
@@ -717,7 +831,7 @@ function App() {
         <div className="section-heading">
           <div>
             <h2>授权任务</h2>
-            <p>{emailFilter.length
+            <p>{hasJobFilters
               ? `匹配 ${pagination.total} 条，共 ${pagination.totalAll ?? pagination.total} 条任务`
               : (pagination.total ? `共 ${pagination.total} 条任务` : "添加邮箱后开始第一条任务")}</p>
           </div>
@@ -751,8 +865,8 @@ function App() {
               <Filter size={17} />
               {emailFilter.length ? `筛选 ${emailFilter.length}` : "筛选账号"}
             </button>
-            {emailFilter.length > 0 && (
-              <button className="selection-text-button clear-filter-button" type="button" onClick={clearEmailFilter}>
+            {hasJobFilters && (
+              <button className="selection-text-button clear-filter-button" type="button" onClick={clearJobFilters}>
                 清除筛选
               </button>
             )}
@@ -866,16 +980,89 @@ function App() {
           </div>
         )}
 
+        <div className="job-filter-toolbar" aria-label="任务查找与状态筛选">
+          <label className="job-search-field">
+            <Search size={16} aria-hidden="true" />
+            <input
+              value={accountSearch}
+              onChange={(event) => {
+                setAccountSearch(event.target.value);
+                setSelectedJobIds(new Set());
+                setExpandedJobId(null);
+                setPage(1);
+              }}
+              placeholder="查找匹配账号"
+              spellCheck="false"
+              aria-label="查找匹配账号"
+            />
+          </label>
+          <label className="status-filter-field">
+            <span>状态</span>
+            <select
+              value={statusFilter}
+              onChange={(event) => {
+                setStatusFilter(event.target.value);
+                setSelectedJobIds(new Set());
+                setExpandedJobId(null);
+                setPage(1);
+              }}
+              aria-label="按状态筛选"
+            >
+              {STATUS_FILTER_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
+            </select>
+          </label>
+          {features.groupFilter && (
+            <label className="status-filter-field group-filter-field">
+              <span>分组</span>
+              <select
+                value={groupFilter}
+                onChange={(event) => {
+                  setGroupFilter(event.target.value);
+                  setSelectedJobIds(new Set());
+                  setExpandedJobId(null);
+                  setPage(1);
+                }}
+                aria-label="按分组筛选"
+              >
+                <option value="">全部分组</option>
+                <option value={UNGROUPED_ACCOUNT_FILTER}>未分组</option>
+                {accountGroups.map((group) => (
+                  <option key={group.id} value={group.id}>{group.name}（{group.count}）</option>
+                ))}
+              </select>
+            </label>
+          )}
+          <span className="job-filter-match">匹配 {pagination.total} 条</span>
+          {features.accountGroups && (
+            <button type="button" className="icon-button" onClick={openGroupDialog} title="管理账号分组">
+              <Folder size={16} />
+            </button>
+          )}
+          {hasJobFilters && (
+            <button type="button" className="icon-button" onClick={clearJobFilters} title="清除全部筛选">
+              <X size={16} />
+            </button>
+          )}
+        </div>
+
         {features.bulkActions && jobs.length > 0 && (
           <div className="selection-toolbar">
             <div className="selection-summary">
               <span>当前页 {jobs.length} 条，跨页已选 {selectedJobIds.size} 条，可下载 {downloadableSelectedCount} 条</span>
-              <button type="button" className="selection-text-button" onClick={toggleAllOnPage} disabled={allPageSelected || !pageJobIds.length}>
-                本页全选
+              <button type="button" className="selection-text-button" onClick={selectAllMatchingJobs} disabled={allMatchingSelected || !matchingJobIds.length}>
+                全选匹配
+              </button>
+              <button type="button" className="selection-text-button" onClick={invertMatchingJobSelection} disabled={!matchingJobIds.length}>
+                反选匹配
               </button>
               <button type="button" className="selection-text-button" onClick={() => setSelectedJobIds(new Set())} disabled={!selectedJobIds.size}>
                 清除选择
               </button>
+              {features.accountGroups && (
+                <button type="button" className="selection-text-button" onClick={openGroupDialog} disabled={!selectedJobIds.size || Boolean(batchAction)}>
+                  设置分组
+                </button>
+              )}
             </div>
             <div className="bulk-actions">
               {features.cancelAll && (
@@ -957,7 +1144,7 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {!jobs.length && <EmptyState filtered={emailFilter.length > 0} />}
+              {!jobs.length && <EmptyState filtered={hasJobFilters} />}
               {jobs.map((job) => (
                 <React.Fragment key={job.id}>
                   <JobRow
@@ -1462,6 +1649,70 @@ function App() {
           </form>
         </div>
       )}
+      {groupDialogOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !groupSaving) setGroupDialogOpen(false);
+        }}>
+          <form className="batch-dialog account-group-dialog" onSubmit={applyAccountGroup} role="dialog" aria-modal="true" aria-labelledby="account-group-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="account-group-title">设置账号分组</h2>
+                <span>已选择 {selectedJobIds.size} 个账号</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setGroupDialogOpen(false)} disabled={groupSaving} title="关闭">
+                <X size={18} />
+              </button>
+            </div>
+            <label className="batch-label" htmlFor="account-group-target">目标分组</label>
+            <select
+              id="account-group-target"
+              className="account-group-select"
+              value={groupTarget}
+              onChange={(event) => { setGroupTarget(event.target.value); setGroupDialogError(""); }}
+              disabled={groupSaving}
+            >
+              {accountGroups.map((group) => <option key={group.id} value={group.id}>{group.name}（{group.count}）</option>)}
+              <option value={NEW_ACCOUNT_GROUP_OPTION}>新建分组</option>
+              <option value="">设为未分组</option>
+            </select>
+            {groupTarget === NEW_ACCOUNT_GROUP_OPTION && (
+              <label className="batch-label" htmlFor="new-account-group">新分组名称</label>
+            )}
+            {groupTarget === NEW_ACCOUNT_GROUP_OPTION && (
+              <input
+                id="new-account-group"
+                className="account-group-input"
+                value={newGroupName}
+                onChange={(event) => setNewGroupName(event.target.value)}
+                placeholder="例如：八月完成账号"
+                maxLength="64"
+                autoFocus
+                disabled={groupSaving}
+              />
+            )}
+            <div className="account-group-list" aria-label="已有分组">
+              <div className="account-group-list-heading"><span>已有分组</span><span>账号数</span></div>
+              {accountGroups.length ? accountGroups.map((group) => (
+                <div className="account-group-item" key={group.id}>
+                  <span title={group.name}>{group.name}</span>
+                  <small>{group.count}</small>
+                  <button type="button" className="icon-button group-delete-button" onClick={() => deleteAccountGroup(group)} disabled={groupSaving} title={`删除分组 ${group.name}`}>
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              )) : <div className="account-group-empty">尚未创建分组</div>}
+            </div>
+            {groupDialogError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{groupDialogError}</div>}
+            <div className="dialog-footer">
+              <button type="button" className="cancel-button" onClick={() => setGroupDialogOpen(false)} disabled={groupSaving}>取消</button>
+              <button type="submit" className="primary-button" disabled={!selectedJobIds.size || groupSaving || (groupTarget === NEW_ACCOUNT_GROUP_OPTION && !newGroupName.trim())}>
+                {groupSaving ? <LoaderCircle className="spin" size={17} /> : <Folder size={17} />}
+                保存分组
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </main>
   );
 }
@@ -1643,7 +1894,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       <td>
         <div className="account-cell">
           <div className="account-avatar">{job.email.slice(0, 1).toUpperCase()}</div>
-          <div className="account-details"><strong>{job.email}</strong><span>{shortId(job.id)}</span></div>
+          <div className="account-details"><strong>{job.email}</strong><span>{shortId(job.id)}{job.groupName ? ` · ${job.groupName}` : " · 未分组"}</span></div>
           <LoginMethodBadge job={job} />
         </div>
       </td>

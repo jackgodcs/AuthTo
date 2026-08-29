@@ -150,6 +150,8 @@ const childExit = new Promise((resolve) => child.once("exit", (code, signal) => 
 try {
   const bootstrap = await waitForJson(`${baseUrl}/api/bootstrap`);
   assert.equal(typeof bootstrap.token, "string");
+  assert.equal(bootstrap.features.accountGroups, true);
+  assert.equal(bootstrap.features.groupFilter, true);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
 
   const pageResponse = await fetch(`${baseUrl}/`);
@@ -241,6 +243,98 @@ try {
 
   let job = await waitForJob(headers, jobId, (value) => value.status === "completed");
   assert.equal(job.canDownload, true);
+
+  const filteredJobsResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      page: 1,
+      emails: ["cross-platform@example.com"],
+      status: "completed",
+      search: "cross-platform",
+    }),
+  });
+  const filteredJobsText = await filteredJobsResponse.text();
+  assert.equal(filteredJobsResponse.status, 200, filteredJobsText);
+  const filteredJobs = JSON.parse(filteredJobsText);
+  assert.equal(filteredJobs.pagination.total, 1);
+  assert.equal(filteredJobs.jobs[0].id, jobId);
+  assert.deepEqual(filteredJobs.selection.map((item) => item.id), [jobId]);
+
+  const createGroupResponse = await fetch(`${baseUrl}/api/account-groups`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: "第一批账号" }),
+  });
+  const createGroupText = await createGroupResponse.text();
+  assert.equal(createGroupResponse.status, 201, createGroupText);
+  const firstGroup = JSON.parse(createGroupText).group;
+  assert.equal(firstGroup.name, "第一批账号");
+
+  const assignFirstGroupResponse = await fetch(`${baseUrl}/api/jobs/group`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId], groupId: firstGroup.id }),
+  });
+  const assignFirstGroupText = await assignFirstGroupResponse.text();
+  assert.equal(assignFirstGroupResponse.status, 200, assignFirstGroupText);
+  assert.equal(JSON.parse(assignFirstGroupText).jobs[0].groupName, "第一批账号");
+
+  const groupedQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, groupId: firstGroup.id }),
+  });
+  const groupedQueryText = await groupedQueryResponse.text();
+  assert.equal(groupedQueryResponse.status, 200, groupedQueryText);
+  const groupedQuery = JSON.parse(groupedQueryText);
+  assert.equal(groupedQuery.pagination.total, 1);
+  assert.equal(groupedQuery.jobs[0].id, jobId);
+  assert.equal(groupedQuery.groups.find((group) => group.id === firstGroup.id).count, 1);
+
+  const assignSecondGroupResponse = await fetch(`${baseUrl}/api/jobs/group`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId], groupName: "第二批账号" }),
+  });
+  const assignSecondGroupText = await assignSecondGroupResponse.text();
+  assert.equal(assignSecondGroupResponse.status, 200, assignSecondGroupText);
+  const secondGroupResult = JSON.parse(assignSecondGroupText);
+  assert.equal(secondGroupResult.created, true);
+  const secondGroup = secondGroupResult.group;
+  assert.equal(secondGroup.name, "第二批账号");
+
+  const deleteGroupResponse = await fetch(`${baseUrl}/api/account-groups/${secondGroup.id}`, {
+    method: "DELETE",
+    headers,
+  });
+  const deleteGroupText = await deleteGroupResponse.text();
+  assert.equal(deleteGroupResponse.status, 200, deleteGroupText);
+  assert.equal(JSON.parse(deleteGroupText).ungrouped, 1);
+
+  const ungroupedQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, groupId: "__ungrouped__" }),
+  });
+  const ungroupedQueryText = await ungroupedQueryResponse.text();
+  assert.equal(ungroupedQueryResponse.status, 200, ungroupedQueryText);
+  const ungroupedQuery = JSON.parse(ungroupedQueryText);
+  assert.equal(ungroupedQuery.jobs.find((item) => item.id === jobId).groupId, null);
+
+  const deletedGroupQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, groupId: secondGroup.id }),
+  });
+  assert.equal(deletedGroupQueryResponse.status, 400, await deletedGroupQueryResponse.text());
+
+  const invalidStatusFilterResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, status: "not-a-status" }),
+  });
+  assert.equal(invalidStatusFilterResponse.status, 400, await invalidStatusFilterResponse.text());
 
   const downloadResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/download`, { headers });
   assert.equal(downloadResponse.status, 200);
