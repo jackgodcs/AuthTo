@@ -1,0 +1,42 @@
+{
+  "name": "tosub2",
+  "version": "1.8.0",
+  "description": "通过协议登录 ChatGPT、完成 Codex 授权并生成 sub2api 导入文件",
+  "type": "module",
+  "scripts": {
+    "dev": "node src/console-server.mjs",
+    "start": "node src/console-server.mjs",
+    "daemon:start": "pm2 start ecosystem.config.cjs",
+    "daemon:restart": "pm2 restart tosub2 --update-env",
+    "daemon:stop": "pm2 stop tosub2",
+    "daemon:logs": "pm2 logs tosub2",
+    "check": "node --check src/console-server.mjs && node --check src/protocol-login.mjs && node --check src/tls-transport.mjs && node --check src/mail-otp.mjs && node --check src/luban-sms.mjs && node --check src/smsbower.mjs && node --check src/custom-sms.mjs && node --check src/sms-providers.mjs && node --check src/credential-store.mjs && node --check src/protected-store.mjs && node --check src/cpamp-sync.mjs && node test/tls-transport.mjs && node test/credential-store.mjs && node test/protected-store.mjs && node test/cpamp-sync.mjs && node test/sms-providers.mjs && node test/console-job-lock-smoke.mjs && node test/console-smoke.mjs && node test/console-restore-shutdown-smoke.mjs && node test/sms-provider-console-smoke.mjs && node test/protocol-smoke.mjs && node test/password-mfa-workspace-smoke.mjs"
+  },
+  "keywords": [
+    "chatgpt",
+    "codex",
+    "oauth",
+    "sub2api"
+  ],
+  "author": "poxiao33",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/jackwog/toSub2.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jackwog/toSub2/issues"
+  },
+  "homepage": "https://github.com/jackwog/toSub2#readme",
+  "dependencies": {
+    "@vitejs/plugin-react": "^5.1.1",
+    "jsdom": "26.1.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "vite": "^6.4.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

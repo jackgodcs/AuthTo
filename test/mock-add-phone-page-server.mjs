@@ -1,0 +1,296 @@
+#!/usr/bin/env node
+import http from "node:http";
+
+const port = Number(process.argv[2] || 4492);
+const base = `http://127.0.0.1:${port}`;
+const publicBase = process.argv[3] || base;
+
+const idTokenPayload = Buffer.from(JSON.stringify({
+  email: "add-phone-page@example.com",
+  sid: "mock-account-id",
+  sub: "mock-user-id",
+})).toString("base64url");
+
+let lastLoginHint = "";
+let addPasswordMode = false;
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url || "/", base);
+  const body = await readBody(req);
+
+  if (req.method === "GET" && url.pathname === "/") {
+    res.setHeader("set-cookie", [
+      "__Host-next-auth.csrf-token=mock-csrf; Path=/",
+      "__Secure-next-auth.session-token=mock-session; Path=/",
+    ]);
+    return sendText(res, 200, "ok");
+  }
+  if (req.method === "GET" && url.pathname === "/api/auth/providers") return sendJson(res, 200, {});
+  if (req.method === "GET" && url.pathname === "/api/auth/csrf") return sendJson(res, 200, { csrfToken: "mock-csrf" });
+  if (req.method === "POST" && url.pathname === "/api/auth/signin/openai") {
+    lastLoginHint = url.searchParams.get("login_hint") || "";
+    addPasswordMode = url.searchParams.get("post_login_add_password") === "true";
+    return sendJson(res, 200, { url: `${publicBase}/api/accounts/authorize` });
+  }
+  if (req.method === "GET" && url.pathname === "/api/accounts/authorize") {
+    if (lastLoginHint === "risk-control@example.com") {
+      return sendText(res, 403, "<html><title>Just a moment...</title><div id=\"challenge-platform\"></div></html>", "text/html");
+    }
+    if (lastLoginHint === "unexpected-page@example.com") {
+      return redirect(res, `${publicBase}/device-confirmation`);
+    }
+    if (lastLoginHint === "banned@example.com") {
+      return sendJson(res, 403, {
+        error: {
+          message: "Your account has been deactivated.",
+          code: "account_deactivated",
+        },
+      });
+    }
+    return redirect(res, `${publicBase}/email-verification`);
+  }
+  if (req.method === "GET" && url.pathname === "/device-confirmation") {
+    return sendText(res, 200, "<html><title>Confirm this device</title></html>", "text/html");
+  }
+  if (req.method === "GET" && url.pathname === "/email-verification") {
+    return sendText(res, 200, "<html><title>Check your inbox</title></html>", "text/html");
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/validate") {
+    const payload = parseJson(body);
+    if (lastLoginHint === "wrong-email-otp@example.com" && payload.code !== "123456") {
+      return sendJson(res, 401, {
+        error: {
+          message: "Wrong code. Please check it and try again.",
+          type: "invalid_request_error",
+          code: "wrong_email_otp_code",
+        },
+      });
+    }
+    const emailOtpSentinel = parseJson(req.headers["openai-sentinel-token"]);
+    if (
+      emailOtpSentinel?.flow !== "email_otp_validate"
+      || req.headers["openai-sentinel-so-token"] !== "mock-so-token"
+    ) {
+      return sendJson(res, 400, { error: { message: "missing email OTP sentinel headers" } });
+    }
+    if (lastLoginHint === "account-profile@example.com") {
+      return sendJson(res, 200, {
+        continue_url: `${publicBase}/about-you`,
+        page: { type: "about_you" },
+        "oai-client-auth-session": { email_verified: true },
+      });
+    }
+    if (addPasswordMode) {
+      const sentinel = parseJson(req.headers["openai-sentinel-token"]);
+      if (sentinel?.flow !== "email_otp_validate" || req.headers["openai-sentinel-so-token"] !== "mock-so-token") {
+        return sendJson(res, 400, { error: { message: "missing add-password email OTP sentinel token" } });
+      }
+      return sendJson(res, 200, {
+        continue_url: `${publicBase}/reset-password/new-password`,
+        method: "GET",
+        page: { type: "reset_password_new_password" },
+        "oai-client-auth-session": { email_verified: true, post_login_add_password: true },
+      });
+    }
+    return sendJson(res, 200, {
+      continue_url: `${publicBase}/web-callback`,
+      "oai-client-auth-session": { email_verified: true },
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/email-otp/resend") {
+    if (!/^application\/json\b/i.test(String(req.headers["content-type"] || "")) || JSON.stringify(parseJson(body)) !== "{}") {
+      return sendJson(res, 400, { error: { message: "resend must use an empty JSON body" } });
+    }
+    return sendJson(res, 200, { success: true });
+  }
+  if (req.method === "POST" && url.pathname === "/backend-api/sentinel/req") {
+    const payload = JSON.parse(body || "{}");
+    if (!["oauth_create_account", "email_otp_validate", "password_reset"].includes(payload.flow) || typeof payload.id !== "string" || !payload.id) {
+      return sendJson(res, 400, { error: { message: "invalid sentinel request" } });
+    }
+    return sendJson(res, 200, {
+      token: "mock-sentinel-challenge",
+      so: "mock-so-token",
+      proofofwork: { required: false },
+      turnstile: { required: false },
+    });
+  }
+  if (req.method === "GET" && url.pathname === "/reset-password/new-password") {
+    return sendText(res, 200, "<html><title>Add password</title></html>", "text/html");
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/password/add") {
+    const payload = parseJson(body);
+    const sentinel = parseJson(req.headers["openai-sentinel-token"]);
+    if (
+      !addPasswordMode
+      || sentinel?.flow !== "password_reset"
+      || sentinel?.c !== "mock-sentinel-challenge"
+      || typeof payload?.password !== "string"
+      || payload.password.length < 12
+    ) {
+      return sendJson(res, 400, { error: { message: "invalid add-password submission" } });
+    }
+    addPasswordMode = false;
+    return sendJson(res, 200, {
+      continue_url: `${publicBase}/web-callback`,
+      method: "GET",
+      page: { type: "external_url" },
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/create_account") {
+    const payload = JSON.parse(body || "{}");
+    const sentinel = parseJson(req.headers["openai-sentinel-token"]);
+    if (
+      sentinel?.flow !== "oauth_create_account"
+      || sentinel?.c !== "mock-sentinel-challenge"
+      || req.headers["openai-sentinel-so-token"] !== "mock-so-token"
+      || typeof sentinel?.id !== "string"
+      || !sentinel.id
+    ) {
+      return sendJson(res, 400, { error: { message: "missing sentinel token" } });
+    }
+    if (!/^[A-Za-z]+ [A-Za-z]+$/.test(payload.name || "")) {
+      return sendJson(res, 400, { error: { message: "invalid generated name" } });
+    }
+    if (!isAgeBetween(payload.birthdate, 20, 50)) {
+      return sendJson(res, 400, { error: { message: "generated age must be between 20 and 50" } });
+    }
+    return sendJson(res, 200, {
+      continue_url: `${publicBase}/api/auth/callback/openai?code=profile-code&state=profile-state`,
+      page: { type: "external_url" },
+      "oai-client-auth-session": { email_verified: true, profile_completed: true },
+    });
+  }
+  if (req.method === "GET" && url.pathname === "/api/auth/callback/openai") return redirect(res, `${publicBase}/`);
+  if (req.method === "GET" && url.pathname === "/web-callback") return redirect(res, `${publicBase}/`);
+  if (req.method === "GET" && url.pathname === "/oauth/authorize") {
+    return redirect(res, `${publicBase}/choose-an-account`);
+  }
+  if (req.method === "GET" && url.pathname === "/choose-an-account") {
+    return sendText(res, 200, '<html><input name="session_id" value="us_1234567890abcdef"></html>', "text/html");
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/session/select") {
+    res.setHeader("set-cookie", "oai-client-auth-session=mock-auth-session; Path=/");
+    return sendJson(res, 200, {
+      continue_url: `${publicBase}/add-phone`,
+      "oai-client-auth-session": {},
+    });
+  }
+  if (req.method === "GET" && url.pathname === "/add-phone") {
+    res.setHeader("set-cookie", "add_phone_ready=1; Path=/");
+    return sendText(res, 200, "<html><title>Add phone</title></html>", "text/html");
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/add-phone/send") {
+    const payload = JSON.parse(body || "{}");
+    if (lastLoginHint === "phone-risk-control@example.com") {
+      return sendText(
+        res,
+        409,
+        "<html><title>Just a moment...</title><div id=\"challenge-platform\"></div></html>",
+        "text/html",
+      );
+    }
+    if (lastLoginHint === "security-check@example.com") {
+      return sendJson(res, 409, {
+        error: {
+          message: "Your sign-in session is no longer valid. Please start over to continue.",
+          code: "invalid_state",
+        },
+      });
+    }
+    if (!/\badd_phone_ready=1\b/.test(req.headers.cookie || "")) {
+      return sendJson(res, 409, { error: { message: "missing add-phone page state", code: "invalid_state" } });
+    }
+    if (lastLoginHint === "phone-change-invalid-step@example.com" && payload.phone_number === "+60122222222") {
+      return sendJson(res, 400, {
+        error: {
+          message: "Invalid authorization step.",
+          code: "invalid_auth_step",
+          redirect_uri: `${publicBase}/log-in`,
+        },
+      });
+    }
+    if ("channel" in payload) {
+      return sendJson(res, 400, { error: { message: "unexpected channel field" } });
+    }
+    if (lastLoginHint === "phone-invalid-state@example.com" && payload.phone_number === "+60111111111") {
+      return sendJson(res, 400, {
+        error: {
+          message: "Your sign-in session is no longer valid. Please start over to continue.",
+          code: "invalid_state",
+        },
+      });
+    }
+    return sendJson(res, 200, {
+      continue_url: `${publicBase}/phone-verification`,
+      page: { type: "phone_otp_verification" },
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/phone-otp/validate") {
+    return sendJson(res, 200, {
+      "oai-client-auth-session": {
+        workspaces: [{ id: "workspace-personal", kind: "personal" }],
+      },
+    });
+  }
+  if (req.method === "POST" && url.pathname === "/api/accounts/workspace/select") {
+    const callback = new URL("http://localhost:1455/auth/callback");
+    callback.searchParams.set("code", "mock-authorization-code");
+    callback.searchParams.set("state", "mock-state");
+    return sendJson(res, 200, { continue_url: callback.toString() });
+  }
+  if (req.method === "POST" && url.pathname === "/oauth/token") {
+    return sendJson(res, 200, {
+      access_token: "mock-access-token",
+      refresh_token: "mock-refresh-token",
+      id_token: `e30.${idTokenPayload}.signature`,
+    });
+  }
+  return sendJson(res, 404, { error: "not found" });
+});
+
+server.listen(port, "127.0.0.1", () => {
+  console.log(`[ok] Mock add-phone page server: ${base}`);
+});
+
+function redirect(res, location) {
+  res.writeHead(302, { location });
+  res.end();
+}
+
+function sendJson(res, status, data) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(data));
+}
+
+function sendText(res, status, text, contentType = "text/plain") {
+  res.writeHead(status, { "content-type": contentType });
+  res.end(text);
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function parseJson(value) {
+  try {
+    return JSON.parse(String(value || ""));
+  } catch {
+    return null;
+  }
+}
+
+function isAgeBetween(birthdate, minAge, maxAge) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(birthdate || "")) return false;
+  const birth = new Date(`${birthdate}T00:00:00Z`);
+  if (Number.isNaN(birth.getTime())) return false;
+  const now = new Date();
+  let age = now.getUTCFullYear() - birth.getUTCFullYear();
+  const birthdayPassed =
+    now.getUTCMonth() > birth.getUTCMonth()
+    || (now.getUTCMonth() === birth.getUTCMonth() && now.getUTCDate() >= birth.getUTCDate());
+  if (!birthdayPassed) age -= 1;
+  return age >= minAge && age <= maxAge;
+}
