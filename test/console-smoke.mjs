@@ -587,7 +587,11 @@ try {
     (value) => value.status === "completed" && value.passwordAddedAt,
   );
   assert.equal(passwordAddedJob.lastOperationType, "add_password");
-  assert.equal(passwordAddedJob.passwordAddError, null);
+  if (process.platform === "linux") {
+    assert.match(passwordAddedJob.passwordAddError || "", /不支持持久凭据存储/);
+  } else {
+    assert.equal(passwordAddedJob.passwordAddError, null);
+  }
   assert.equal(passwordAddedJob.canAddPassword, false);
 
   const passwordSourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
