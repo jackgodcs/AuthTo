@@ -8,6 +8,8 @@ import { createCpampSync } from "../src/cpamp-sync.mjs";
 
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-cpamp-sync-"));
 const files = new Map();
+const fileStates = new Map();
+const credentialRefreshRequests = [];
 let storedManagementKey = "";
 let requiresManagementPrefix = false;
 let rejectsManagementKey = false;
@@ -27,12 +29,19 @@ const server = http.createServer(async (req, res) => {
   const authFilesPath = requiresManagementPrefix ? "/v0/management/auth-files" : "/auth-files";
   const modelDefinitionsPath = requiresManagementPrefix ? "/v0/management/model-definitions/codex" : "/model-definitions/codex";
   if (req.method === "GET" && requestUrl.pathname === authFilesPath) {
-    const listed = [...files.entries()].map(([name, payload]) => ({
-      name,
-      email: Array.isArray(payload) ? payload[0]?.email : payload?.email,
-      disabled: Array.isArray(payload) ? payload[0]?.disabled : payload?.disabled,
-      status: Array.isArray(payload) ? payload[0]?.status : payload?.status,
-    }));
+    const listed = [...files.entries()].map(([name, payload]) => {
+      const state = fileStates.get(name) || {};
+      return {
+        name,
+        id: state.id || name,
+        auth_index: state.authIndex || undefined,
+        email: Array.isArray(payload) ? payload[0]?.email : payload?.email,
+        disabled: state.disabled ?? (Array.isArray(payload) ? payload[0]?.disabled : payload?.disabled),
+        status: state.status ?? (Array.isArray(payload) ? payload[0]?.status : payload?.status),
+        failed: state.failed ?? 0,
+        success: state.success ?? 0,
+      };
+    });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ files: listed }));
     return;
@@ -74,6 +83,37 @@ const server = http.createServer(async (req, res) => {
     } finally {
       uploadsInFlight -= 1;
     }
+    return;
+  }
+
+  if (req.method === "PATCH" && requestUrl.pathname === `${authFilesPath}/fields`) {
+    const patch = JSON.parse(await readBody(req));
+    const name = String(patch.name || "");
+    const payload = files.get(name);
+    if (!payload) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "not found" }));
+      return;
+    }
+    credentialRefreshRequests.push({ name, expired: patch.expired, last_refresh: patch.last_refresh });
+    files.set(name, { ...payload, expired: patch.expired, last_refresh: patch.last_refresh });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ success: true }));
+    return;
+  }
+
+  if (req.method === "PATCH" && requestUrl.pathname === `${authFilesPath}/status`) {
+    const patch = JSON.parse(await readBody(req));
+    const name = String(patch.name || "");
+    if (!files.has(name)) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "not found" }));
+      return;
+    }
+    const state = fileStates.get(name) || {};
+    fileStates.set(name, { ...state, disabled: patch.disabled === true, status: patch.disabled === true ? "disabled" : "active" });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ success: true }));
     return;
   }
 
@@ -248,9 +288,42 @@ try {
   assert.equal(locallySavedReauthorization.syncAfterManualReauthorization, true);
   rejectsManagementKey = false;
   const manualReauthorization = await writeJob("manual-reauthorization", "manual-reauthorization@example.com", "manual-reauthorization-access", "manual-reauthorization-refresh");
-  const manualReauthorizationHandled = await sync.syncAfterManualReauthorization(manualReauthorization);
+  const manualReauthorizationCreated = await sync.syncManual([manualReauthorization]);
+  const manualReauthorizationFileName = manualReauthorizationCreated.results[0].remoteFileName;
+  files.set(manualReauthorizationFileName, {
+    ...files.get(manualReauthorizationFileName),
+    access_token: "stale-manual-reauthorization-access",
+    refresh_token: "stale-manual-reauthorization-refresh",
+  });
+  fileStates.set(manualReauthorizationFileName, {
+    disabled: true,
+    status: "disabled",
+    failed: 1,
+    success: 1,
+    authIndex: "manual-reauthorization-index",
+  });
+  const refreshedManualReauthorization = await writeJob("manual-reauthorization-refresh", "manual-reauthorization@example.com", "manual-reauthorization-new-access", "manual-reauthorization-new-refresh");
+  const manualReauthorizationHandled = await sync.syncAfterManualReauthorization(refreshedManualReauthorization);
   assert.equal(manualReauthorizationHandled, true);
   assert.equal([...files.values()].some((payload) => payload.email === "manual-reauthorization@example.com"), true);
+  assert.equal(files.get(manualReauthorizationFileName).access_token, "manual-reauthorization-new-access");
+  assert.equal(files.get(manualReauthorizationFileName).refresh_token, "manual-reauthorization-new-refresh");
+  assert.equal(fileStates.get(manualReauthorizationFileName).disabled, false);
+  assert.equal(fileStates.get(manualReauthorizationFileName).status, "active");
+  assert.deepEqual(credentialRefreshRequests.at(-1), {
+    name: manualReauthorizationFileName,
+    expired: "2000-01-01T00:00:00Z",
+    last_refresh: "2000-01-01T00:00:00Z",
+  });
+
+  const intentionallyDisabled = await writeJob("intentionally-disabled", "intentionally-disabled@example.com", "intentionally-disabled-access", "intentionally-disabled-refresh");
+  const intentionallyDisabledCreated = await sync.syncManual([intentionallyDisabled]);
+  const intentionallyDisabledFileName = intentionallyDisabledCreated.results[0].remoteFileName;
+  fileStates.set(intentionallyDisabledFileName, { disabled: true, status: "disabled", failed: 0, success: 1 });
+  const intentionallyDisabledRefresh = await writeJob("intentionally-disabled-refresh", "intentionally-disabled@example.com", "intentionally-disabled-new-access", "intentionally-disabled-new-refresh");
+  await sync.syncAfterManualReauthorization(intentionallyDisabledRefresh);
+  assert.equal(fileStates.get(intentionallyDisabledFileName).disabled, true);
+  assert.equal(credentialRefreshRequests.some((request) => request.name === intentionallyDisabledFileName), false);
 
   await sync.configure({ baseUrl, managementKey: "", autoSyncEnabled: true });
   const automaticFirst = await writeJob("automatic-first", "auto@example.com", "auto-access-1", "auto-refresh-1", new Date(Date.now() + 1_000).toISOString());

@@ -198,7 +198,7 @@ export function createCpampSync(options) {
 
   async function syncJobs(jobs, syncOptions) {
     const unique = uniqueByEmail(jobs);
-    const summary = { selected: jobs.length, attempted: unique.length, created: 0, updated: 0, failed: 0, duplicates: 0, results: [] };
+    const summary = { selected: jobs.length, attempted: unique.length, created: 0, updated: 0, recovered: 0, failed: 0, duplicates: 0, results: [] };
     let modelIdsPromise = null;
     const context = {
       async getModelIds() {
@@ -220,6 +220,7 @@ export function createCpampSync(options) {
       if (result.status === "failed") summary.failed += 1;
       else if (result.operation === "created") summary.created += 1;
       else summary.updated += 1;
+      if (result.recovered === true) summary.recovered += 1;
       summary.duplicates += Number(result.duplicateCount || 0);
       summary.results.push(result);
     }
@@ -262,6 +263,9 @@ export function createCpampSync(options) {
       payload = applyPolicyToPayload(payload, email, config.policy, models, job);
     }
     await uploadAuthFile(config.baseUrl, managementKey, fileName, payload);
+    const recovered = shouldRecoverAfterManualReauthorization(selection.file, syncOptions)
+      ? await recoverAfterManualReauthorization(selection.file, fileName)
+      : false;
     record.email = email;
     record.remoteFileName = fileName;
     record.pendingJobId = null;
@@ -280,7 +284,22 @@ export function createCpampSync(options) {
       operation: selection.file ? "updated" : "created",
       remoteFileName: fileName,
       duplicateCount: selection.duplicateCount,
+      recovered,
     };
+  }
+
+  async function recoverAfterManualReauthorization(file, fileName) {
+    const targetName = remoteMutationTarget(file, fileName);
+    if (!targetName) throw syncError(409, "CPAMP 返回的凭证标识无效，无法恢复重新授权后的账号");
+    await patchAuthFileFields(config.baseUrl, managementKey, targetName, {
+      expired: "2000-01-01T00:00:00Z",
+      last_refresh: "2000-01-01T00:00:00Z",
+    });
+    const statusPayload = { name: targetName, disabled: false };
+    const authIndex = String(file?.auth_index ?? file?.authIndex ?? "").trim();
+    if (authIndex) statusPayload.auth_index = authIndex;
+    await patchAuthFileStatus(config.baseUrl, managementKey, statusPayload);
+    return true;
   }
 
   async function recordAutomaticFailure(job, error) {
@@ -422,6 +441,43 @@ export function createCpampSync(options) {
     }
   }
 
+  async function patchAuthFileFields(baseUrl, key, name, fields) {
+    await patchJson(baseUrl, key, "/auth-files/fields", { name, ...fields }, "更新 CPAMP 凭证状态");
+  }
+
+  async function patchAuthFileStatus(baseUrl, key, payload) {
+    await patchJson(baseUrl, key, "/auth-files/status", payload, "恢复 CPAMP 账号状态");
+  }
+
+  async function patchJson(baseUrl, key, endpoint, payload, action) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    let requestPromise;
+    try {
+      requestPromise = fetchImpl(`${baseUrl}${endpoint}`, {
+        method: "PATCH",
+        headers: {
+          authorization: `Bearer ${key}`,
+          accept: "application/json",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      requests.add(requestPromise);
+      const response = await requestPromise;
+      const text = await response.text();
+      if (!response.ok) throw remoteError(response.status, text);
+    } catch (error) {
+      if (error?.status) throw error;
+      if (error?.name === "AbortError") throw syncError(504, `${action}超时`);
+      throw syncError(502, `无法${action}：${error.message}`);
+    } finally {
+      clearTimeout(timeout);
+      if (requestPromise) requests.delete(requestPromise);
+    }
+  }
+
   async function listCodexModels() {
     let payload;
     try {
@@ -555,6 +611,16 @@ function selectRemoteFile(files, email, preferredFileName) {
   if (!matches.length) return { file: null, duplicateCount: 0 };
   const active = matches.find((file) => file.disabled !== true);
   return { file: active || matches[0], duplicateCount: matches.length - 1 };
+}
+
+function shouldRecoverAfterManualReauthorization(file, syncOptions) {
+  return syncOptions?.source === "manual_reauthorization"
+    && file?.disabled === true
+    && Number(file?.failed || 0) > 0;
+}
+
+function remoteMutationTarget(file, fallbackName) {
+  return String((file?.runtime_id ?? file?.runtimeId ?? file?.id ?? fallbackName) || "").trim();
 }
 
 function fileMatchesEmail(file, email) {

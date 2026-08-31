@@ -2849,11 +2849,13 @@ function formatMonitorResult(result) {
 function formatCpampResult(result) {
   const created = Number(result?.created || 0);
   const updated = Number(result?.updated || 0);
+  const recovered = Number(result?.recovered || 0);
   const failed = Number(result?.failed || 0);
   const duplicates = Number(result?.duplicates || 0);
   const parts = [`CPAMP 已同步 ${created + updated} 个账号`];
   if (created) parts.push(`新建 ${created} 个`);
   if (updated) parts.push(`更新 ${updated} 个`);
+  if (recovered) parts.push(`恢复 ${recovered} 个重新授权账号`);
   if (duplicates) parts.push(`发现 ${duplicates} 份同邮箱凭证，仅更新主凭证`);
   if (failed) parts.push(`失败 ${failed} 个`);
   const failures = Array.isArray(result?.results)
