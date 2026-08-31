@@ -224,6 +224,22 @@ try {
   assert.equal(distinctUpdate.created, 1);
   assert.equal(files.get("codex-wrong-xxnear@example.com-plus.json").access_token, "wrong-account-token");
 
+  const disabledManualReauthorization = await writeJob("manual-reauthorization-disabled", "manual-disabled@example.com", "manual-disabled-access", "manual-disabled-refresh");
+  await sync.syncAfterManualReauthorization(disabledManualReauthorization);
+  assert.equal([...files.values()].some((payload) => payload.email === "manual-disabled@example.com"), false);
+
+  const reauthorizationConfigured = await sync.configure({
+    baseUrl,
+    managementKey: "",
+    autoSyncEnabled: false,
+    syncAfterManualReauthorization: true,
+  });
+  assert.equal(reauthorizationConfigured.syncAfterManualReauthorization, true);
+  const manualReauthorization = await writeJob("manual-reauthorization", "manual-reauthorization@example.com", "manual-reauthorization-access", "manual-reauthorization-refresh");
+  const manualReauthorizationHandled = await sync.syncAfterManualReauthorization(manualReauthorization);
+  assert.equal(manualReauthorizationHandled, true);
+  assert.equal([...files.values()].some((payload) => payload.email === "manual-reauthorization@example.com"), true);
+
   await sync.configure({ baseUrl, managementKey: "", autoSyncEnabled: true });
   const automaticFirst = await writeJob("automatic-first", "auto@example.com", "auto-access-1", "auto-refresh-1", new Date(Date.now() + 1_000).toISOString());
   await sync.queueCompleted(automaticFirst);

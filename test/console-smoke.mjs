@@ -20,6 +20,7 @@ const clearedRemoteAccountIds = new Set();
 const scheduledRemoteAccounts = new Map();
 const clearRemoteCounts = new Map();
 const failClearOnce = new Set();
+const cpampFiles = new Map();
 const sub2api = http.createServer(async (req, res) => {
   if (req.headers["x-api-key"] !== "test-admin-key") {
     res.writeHead(401, { "content-type": "application/json" });
@@ -119,6 +120,42 @@ const sub2api = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ message: "not found" }));
 });
 await new Promise((resolve) => sub2api.listen(sub2apiPort, "127.0.0.1", resolve));
+const cpampPort = await findAvailablePort();
+const cpampUrl = `http://127.0.0.1:${cpampPort}`;
+const cpamp = http.createServer(async (req, res) => {
+  if (req.headers.authorization !== "Bearer test-cpamp-key") {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ message: "invalid management key" }));
+    return;
+  }
+  const requestUrl = new URL(req.url, cpampUrl);
+  if (req.method === "GET" && requestUrl.pathname === "/auth-files") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ files: [...cpampFiles.entries()].map(([name, payload]) => ({ name, email: payload.email })) }));
+    return;
+  }
+  if (req.method === "GET" && requestUrl.pathname === "/auth-files/download") {
+    const payload = cpampFiles.get(requestUrl.searchParams.get("name"));
+    if (!payload) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "not found" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+  if (req.method === "POST" && requestUrl.pathname === "/auth-files") {
+    const parsed = parseMultipartJson(await readBody(req), String(req.headers["content-type"] || ""));
+    cpampFiles.set(parsed.name, parsed.payload);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ success: true }));
+    return;
+  }
+  res.writeHead(404, { "content-type": "application/json" });
+  res.end(JSON.stringify({ message: "not found" }));
+});
+await new Promise((resolve) => cpamp.listen(cpampPort, "127.0.0.1", resolve));
 const child = spawn(process.execPath, [
   path.join(projectRoot, "src", "console-server.mjs"),
   "--host",
@@ -153,6 +190,19 @@ try {
   assert.equal(bootstrap.features.accountGroups, true);
   assert.equal(bootstrap.features.groupFilter, true);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
+  const cpampConfigResponse = await fetch(`${baseUrl}/api/cpamp/config`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      baseUrl: cpampUrl,
+      managementKey: "test-cpamp-key",
+      autoSyncEnabled: false,
+      syncAfterManualReauthorization: true,
+    }),
+  });
+  const cpampConfigText = await cpampConfigResponse.text();
+  assert.equal(cpampConfigResponse.status, 200, cpampConfigText);
+  assert.equal(JSON.parse(cpampConfigText).syncAfterManualReauthorization, true);
 
   const pageResponse = await fetch(`${baseUrl}/`);
   assert.equal(pageResponse.status, 200);
@@ -245,6 +295,7 @@ try {
 
   let job = await waitForJob(headers, jobId, (value) => value.status === "completed");
   assert.equal(job.canDownload, true);
+  assert.equal(cpampFiles.size, 0, "initial authorization must not use the manual reauthorization switch");
 
   const filteredJobsResponse = await fetch(`${baseUrl}/api/jobs/query`, {
     method: "POST",
@@ -389,6 +440,7 @@ try {
   job = await waitForJob(headers, jobId, (value) => value.status === "completed" && value.attempt >= 2);
   assert.equal(job.canDownload, true);
   assert.equal(job.lastOperationType, "reauthorize");
+  await waitFor(() => cpampAccount("cross-platform@example.com")?.access_token?.startsWith("refreshed-access-"));
 
   const refreshedResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/download`, { headers });
   const refreshed = await refreshedResponse.json();
@@ -403,6 +455,20 @@ try {
   const profileCreated = await profileResponse.json();
   const profileJob = await waitForJob(headers, profileCreated.job.id, (value) => value.status === "completed");
   assert.equal(profileJob.canDownload, true);
+
+  const batchReauthorizeResponse = await fetch(`${baseUrl}/api/jobs/reauthorize-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId, profileJob.id] }),
+  });
+  const batchReauthorizeText = await batchReauthorizeResponse.text();
+  assert.equal(batchReauthorizeResponse.status, 200, batchReauthorizeText);
+  assert.equal(JSON.parse(batchReauthorizeText).started, 2);
+  await Promise.all([
+    waitForJob(headers, jobId, (value) => value.status === "completed" && value.lastOperationType === "reauthorize" && value.attempt >= 3),
+    waitForJob(headers, profileJob.id, (value) => value.status === "completed" && value.lastOperationType === "reauthorize" && value.attempt >= 2),
+  ]);
+  await waitFor(() => cpampAccount("account-profile@example.com")?.access_token?.startsWith("refreshed-access-"));
 
   const setupTotpResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/setup-2fa`, {
     method: "POST",
@@ -471,6 +537,7 @@ try {
   );
   assert.equal(reloggedJob.hasTotpKey, true);
   assert.equal(reloggedJob.lastOperationType, "relogin");
+  await waitFor(() => cpampAccount("cross-platform@example.com")?.access_token?.startsWith("test-access-"));
   const reloginLogs = await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers }).then((response) => response.json());
   assert.match(reloginLogs.logs, /\[relogin\].*跳过刷新令牌并强制重新登录/);
 
@@ -572,6 +639,7 @@ try {
   await Promise.all([jobId, profileJob.id].map((id) => (
     waitForJob(headers, id, (value) => value.status === "completed" && value.canForceRelogin)
   )));
+  await waitFor(() => cpampAccount("account-profile@example.com")?.access_token?.startsWith("test-access-"));
 
   const addPasswordResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/add-password`, {
     method: "POST",
@@ -1205,6 +1273,7 @@ try {
   if (isRunning(child)) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);
   await new Promise((resolve) => sub2api.close(resolve));
+  await new Promise((resolve) => cpamp.close(resolve));
   await fs.rm(outputRoot, { recursive: true, force: true });
 }
 
@@ -1270,6 +1339,27 @@ function findAvailablePort() {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cpampAccount(email) {
+  return [...cpampFiles.values()].find((account) => account.email === email) || null;
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function parseMultipartJson(raw, contentType) {
+  const boundary = /boundary=([^;]+)/i.exec(contentType)?.[1]?.replace(/^\"|\"$/g, "");
+  assert.ok(boundary, "expected CPAMP multipart boundary");
+  const name = /filename=\"([^\"]+)\"/i.exec(raw)?.[1];
+  assert.ok(name, "expected CPAMP uploaded file name");
+  const contentStart = raw.indexOf("\r\n\r\n");
+  const contentEnd = raw.indexOf(`\r\n--${boundary}`, contentStart);
+  assert.ok(contentStart >= 0 && contentEnd > contentStart, "expected CPAMP uploaded JSON body");
+  return { name, payload: JSON.parse(raw.slice(contentStart + 4, contentEnd)) };
 }
 
 function isRunning(processHandle) {

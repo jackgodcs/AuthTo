@@ -50,6 +50,7 @@ export function createCpampSync(options) {
         baseUrl: config.baseUrl || null,
         autoSyncEnabled: config.autoSyncEnabled === true,
         autoSyncEnabledAt: config.autoSyncEnabledAt || null,
+        syncAfterManualReauthorization: config.syncAfterManualReauthorization === true,
         pending,
         pendingCount: pending.length,
         syncingCount: records.filter((record) => record.state === "syncing").length,
@@ -89,6 +90,9 @@ export function createCpampSync(options) {
       const nextKey = suppliedKey || managementKey;
       if (!nextKey) throw syncError(400, "请填写 CPAMP 管理密钥");
       const nextAuto = input.autoSyncEnabled === true;
+      const syncAfterManualReauthorization = input.syncAfterManualReauthorization === undefined
+        ? config.syncAfterManualReauthorization === true
+        : input.syncAfterManualReauthorization === true;
       const policy = normalizePolicy(input.policy === undefined ? config.policy : input.policy);
       const inspectionEnabled = input.inspectionEnabled === undefined
         ? config.inspection.enabled === true
@@ -100,6 +104,7 @@ export function createCpampSync(options) {
       config.baseUrl = apiBase;
       config.autoSyncEnabled = nextAuto;
       config.autoSyncEnabledAt = enabling ? new Date().toISOString() : (nextAuto ? config.autoSyncEnabledAt || new Date().toISOString() : null);
+      config.syncAfterManualReauthorization = syncAfterManualReauthorization;
       config.policy = policy;
       config.inspection.enabled = inspectionEnabled;
       if (!inspectionEnabled) config.inspection.lastError = null;
@@ -152,6 +157,12 @@ export function createCpampSync(options) {
         return;
       }
       await syncAutomatic(job);
+    },
+
+    async syncAfterManualReauthorization(job) {
+      if (!config.syncAfterManualReauthorization || !managementKey || !config.baseUrl || !job?.resultSaved) return false;
+      await syncJobs([job], { source: "manual_reauthorization", approve: true });
+      return true;
     },
 
     async resume(jobsById) {
@@ -784,6 +795,7 @@ async function readConfig(configPath) {
       baseUrl: typeof raw.baseUrl === "string" ? raw.baseUrl : "",
       autoSyncEnabled: raw.autoSyncEnabled === true,
       autoSyncEnabledAt: typeof raw.autoSyncEnabledAt === "string" ? raw.autoSyncEnabledAt : null,
+      syncAfterManualReauthorization: raw.syncAfterManualReauthorization === true,
       records: raw.records && typeof raw.records === "object" && !Array.isArray(raw.records) ? raw.records : {},
       lastError: typeof raw.lastError === "string" ? raw.lastError : null,
       lastSyncAt: typeof raw.lastSyncAt === "string" ? raw.lastSyncAt : null,
@@ -802,6 +814,7 @@ function emptyConfig() {
     baseUrl: "",
     autoSyncEnabled: false,
     autoSyncEnabledAt: null,
+    syncAfterManualReauthorization: false,
     records: {},
     lastError: null,
     lastSyncAt: null,

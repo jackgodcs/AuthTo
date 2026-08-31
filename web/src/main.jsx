@@ -143,12 +143,12 @@ function App() {
     intervalMinutes: 5,
   });
   const [cpampStatus, setCpampStatus] = useState({
-    configured: false, baseUrl: null, autoSyncEnabled: false, pending: [], pendingCount: 0, syncingCount: 0, lastError: null,
+    configured: false, baseUrl: null, autoSyncEnabled: false, syncAfterManualReauthorization: false, pending: [], pendingCount: 0, syncingCount: 0, lastError: null,
     policy: defaultCpampPolicy(),
     inspection: { enabled: false, running: false, lastCheckAt: null, lastError: null, lastResult: null, intervalMinutes: 5 },
   });
   const [cpampSettingsOpen, setCpampSettingsOpen] = useState(false);
-  const [cpampSettingsDraft, setCpampSettingsDraft] = useState({ baseUrl: "", managementKey: "", autoSyncEnabled: false, policy: defaultCpampPolicy(), inspectionEnabled: false });
+  const [cpampSettingsDraft, setCpampSettingsDraft] = useState({ baseUrl: "", managementKey: "", autoSyncEnabled: false, syncAfterManualReauthorization: false, policy: defaultCpampPolicy(), inspectionEnabled: false });
   const [cpampSettingsError, setCpampSettingsError] = useState("");
   const [cpampSettingsSaving, setCpampSettingsSaving] = useState(false);
   const [cpampModels, setCpampModels] = useState([]);
@@ -342,6 +342,7 @@ function App() {
       baseUrl: cpampStatus.baseUrl || "",
       managementKey: "",
       autoSyncEnabled: Boolean(cpampStatus.autoSyncEnabled),
+      syncAfterManualReauthorization: Boolean(cpampStatus.syncAfterManualReauthorization),
       policy: normalizeCpampPolicy(cpampStatus.policy),
       inspectionEnabled: Boolean(cpampStatus.inspection?.enabled),
     });
@@ -370,13 +371,14 @@ function App() {
           baseUrl,
           managementKey: String(cpampSettingsDraft.managementKey || "").trim(),
           autoSyncEnabled: cpampSettingsDraft.autoSyncEnabled === true,
+          syncAfterManualReauthorization: cpampSettingsDraft.syncAfterManualReauthorization === true,
           policy: cpampSettingsDraft.policy,
           inspectionEnabled: cpampSettingsDraft.inspectionEnabled === true,
         }),
       });
       setCpampStatus(nextStatus);
       setCpampSettingsOpen(false);
-      setUploadNotice(`CPAMP 已连接${nextStatus.autoSyncEnabled ? "，已启用以后完成任务的自动同步" : ""}`);
+      setUploadNotice(`CPAMP 已连接${nextStatus.autoSyncEnabled ? "，已启用以后完成任务的自动同步" : ""}${nextStatus.syncAfterManualReauthorization ? "，手动重新授权成功后会自动同步" : ""}`);
       setError("");
     } catch (requestError) {
       setCpampSettingsError(requestError.message);
@@ -1142,6 +1144,10 @@ function App() {
               {cpampStatus.autoSyncEnabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
               {cpampStatus.autoSyncEnabled ? "新完成任务自动同步" : "自动同步未启用"}
             </span>
+            <span className={`provider-ready monitor-ready ${cpampStatus.syncAfterManualReauthorization ? "" : "incomplete"}`}>
+              {cpampStatus.syncAfterManualReauthorization ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+              {cpampStatus.syncAfterManualReauthorization ? "手动重新授权后自动同步" : "手动重新授权后不自动同步"}
+            </span>
             {cpampStatus.inspection?.enabled && (
               <>
                 <span className={`provider-ready monitor-ready ${cpampInspectionIssueCount(cpampStatus.inspection?.lastResult) ? "incomplete" : ""}`}>
@@ -1887,6 +1893,17 @@ function App() {
                 <span>
                   <strong>自动同步以后新完成的任务</strong>
                   <small>首次同步某个邮箱前会进入待确认队列。勾选账号后点击“确认待同步”，以后该邮箱会自动更新。</small>
+                </span>
+              </label>
+              <label className="settings-field wide-settings-field cpamp-auto-sync-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cpampSettingsDraft.syncAfterManualReauthorization)}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, syncAfterManualReauthorization: event.target.checked }))}
+                />
+                <span>
+                  <strong>手动重新授权成功后自动同步</strong>
+                  <small>适用于单个或批量“重新授权”和“重新登录并授权”。只更新 OAuth 授权信息，不覆盖 CPAMP 原有策略；Sub2API 自动修复不受此开关影响。</small>
                 </span>
               </label>
               <div className="cpamp-settings-section wide-settings-field">

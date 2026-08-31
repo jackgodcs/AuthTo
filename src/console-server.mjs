@@ -951,6 +951,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     updatedAt: createdAt,
     lastOperationAt: createdAt,
     lastOperationType: "initial_authorization",
+    cpampSyncAfterManualReauthorization: false,
     completedAt: null,
     outputPath,
     checkpointPath,
@@ -1212,10 +1213,20 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     touch(job);
     await saveJobMetadata(job);
     await finishSub2ApiAutoRepairSuccess(job);
+    const shouldSyncManualReauthorization = job.cpampSyncAfterManualReauthorization === true;
+    let manualReauthorizationSyncHandled = false;
     try {
-      await cpampSync.queueCompleted(job);
+      if (shouldSyncManualReauthorization) {
+        manualReauthorizationSyncHandled = await cpampSync.syncAfterManualReauthorization(job);
+      }
+      if (!manualReauthorizationSyncHandled) await cpampSync.queueCompleted(job);
     } catch (error) {
       console.warn(`[cpamp] ${job.email} 的同步队列写入失败：${error.message}`);
+    } finally {
+      if (shouldSyncManualReauthorization) {
+        job.cpampSyncAfterManualReauthorization = false;
+        await saveJobMetadata(job);
+      }
     }
     scheduleQueuedJobs();
     return;
@@ -1289,6 +1300,7 @@ async function retryJob(job, options = {}) {
   job.autoRepairOperation = null;
   job.autoRepairPendingAccountIds = [];
   job.autoRepairPendingBackend = null;
+  job.cpampSyncAfterManualReauthorization = true;
   beginAuthorizationAutomationAttempt(job, "manual_retry");
   recordJobOperation(job, resumingCheckpoint ? "resume" : "reauthorize");
   appendJobLog(
@@ -1322,6 +1334,7 @@ async function regenerateJob(job, options = {}) {
   job.proxyRiskRestarting = false;
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
+  job.cpampSyncAfterManualReauthorization = true;
   recordJobOperation(job, "reauthorize");
   appendJobLog(job, `\n[refresh] 第 ${job.attempt} 次生成：优先使用已有刷新令牌。\n`);
   enqueueJob(job, "refresh", "正在使用已有刷新令牌直接生成新授权");
@@ -1372,6 +1385,7 @@ async function forceReloginJob(job, options = {}, context = {}) {
     clearAutoRepairBlock(job);
     job.autoRepairPendingAccountIds = [];
     job.autoRepairPendingBackend = null;
+    job.cpampSyncAfterManualReauthorization = true;
   }
   job.autoRepairOperation = context.autoRepair || null;
   if (context.autoRepair) {
@@ -3620,6 +3634,7 @@ async function syncCompletedOutputs(force = false) {
           updatedAt,
           lastOperationAt: metadata.last_operation_at || metadata.created_at || completedAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
+          cpampSyncAfterManualReauthorization: Boolean(metadata.cpamp_sync_after_manual_reauthorization),
           completedAt: metadata.completed_at || completedAt,
           outputPath,
           checkpointPath,
@@ -3706,6 +3721,7 @@ async function syncCompletedOutputs(force = false) {
           updatedAt: metadata.updated_at || restoredAt,
           lastOperationAt: metadata.last_operation_at || metadata.created_at || restoredAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
+          cpampSyncAfterManualReauthorization: Boolean(metadata.cpamp_sync_after_manual_reauthorization),
           completedAt: null,
           outputPath,
           checkpointPath,
@@ -3799,6 +3815,7 @@ async function syncCompletedOutputs(force = false) {
           updatedAt: restoredAt,
           lastOperationAt: metadata.last_operation_at || metadata.created_at || restoredAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
+          cpampSyncAfterManualReauthorization: Boolean(metadata.cpamp_sync_after_manual_reauthorization),
           completedAt: metadata.completed_at || null,
           outputPath,
           checkpointPath,
@@ -4650,6 +4667,7 @@ async function saveJobMetadata(job) {
         created_at: job.createdAt,
         last_operation_at: job.lastOperationAt || job.createdAt,
         last_operation_type: job.lastOperationType || "initial_authorization",
+        cpamp_sync_after_manual_reauthorization: Boolean(job.cpampSyncAfterManualReauthorization),
         login_mode: job.loginMode || null,
         mail_api_url: job.mailApiUrl || null,
         mail_request_body: job.mailRequestBody || null,
