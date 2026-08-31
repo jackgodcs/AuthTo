@@ -627,7 +627,11 @@ try {
     profileJob.id,
     (value) => value.status === "completed" && value.passwordAddedAt,
   );
-  assert.equal(profilePasswordAdded.passwordAddError, null);
+  if (process.platform === "linux") {
+    assert.match(profilePasswordAdded.passwordAddError || "", /不支持持久凭据存储/);
+  } else {
+    assert.equal(profilePasswordAdded.passwordAddError, null);
+  }
   assert.equal(profilePasswordAdded.canAddPassword, false);
 
   const incompleteAuthorizationResponse = await fetch(`${baseUrl}/api/jobs`, {
