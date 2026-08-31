@@ -10,6 +10,11 @@ const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-cpamp-sync-")
 const files = new Map();
 let storedManagementKey = "";
 let requiresManagementPrefix = false;
+let codexModels = ["gpt-5", "gpt-5-mini", "gpt-4.1"];
+let modelDirectoryAvailable = true;
+let uploadDelayMs = 0;
+let uploadsInFlight = 0;
+let maxUploadsInFlight = 0;
 const server = http.createServer(async (req, res) => {
   if (req.headers.authorization !== "Bearer test-management-key") {
     res.writeHead(401, { "content-type": "application/json" });
@@ -19,11 +24,13 @@ const server = http.createServer(async (req, res) => {
 
   const requestUrl = new URL(req.url, "http://127.0.0.1");
   const authFilesPath = requiresManagementPrefix ? "/v0/management/auth-files" : "/auth-files";
+  const modelDefinitionsPath = requiresManagementPrefix ? "/v0/management/model-definitions/codex" : "/model-definitions/codex";
   if (req.method === "GET" && requestUrl.pathname === authFilesPath) {
     const listed = [...files.entries()].map(([name, payload]) => ({
       name,
       email: Array.isArray(payload) ? payload[0]?.email : payload?.email,
       disabled: Array.isArray(payload) ? payload[0]?.disabled : payload?.disabled,
+      status: Array.isArray(payload) ? payload[0]?.status : payload?.status,
     }));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ files: listed }));
@@ -42,12 +49,30 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "POST" && requestUrl.pathname === authFilesPath) {
-    const raw = await readBody(req);
-    const parsed = parseMultipartJson(raw, String(req.headers["content-type"] || ""));
-    files.set(parsed.name, parsed.payload);
+  if (req.method === "GET" && requestUrl.pathname === modelDefinitionsPath) {
+    if (!modelDirectoryAvailable) {
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "model directory unavailable" }));
+      return;
+    }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ success: true }));
+    res.end(JSON.stringify({ models: codexModels }));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === authFilesPath) {
+    uploadsInFlight += 1;
+    maxUploadsInFlight = Math.max(maxUploadsInFlight, uploadsInFlight);
+    try {
+      const raw = await readBody(req);
+      const parsed = parseMultipartJson(raw, String(req.headers["content-type"] || ""));
+      if (uploadDelayMs) await delay(uploadDelayMs);
+      files.set(parsed.name, parsed.payload);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ success: true }));
+    } finally {
+      uploadsInFlight -= 1;
+    }
     return;
   }
 
@@ -80,6 +105,22 @@ try {
   const prefixedConfigured = await sync.configure({ baseUrl, managementKey: "", autoSyncEnabled: false });
   assert.equal(prefixedConfigured.configured, true);
   assert.equal(prefixedConfigured.baseUrl, `${baseUrl}/v0/management`);
+  assert.deepEqual((await sync.options()).models, codexModels);
+
+  await sync.configure({
+    baseUrl,
+    managementKey: "",
+    autoSyncEnabled: false,
+    policy: {
+      newAccountEnabled: true,
+      proxyMode: "fixed",
+      fixedProxyUrl: "socks5://policy.example:1080",
+      priority: 7,
+      weight: 3,
+      modelWhitelist: ["gpt-5", "gpt-4.1"],
+      syncConcurrency: 1,
+    },
+  });
 
   const primary = await writeJob("primary-job", "user@example.com", "access-1", "refresh-1");
   const created = await sync.syncManual([primary]);
@@ -87,6 +128,11 @@ try {
   assert.equal(created.updated, 0);
   const primaryFileName = created.results[0].remoteFileName;
   assert.equal(files.get(primaryFileName).access_token, "access-1");
+  assert.equal(files.get(primaryFileName).proxy_url, "socks5://policy.example:1080");
+  assert.equal(files.get(primaryFileName).priority, 7);
+  assert.equal(files.get(primaryFileName).weight, 3);
+  assert.equal(files.get(primaryFileName).disabled, false);
+  assert.deepEqual(files.get(primaryFileName).excluded_models, ["gpt-5-mini"]);
 
   files.set(primaryFileName, {
     ...files.get(primaryFileName),
@@ -110,6 +156,64 @@ try {
   assert.equal(preserved.proxy_url, "socks5://proxy.example:1080");
   assert.equal(preserved.note, "keep this CPAMP setting");
   assert.equal(preserved.disabled, true);
+  assert.deepEqual(preserved.excluded_models, ["gpt-5-mini"]);
+
+  const forced = await sync.applyPolicy([primaryUpdate]);
+  assert.equal(forced.updated, 1);
+  const forceApplied = files.get(primaryFileName);
+  assert.equal(forceApplied.proxy_url, "socks5://policy.example:1080");
+  assert.equal(forceApplied.priority, 7);
+  assert.equal(forceApplied.weight, 3);
+  assert.equal(forceApplied.disabled, false);
+  assert.equal(forceApplied.note, "keep this CPAMP setting");
+
+  await sync.configure({
+    baseUrl,
+    managementKey: "",
+    autoSyncEnabled: false,
+    policy: { newAccountEnabled: true, proxyMode: "none", priority: "", weight: "", modelWhitelist: ["gpt-5"], syncConcurrency: 1 },
+  });
+  modelDirectoryAvailable = false;
+  const blocked = await writeJob("blocked-models", "blocked@example.com", "blocked-access", "blocked-refresh");
+  const blockedResult = await sync.syncManual([blocked]);
+  assert.equal(blockedResult.failed, 1);
+  assert.match(blockedResult.results[0].error, /模型目录读取失败/);
+  assert.equal([...files.values()].some((payload) => payload.email === "blocked@example.com"), false);
+  modelDirectoryAvailable = true;
+
+  await sync.configure({
+    baseUrl,
+    managementKey: "",
+    autoSyncEnabled: false,
+    inspectionEnabled: true,
+    policy: { newAccountEnabled: true, proxyMode: "none", priority: "", weight: "", modelWhitelist: [], syncConcurrency: 3 },
+  });
+  uploadDelayMs = 40;
+  maxUploadsInFlight = 0;
+  const concurrentJobs = await Promise.all([
+    writeJob("parallel-1", "parallel-1@example.com", "parallel-access-1", "parallel-refresh-1"),
+    writeJob("parallel-2", "parallel-2@example.com", "parallel-access-2", "parallel-refresh-2"),
+    writeJob("parallel-3", "parallel-3@example.com", "parallel-access-3", "parallel-refresh-3"),
+    writeJob("parallel-4", "parallel-4@example.com", "parallel-access-4", "parallel-refresh-4"),
+  ]);
+  const concurrent = await sync.syncManual(concurrentJobs);
+  assert.equal(concurrent.created, 4);
+  assert.equal(maxUploadsInFlight, 3);
+  uploadDelayMs = 0;
+
+  files.delete(primaryFileName);
+  const disabledFileName = concurrent.results.find((result) => result.email === "parallel-2@example.com").remoteFileName;
+  const problemFileName = concurrent.results.find((result) => result.email === "parallel-3@example.com").remoteFileName;
+  files.set(disabledFileName, { ...files.get(disabledFileName), disabled: true });
+  files.set(problemFileName, { ...files.get(problemFileName), status: "error" });
+  const inspection = await sync.inspectNow();
+  assert.equal(inspection.missing, 1);
+  assert.equal(inspection.disabled, 1);
+  assert.equal(inspection.problem, 1);
+  assert.equal(sync.recordFor("user@example.com").inspection.state, "missing");
+  assert.equal(sync.recordFor("parallel-2@example.com").inspection.state, "disabled");
+  assert.equal(sync.recordFor("parallel-3@example.com").inspection.state, "problem");
+  assert.equal(sync.recordFor("parallel-1@example.com").inspection.state, "healthy");
 
   files.set("codex-wrong-xxnear@example.com-plus.json", {
     email: "xxnear@example.com",
@@ -167,6 +271,10 @@ async function readBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function parseMultipartJson(raw, contentType) {

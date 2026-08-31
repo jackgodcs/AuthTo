@@ -142,11 +142,18 @@ function App() {
     lastResult: null,
     intervalMinutes: 5,
   });
-  const [cpampStatus, setCpampStatus] = useState({ configured: false, baseUrl: null, autoSyncEnabled: false, pending: [], pendingCount: 0, syncingCount: 0, lastError: null });
+  const [cpampStatus, setCpampStatus] = useState({
+    configured: false, baseUrl: null, autoSyncEnabled: false, pending: [], pendingCount: 0, syncingCount: 0, lastError: null,
+    policy: defaultCpampPolicy(),
+    inspection: { enabled: false, running: false, lastCheckAt: null, lastError: null, lastResult: null, intervalMinutes: 5 },
+  });
   const [cpampSettingsOpen, setCpampSettingsOpen] = useState(false);
-  const [cpampSettingsDraft, setCpampSettingsDraft] = useState({ baseUrl: "", managementKey: "", autoSyncEnabled: false });
+  const [cpampSettingsDraft, setCpampSettingsDraft] = useState({ baseUrl: "", managementKey: "", autoSyncEnabled: false, policy: defaultCpampPolicy(), inspectionEnabled: false });
   const [cpampSettingsError, setCpampSettingsError] = useState("");
   const [cpampSettingsSaving, setCpampSettingsSaving] = useState(false);
+  const [cpampModels, setCpampModels] = useState([]);
+  const [cpampModelsLoading, setCpampModelsLoading] = useState(false);
+  const [cpampInspectionChecking, setCpampInspectionChecking] = useState(false);
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
@@ -335,7 +342,10 @@ function App() {
       baseUrl: cpampStatus.baseUrl || "",
       managementKey: "",
       autoSyncEnabled: Boolean(cpampStatus.autoSyncEnabled),
+      policy: normalizeCpampPolicy(cpampStatus.policy),
+      inspectionEnabled: Boolean(cpampStatus.inspection?.enabled),
     });
+    setCpampModels([]);
     setCpampSettingsError("");
     setCpampSettingsOpen(true);
   }
@@ -360,6 +370,8 @@ function App() {
           baseUrl,
           managementKey: String(cpampSettingsDraft.managementKey || "").trim(),
           autoSyncEnabled: cpampSettingsDraft.autoSyncEnabled === true,
+          policy: cpampSettingsDraft.policy,
+          inspectionEnabled: cpampSettingsDraft.inspectionEnabled === true,
         }),
       });
       setCpampStatus(nextStatus);
@@ -370,6 +382,24 @@ function App() {
       setCpampSettingsError(requestError.message);
     } finally {
       setCpampSettingsSaving(false);
+    }
+  }
+
+  async function loadCpampModels() {
+    if (!cpampStatus.configured) {
+      setCpampSettingsError("请先保存 CPAMP 服务器地址和管理密钥，再读取模型目录");
+      return;
+    }
+    setCpampModelsLoading(true);
+    setCpampSettingsError("");
+    try {
+      const data = await apiFetch(token, "/api/cpamp/options");
+      setCpampModels(Array.isArray(data.models) ? data.models : []);
+    } catch (requestError) {
+      setCpampModels([]);
+      setCpampSettingsError(requestError.message);
+    } finally {
+      setCpampModelsLoading(false);
     }
   }
 
@@ -677,6 +707,51 @@ function App() {
       setError(requestError.message);
     } finally {
       setBatchAction("");
+    }
+  }
+
+  async function applyCpampPolicyToSelected() {
+    if (!cpampStatus.configured) {
+      openCpampSettings();
+      setCpampSettingsError("请先配置 CPAMP API 根地址和管理密钥");
+      return;
+    }
+    if (batchAction) return;
+    const selected = selectedJobs.filter((job) => job.canDownload);
+    if (!selected.length) {
+      setError("请选择至少一条已完成的 OAuth 授权任务");
+      return;
+    }
+    const domain = displayCpampHost(cpampStatus.baseUrl);
+    if (!window.confirm(`确定强制将 CPAMP 同步策略应用到 ${selected.length} 个账号吗？这会覆盖 ${domain} 上对应账号的代理、优先级、调度权重、启停状态和模型限制。`)) return;
+    if (!window.confirm("请再次确认：此操作会替换上述远端设置，但不会修改 CPAMP 备注。")) return;
+    setBatchAction("cpamp-policy");
+    try {
+      const result = await apiFetch(token, "/api/cpamp/apply-policy", {
+        method: "POST",
+        body: JSON.stringify({ ids: selected.map((job) => job.id) }),
+      });
+      setUploadNotice(`${formatCpampResult(result)}，已强制应用同步策略`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function checkCpampInspectionNow() {
+    if (!cpampStatus.configured || !cpampStatus.inspection?.enabled || cpampInspectionChecking) return;
+    setCpampInspectionChecking(true);
+    try {
+      const result = await apiFetch(token, "/api/cpamp/inspection/check", { method: "POST" });
+      setUploadNotice(formatCpampInspectionResult(result));
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setCpampInspectionChecking(false);
     }
   }
 
@@ -1067,6 +1142,23 @@ function App() {
               {cpampStatus.autoSyncEnabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
               {cpampStatus.autoSyncEnabled ? "新完成任务自动同步" : "自动同步未启用"}
             </span>
+            {cpampStatus.inspection?.enabled && (
+              <>
+                <span className={`provider-ready monitor-ready ${cpampInspectionIssueCount(cpampStatus.inspection?.lastResult) ? "incomplete" : ""}`}>
+                  {cpampInspectionIssueCount(cpampStatus.inspection?.lastResult) ? <CircleAlert size={14} /> : <ShieldCheck size={14} />}
+                  {cpampInspectionSummary(cpampStatus.inspection)}
+                </span>
+                <button
+                  type="button"
+                  className="icon-button monitor-check-button"
+                  onClick={checkCpampInspectionNow}
+                  disabled={cpampInspectionChecking || cpampStatus.inspection?.running}
+                  title="立即检查 CPAMP 同步关联"
+                >
+                  <RefreshCw className={cpampInspectionChecking || cpampStatus.inspection?.running ? "spin" : ""} size={16} />
+                </button>
+              </>
+            )}
             {cpampStatus.pendingCount > 0 && (
               <span className="provider-ready monitor-ready incomplete"><CircleAlert size={14} />待确认 {cpampStatus.pendingCount} 个账号</span>
             )}
@@ -1230,6 +1322,12 @@ function App() {
                 <button type="button" className="secondary-button bulk-button" onClick={() => syncSelectedToCpamp([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
                   {batchAction === "cpamp-sync" ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
                   同步到 CPAMP
+                </button>
+              )}
+              {features.cpampSync && (
+                <button type="button" className="secondary-button bulk-button" onClick={applyCpampPolicyToSelected} disabled={!canUploadSelected || Boolean(batchAction)}>
+                  {batchAction === "cpamp-policy" ? <LoaderCircle className="spin" size={16} /> : <Settings2 size={16} />}
+                  强制应用 CPAMP 策略
                 </button>
               )}
               {features.cpampSync && pendingCpampSelectedCount > 0 && (
@@ -1791,10 +1889,125 @@ function App() {
                   <small>首次同步某个邮箱前会进入待确认队列。勾选账号后点击“确认待同步”，以后该邮箱会自动更新。</small>
                 </span>
               </label>
+              <div className="cpamp-settings-section wide-settings-field">
+                <strong>新账号默认同步策略</strong>
+                <span>新建 CPAMP 账号时应用；同邮箱的普通同步只更新 OAuth 授权信息。使用列表中的强制操作才会覆盖既有策略。</span>
+              </div>
+              <label className="settings-field cpamp-auto-sync-toggle">
+                <input
+                  type="checkbox"
+                  checked={cpampSettingsDraft.policy.newAccountEnabled !== false}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, newAccountEnabled: event.target.checked } }))}
+                />
+                <span><strong>新账号默认启用</strong><small>取消勾选时，新建账号会在 CPAMP 中保持禁用状态。</small></span>
+              </label>
+              <label className="settings-field">
+                <span>代理来源</span>
+                <select
+                  value={cpampSettingsDraft.policy.proxyMode}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, proxyMode: event.target.value } }))}
+                >
+                  <option value="none">不设置代理</option>
+                  <option value="fixed">固定代理地址</option>
+                  <option value="job">沿用 AutoTo 登录代理</option>
+                </select>
+              </label>
+              {cpampSettingsDraft.policy.proxyMode === "fixed" && (
+                <label className="settings-field wide-settings-field">
+                  <span>固定代理地址</span>
+                  <input
+                    value={cpampSettingsDraft.policy.fixedProxyUrl}
+                    onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, fixedProxyUrl: event.target.value } }))}
+                    placeholder="例如 socks5://user:password@host:port"
+                    spellCheck="false"
+                  />
+                </label>
+              )}
+              <label className="settings-field">
+                <span>优先级</span>
+                <input
+                  type="number"
+                  min="-1000000"
+                  max="1000000"
+                  step="1"
+                  value={cpampSettingsDraft.policy.priority}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, priority: event.target.value } }))}
+                  placeholder="留空不设置"
+                />
+              </label>
+              <label className="settings-field">
+                <span>调度权重</span>
+                <input
+                  type="number"
+                  min="-1000000"
+                  max="1000000"
+                  step="1"
+                  value={cpampSettingsDraft.policy.weight}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, weight: event.target.value } }))}
+                  placeholder="留空不设置"
+                />
+              </label>
+              <label className="settings-field">
+                <span>批量同步并发</span>
+                <select
+                  value={cpampSettingsDraft.policy.syncConcurrency}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, syncConcurrency: Number(event.target.value) } }))}
+                >
+                  <option value={1}>1</option>
+                  <option value={3}>3</option>
+                  <option value={5}>5</option>
+                </select>
+              </label>
+              <label className="settings-field wide-settings-field">
+                <span>仅允许模型</span>
+                <textarea
+                  className="cpamp-model-textarea"
+                  value={cpampSettingsDraft.policy.modelWhitelist.join("\n")}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({
+                    ...current,
+                    policy: { ...current.policy, modelWhitelist: splitCpampModels(event.target.value) },
+                  }))}
+                  placeholder={"留空表示不限制；每行一个模型，也支持逗号分隔，例如：\ngpt-5\ngpt-5-mini"}
+                  rows="5"
+                  spellCheck="false"
+                />
+                <small>{cpampModels.length ? `已读取 ${cpampModels.length} 个远端模型，可填写：${cpampModels.slice(0, 8).join("、")}${cpampModels.length > 8 ? " ..." : ""}` : "设置模型限制时，同步会再次读取 CPAMP 模型目录；目录不可用则同步会被拒绝。"}</small>
+              </label>
+              <div className="cpamp-settings-section wide-settings-field">
+                <strong>同步关联巡检</strong>
+                <span>仅读取 AutoTo 已关联的 CPAMP 文件状态，不会启动或影响 CPAMP 的全局巡检。</span>
+              </div>
+              <label className="settings-field wide-settings-field cpamp-auto-sync-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cpampSettingsDraft.inspectionEnabled)}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, inspectionEnabled: event.target.checked }))}
+                />
+                <span><strong>每 5 分钟检查同步关联</strong><small>仅显示远端文件缺失、CPAMP 已禁用或远端异常，不会自动重新授权或修改 CPAMP。</small></span>
+              </label>
             </div>
+            {cpampStatus.inspection?.enabled && (
+              <div className={`cpamp-inspection-status ${cpampStatus.inspection?.lastError ? "error" : ""}`}>
+                <ShieldCheck size={15} />
+                <span>{cpampStatus.inspection?.lastError
+                  ? `上次同步关联检查失败：${cpampStatus.inspection.lastError}`
+                  : cpampStatus.inspection?.lastCheckAt
+                    ? cpampInspectionSummary(cpampStatus.inspection)
+                    : "尚未执行同步关联检查"}</span>
+              </div>
+            )}
             {cpampStatus.lastError && <div className="cpamp-status error"><CircleAlert size={15} /><span>上次同步：{cpampStatus.lastError}</span></div>}
             {cpampSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{cpampSettingsError}</div>}
             <div className="dialog-footer">
+              <button type="button" className="secondary-button" onClick={loadCpampModels} disabled={cpampModelsLoading || !token || !cpampStatus.configured}>
+                {cpampModelsLoading ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}读取远端模型
+              </button>
+              {cpampStatus.inspection?.enabled && (
+                <button type="button" className="secondary-button" onClick={checkCpampInspectionNow} disabled={cpampInspectionChecking || cpampStatus.inspection?.running}>
+                  {cpampInspectionChecking || cpampStatus.inspection?.running ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}立即检查
+                </button>
+              )}
+              <span className="dialog-actions-spacer" />
               <button type="button" className="cancel-button" onClick={() => setCpampSettingsOpen(false)} disabled={cpampSettingsSaving}>取消</button>
               <button type="submit" className="primary-button" disabled={cpampSettingsSaving || !token}>
                 {cpampSettingsSaving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
@@ -2133,6 +2346,9 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         {job.autoRepairBlocked && (
           <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
         )}
+        {job.cpampSync?.inspection?.state && job.cpampSync.inspection.state !== "healthy" && (
+          <div className="row-error">CPAMP 同步关联：{job.cpampSync.inspection.reason || cpampInspectionStateText(job.cpampSync.inspection.state)}</div>
+        )}
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
         {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
@@ -2449,6 +2665,60 @@ function formatCpampResult(result) {
   if (duplicates) parts.push(`发现 ${duplicates} 份同邮箱凭证，仅更新主凭证`);
   if (failed) parts.push(`失败 ${failed} 个`);
   return parts.join("，");
+}
+
+function defaultCpampPolicy() {
+  return {
+    newAccountEnabled: true,
+    proxyMode: "none",
+    fixedProxyUrl: "",
+    priority: "",
+    weight: "",
+    modelWhitelist: [],
+    syncConcurrency: 1,
+  };
+}
+
+function normalizeCpampPolicy(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    ...defaultCpampPolicy(),
+    ...source,
+    priority: source.priority ?? "",
+    weight: source.weight ?? "",
+    modelWhitelist: Array.isArray(source.modelWhitelist) ? source.modelWhitelist : splitCpampModels(source.modelWhitelist),
+    syncConcurrency: [1, 3, 5].includes(Number(source.syncConcurrency)) ? Number(source.syncConcurrency) : 1,
+  };
+}
+
+function splitCpampModels(value) {
+  return [...new Set(String(value || "").split(/[\n,]/).map((item) => item.trim()).filter(Boolean))];
+}
+
+function cpampInspectionIssueCount(result) {
+  if (!result || typeof result !== "object") return 0;
+  return Number(result.missing || 0) + Number(result.disabled || 0) + Number(result.problem || 0);
+}
+
+function cpampInspectionSummary(inspection) {
+  if (inspection?.lastError) return "同步关联检查失败";
+  if (!inspection?.lastCheckAt) return "同步关联巡检已启用";
+  const result = inspection.lastResult || {};
+  const issues = cpampInspectionIssueCount(result);
+  return issues
+    ? `同步关联异常 ${issues} 个 · ${formatRelativeMonitorTime(inspection.lastCheckAt)}`
+    : `同步关联正常 · ${formatRelativeMonitorTime(inspection.lastCheckAt)}`;
+}
+
+function formatCpampInspectionResult(result) {
+  const checked = Number(result?.checked || 0);
+  const issues = cpampInspectionIssueCount(result);
+  return issues ? `CPAMP 同步关联检查 ${checked} 个，发现 ${issues} 个异常` : `CPAMP 同步关联检查完成，${checked} 个账号正常`;
+}
+
+function cpampInspectionStateText(state) {
+  const labels = { missing: "远端文件缺失", disabled: "CPAMP 已禁用", problem: "远端异常" };
+  return labels[state] || "远端状态异常";
 }
 
 function displayCpampHost(value) {

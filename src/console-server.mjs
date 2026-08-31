@@ -497,6 +497,11 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "GET" && requestUrl.pathname === "/api/cpamp/options") {
+    sendJson(res, 200, await cpampSync.options());
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/cpamp/sync") {
     const body = await readJson(req);
     const selected = resolveSelectedJobs(body.ids);
@@ -506,9 +511,23 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
+  if (req.method === "POST" && requestUrl.pathname === "/api/cpamp/apply-policy") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const downloadable = selected.filter((job) => job.resultSaved);
+    if (!downloadable.length) throw httpError(409, "选中的任务里没有已完成的 OAuth 授权文件");
+    sendJson(res, 200, await cpampSync.applyPolicy(downloadable));
+    return;
+  }
+
   if (req.method === "POST" && requestUrl.pathname === "/api/cpamp/approve") {
     const body = await readJson(req);
     sendJson(res, 200, await cpampSync.approvePending(resolveSelectedJobs(body.ids)));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/cpamp/inspection/check") {
+    sendJson(res, 200, await cpampSync.inspectNow());
     return;
   }
 

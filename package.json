@@ -25,9 +25,9 @@
     "url": "git+ssh://git@github.com/jackgodcs/AuthTo.git"
   },
   "bugs": {
-    "url": "https://github.com/jackwog/toSub2/issues"
+    "url": "https://github.com/jackgodcs/AuthTo/issues"
   },
-  "homepage": "https://github.com/jackwog/toSub2#readme",
+  "homepage": "https://github.com/jackgodcs/AuthTo#readme",
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
     "jsdom": "26.1.0",

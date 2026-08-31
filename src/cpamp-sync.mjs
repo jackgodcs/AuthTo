@@ -8,6 +8,9 @@ const MANAGEMENT_KEY_ID = "cpamp-management-key";
 const MAX_RETRIES = 5;
 const RETRY_DELAYS_MS = [5_000, 15_000, 60_000, 300_000, 900_000];
 const REQUEST_TIMEOUT_MS = 120_000;
+const INSPECTION_INTERVAL_MS = 5 * 60_000;
+const SYNC_CONCURRENCY_OPTIONS = new Set([1, 3, 5]);
+const MAX_POLICY_INTEGER = 1_000_000;
 
 export function createCpampSync(options) {
   const outputRoot = path.resolve(options.outputRoot);
@@ -18,6 +21,10 @@ export function createCpampSync(options) {
   let managementKey = null;
   const retryTimers = new Map();
   const requests = new Set();
+  let persistPromise = Promise.resolve();
+  let inspectionTimer = null;
+  let inspectionPromise = null;
+  let nextInspectionAt = null;
 
   return {
     async load() {
@@ -30,6 +37,7 @@ export function createCpampSync(options) {
         config.updatedAt = new Date().toISOString();
         await persist();
       }
+      scheduleInspection();
     },
 
     status() {
@@ -47,6 +55,17 @@ export function createCpampSync(options) {
         syncingCount: records.filter((record) => record.state === "syncing").length,
         lastError: config.lastError || null,
         lastSyncAt: config.lastSyncAt || null,
+        policy: publicPolicy(config.policy),
+        inspection: {
+          enabled: config.inspection.enabled === true,
+          supported: config.inspection.supported !== false,
+          running: Boolean(inspectionPromise),
+          intervalMinutes: Math.round(INSPECTION_INTERVAL_MS / 60_000),
+          lastCheckAt: config.inspection.lastCheckAt || null,
+          nextCheckAt: nextInspectionAt,
+          lastError: config.inspection.lastError || null,
+          lastResult: config.inspection.lastResult || null,
+        },
       };
     },
 
@@ -60,6 +79,7 @@ export function createCpampSync(options) {
         lastError: record.lastError || null,
         duplicateCount: Number(record.duplicateCount || 0),
         retryAttempt: Number(record.retryAttempt || 0),
+        inspection: publicInspection(record.inspection),
       };
     },
 
@@ -69,23 +89,43 @@ export function createCpampSync(options) {
       const nextKey = suppliedKey || managementKey;
       if (!nextKey) throw syncError(400, "请填写 CPAMP 管理密钥");
       const nextAuto = input.autoSyncEnabled === true;
+      const policy = normalizePolicy(input.policy === undefined ? config.policy : input.policy);
+      const inspectionEnabled = input.inspectionEnabled === undefined
+        ? config.inspection.enabled === true
+        : input.inspectionEnabled === true;
       const apiBase = await discoverApiBase(baseUrl, nextKey);
+      const connectionChanged = config.baseUrl !== apiBase || (Boolean(suppliedKey) && suppliedKey !== managementKey);
       if (suppliedKey) await secretStore.save(MANAGEMENT_KEY_ID, suppliedKey);
-      const enabling = nextAuto && !config.autoSyncEnabled;
+      const enabling = nextAuto && (!config.autoSyncEnabled || connectionChanged);
       config.baseUrl = apiBase;
       config.autoSyncEnabled = nextAuto;
       config.autoSyncEnabledAt = enabling ? new Date().toISOString() : (nextAuto ? config.autoSyncEnabledAt || new Date().toISOString() : null);
+      config.policy = policy;
+      config.inspection.enabled = inspectionEnabled;
+      if (!inspectionEnabled) config.inspection.lastError = null;
       config.lastError = null;
       config.updatedAt = new Date().toISOString();
       managementKey = nextKey;
       await persist();
+      scheduleInspection();
       return this.status();
+    },
+
+    async options() {
+      if (!managementKey || !config.baseUrl) throw syncError(409, "请先配置 CPAMP 服务器地址和管理密钥");
+      const models = await listCodexModels();
+      return { models, modelCount: models.length };
     },
 
     async syncManual(jobs) {
       if (!managementKey || !config.baseUrl) throw syncError(409, "请先配置 CPAMP 服务器地址和管理密钥");
       const result = await syncJobs(jobs, { source: "manual", approve: true });
       return result;
+    },
+
+    async applyPolicy(jobs) {
+      if (!managementKey || !config.baseUrl) throw syncError(409, "请先配置 CPAMP 服务器地址和管理密钥");
+      return syncJobs(jobs, { source: "manual", approve: true, forcePolicy: true });
     },
 
     async approvePending(jobs) {
@@ -124,31 +164,51 @@ export function createCpampSync(options) {
         const delay = Math.max(0, Date.parse(record.nextRetryAt || "") - now);
         if (Number.isFinite(delay)) scheduleRetry(job, delay);
       }
+      scheduleInspection();
+    },
+
+    async inspectNow() {
+      if (!managementKey || !config.baseUrl) throw syncError(409, "请先配置 CPAMP 服务器地址和管理密钥");
+      if (!config.inspection.enabled) throw syncError(409, "请先启用 CPAMP 异常巡检");
+      return runInspection("manual");
     },
 
     async shutdown() {
       for (const timer of retryTimers.values()) clearTimeout(timer);
       retryTimers.clear();
-      await Promise.allSettled([...requests]);
+      if (inspectionTimer) clearInterval(inspectionTimer);
+      inspectionTimer = null;
+      nextInspectionAt = null;
+      await Promise.allSettled([...requests, inspectionPromise, persistPromise].filter(Boolean));
     },
   };
 
-  async function syncJobs(jobs, options) {
+  async function syncJobs(jobs, syncOptions) {
     const unique = uniqueByEmail(jobs);
     const summary = { selected: jobs.length, attempted: unique.length, created: 0, updated: 0, failed: 0, duplicates: 0, results: [] };
-    for (const job of unique) {
+    let modelIdsPromise = null;
+    const context = {
+      async getModelIds() {
+        if (!modelIdsPromise) modelIdsPromise = listCodexModels();
+        return modelIdsPromise;
+      },
+    };
+    const outcomes = await mapWithConcurrency(unique, config.policy.syncConcurrency, async (job) => {
       try {
-        const result = await syncOne(job, options);
-        if (result.operation === "created") summary.created += 1;
-        else summary.updated += 1;
-        summary.duplicates += result.duplicateCount;
-        summary.results.push(result);
+        return { result: await syncOne(job, syncOptions, context) };
       } catch (error) {
-        summary.failed += 1;
-        summary.results.push({ email: job.email, status: "failed", error: redactSecrets(error.message) });
-        if (options.source === "automatic") await recordAutomaticFailure(job, error);
+        if (syncOptions.source === "automatic") await recordAutomaticFailure(job, error);
         else await recordManualFailure(job, error);
+        return { result: { email: job.email, status: "failed", error: redactSecrets(error.message) } };
       }
+    });
+    for (const outcome of outcomes) {
+      const result = outcome.result;
+      if (result.status === "failed") summary.failed += 1;
+      else if (result.operation === "created") summary.created += 1;
+      else summary.updated += 1;
+      summary.duplicates += Number(result.duplicateCount || 0);
+      summary.results.push(result);
     }
     config.lastSyncAt = new Date().toISOString();
     config.lastError = summary.failed ? summary.results.find((item) => item.status === "failed")?.error || "CPAMP 同步失败" : null;
@@ -167,7 +227,7 @@ export function createCpampSync(options) {
     }
   }
 
-  async function syncOne(job, options) {
+  async function syncOne(job, syncOptions, context) {
     const email = normalizeEmail(job.email);
     const record = recordForWrite(email);
     record.state = "syncing";
@@ -182,6 +242,12 @@ export function createCpampSync(options) {
       const remote = await requestText(config.baseUrl, managementKey, `/auth-files/download?name=${encodeURIComponent(fileName)}`);
       payload = mergeRemoteAuth(JSON.parse(remote), email, auth);
     }
+    if (!selection.file || syncOptions.forcePolicy === true) {
+      const models = config.policy.modelWhitelist.length
+        ? await context.getModelIds()
+        : null;
+      payload = applyPolicyToPayload(payload, email, config.policy, models, job);
+    }
     await uploadAuthFile(config.baseUrl, managementKey, fileName, payload);
     record.email = email;
     record.remoteFileName = fileName;
@@ -193,7 +259,7 @@ export function createCpampSync(options) {
     record.retryAttempt = 0;
     record.nextRetryAt = null;
     record.duplicateCount = selection.duplicateCount;
-    if (options.approve) record.approvedAt = record.approvedAt || new Date().toISOString();
+    if (syncOptions.approve) record.approvedAt = record.approvedAt || new Date().toISOString();
     await persist();
     return {
       email,
@@ -261,9 +327,13 @@ export function createCpampSync(options) {
 
   async function persist() {
     config.updatedAt = new Date().toISOString();
-    const tempPath = `${configPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-    await fs.writeFile(tempPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-    await fs.rename(tempPath, configPath);
+    const serialized = `${JSON.stringify(config, null, 2)}\n`;
+    persistPromise = persistPromise.catch(() => {}).then(async () => {
+      const tempPath = `${configPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+      await fs.writeFile(tempPath, serialized, { mode: 0o600 });
+      await fs.rename(tempPath, configPath);
+    });
+    return persistPromise;
   }
 
   async function request(baseUrl, key, endpoint) {
@@ -337,6 +407,78 @@ export function createCpampSync(options) {
       clearTimeout(timeout);
       if (requestPromise) requests.delete(requestPromise);
     }
+  }
+
+  async function listCodexModels() {
+    let payload;
+    try {
+      payload = await request(config.baseUrl, managementKey, "/model-definitions/codex");
+    } catch (error) {
+      throw syncError(error.status || 502, `CPAMP 模型目录读取失败，已停止同步以避免未受模型限制导入：${redactSecrets(error.message)}`);
+    }
+    const models = extractModelIds(payload);
+    if (!models.length) {
+      throw syncError(502, "CPAMP 模型目录读取失败，已停止同步以避免未受模型限制导入");
+    }
+    return models;
+  }
+
+  function scheduleInspection() {
+    if (inspectionTimer) clearInterval(inspectionTimer);
+    inspectionTimer = null;
+    nextInspectionAt = null;
+    if (!config.inspection.enabled || !managementKey || !config.baseUrl) return;
+    nextInspectionAt = new Date(Date.now() + INSPECTION_INTERVAL_MS).toISOString();
+    inspectionTimer = setInterval(() => {
+      nextInspectionAt = new Date(Date.now() + INSPECTION_INTERVAL_MS).toISOString();
+      void runInspection("scheduled").catch(() => {});
+    }, INSPECTION_INTERVAL_MS);
+    inspectionTimer.unref?.();
+  }
+
+  function runInspection(source) {
+    if (inspectionPromise) return inspectionPromise;
+    const task = (async () => {
+      const checkedAt = new Date().toISOString();
+      try {
+        const files = extractFiles(await request(config.baseUrl, managementKey, "/auth-files"));
+        const fileByName = new Map(files.map((file) => [file.name, file]));
+        const summary = { source, checked: 0, healthy: 0, missing: 0, disabled: 0, problem: 0 };
+        for (const record of Object.values(config.records)) {
+          if (!record.remoteFileName) continue;
+          summary.checked += 1;
+          const file = fileByName.get(record.remoteFileName);
+          if (!file) {
+            record.inspection = { state: "missing", reason: "远端文件缺失", checkedAt };
+            summary.missing += 1;
+          } else if (file.disabled === true) {
+            record.inspection = { state: "disabled", reason: "CPAMP 已禁用", checkedAt };
+            summary.disabled += 1;
+          } else if (hasRemoteProblem(file)) {
+            record.inspection = { state: "problem", reason: "CPAMP 返回远端异常状态", checkedAt };
+            summary.problem += 1;
+          } else {
+            record.inspection = { state: "healthy", reason: null, checkedAt };
+            summary.healthy += 1;
+          }
+        }
+        config.inspection.lastCheckAt = checkedAt;
+        config.inspection.lastError = null;
+        config.inspection.lastResult = summary;
+        await persist();
+        return summary;
+      } catch (error) {
+        config.inspection.lastCheckAt = checkedAt;
+        config.inspection.lastError = redactSecrets(error.message);
+        await persist();
+        throw error;
+      }
+    })();
+    inspectionPromise = task;
+    void task.finally(() => {
+      if (inspectionPromise === task) inspectionPromise = null;
+    }).catch(() => {});
+    return task;
   }
 }
 
@@ -440,6 +582,67 @@ function mergeAuthFields(remote, auth) {
   return merged;
 }
 
+function applyPolicyToPayload(payload, email, policy, modelIds, job) {
+  if (Array.isArray(payload)) {
+    const index = payload.findIndex((entry) => authMatchesEmail(entry, email));
+    if (index < 0) throw syncError(409, `${email} 的 CPAMP 主凭证内容已变化，已拒绝覆盖`);
+    return payload.map((entry, current) => current === index ? applyPolicyToAuth(entry, policy, modelIds, job) : entry);
+  }
+  return applyPolicyToAuth(payload, policy, modelIds, job);
+}
+
+function applyPolicyToAuth(auth, policy, modelIds, job) {
+  const next = { ...auth };
+  if (policy.proxyMode === "fixed") next.proxy_url = policy.fixedProxyUrl;
+  else if (policy.proxyMode === "job" && job?.proxyUrl) next.proxy_url = String(job.proxyUrl);
+  else delete next.proxy_url;
+
+  if (policy.priority === null) delete next.priority;
+  else next.priority = policy.priority;
+  if (policy.weight === null) delete next.weight;
+  else next.weight = policy.weight;
+  next.disabled = policy.newAccountEnabled !== true;
+
+  if (!policy.modelWhitelist.length) {
+    delete next.excluded_models;
+  } else {
+    next.excluded_models = modelIds.filter((model) => !policy.modelWhitelist.includes(model));
+  }
+  return next;
+}
+
+function extractModelIds(payload) {
+  const candidates = Array.isArray(payload)
+    ? payload
+    : [payload?.models, payload?.data, payload?.items, payload?.definitions].find(Array.isArray) || [];
+  const seen = new Set();
+  for (const item of candidates) {
+    const value = typeof item === "string" ? item : item?.id || item?.name || item?.model;
+    const model = String(value || "").trim();
+    if (model && model.length <= 200) seen.add(model);
+  }
+  return [...seen];
+}
+
+function hasRemoteProblem(file) {
+  const status = String(file?.status || file?.state || file?.inspection_status || "").trim().toLowerCase();
+  return ["problem", "error", "failed", "invalid", "unhealthy"].includes(status);
+}
+
+function mapWithConcurrency(values, limit, callback) {
+  const count = Math.max(1, Math.min(Number(limit) || 1, values.length || 1));
+  const results = new Array(values.length);
+  let nextIndex = 0;
+  return Promise.all(Array.from({ length: count }, async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= values.length) return;
+      results[index] = await callback(values[index], index);
+    }
+  })).then(() => results);
+}
+
 function codexFileName(auth) {
   const account = sanitize(auth.account_id || auth.chatgpt_account_id || stableId(auth.email), 8);
   const email = sanitize(auth.email || "account", 96, true);
@@ -472,6 +675,62 @@ function normalizeBaseUrl(value) {
   parsed.search = "";
   if (/\/management\.html$/i.test(parsed.pathname)) parsed.pathname = "/";
   return parsed.toString().replace(/\/+$/, "");
+}
+
+function normalizePolicy(input) {
+  const source = input && typeof input === "object" ? input : {};
+  const proxyMode = String(source.proxyMode || "none").trim();
+  if (!["none", "fixed", "job"].includes(proxyMode)) throw syncError(400, "CPAMP 代理来源无效");
+  const fixedProxyUrl = String(source.fixedProxyUrl || "").trim();
+  if (proxyMode === "fixed") validateProxyUrl(fixedProxyUrl);
+  const whitelistSource = Array.isArray(source.modelWhitelist) ? source.modelWhitelist : String(source.modelWhitelist || "").split(/[\n,]/);
+  const modelWhitelist = [...new Set(whitelistSource
+    .map((value) => String(value || "").trim())
+    .filter((value) => value && value.length <= 200 && !/[\r\n]/.test(value)))];
+  if (modelWhitelist.length > 300) throw syncError(400, "CPAMP 仅允许模型数量不能超过 300 个");
+  const syncConcurrency = Number(source.syncConcurrency ?? 1);
+  if (!SYNC_CONCURRENCY_OPTIONS.has(syncConcurrency)) throw syncError(400, "CPAMP 批量同步并发只支持 1、3 或 5");
+  return {
+    newAccountEnabled: source.newAccountEnabled !== false,
+    proxyMode,
+    fixedProxyUrl: proxyMode === "fixed" ? fixedProxyUrl : "",
+    priority: normalizeOptionalInteger(source.priority, "CPAMP 优先级"),
+    weight: normalizeOptionalInteger(source.weight, "CPAMP 调度权重"),
+    modelWhitelist,
+    syncConcurrency,
+  };
+}
+
+function validateProxyUrl(value) {
+  if (!value || value.length > 2_000 || /[\r\n]/.test(value)) throw syncError(400, "固定代理地址格式不正确");
+  let parsed;
+  try { parsed = new URL(value); } catch { throw syncError(400, "固定代理地址格式不正确"); }
+  if (!["http:", "https:", "socks5:", "socks5h:"].includes(parsed.protocol) || !parsed.hostname) {
+    throw syncError(400, "固定代理地址必须使用 http、https、socks5 或 socks5h");
+  }
+}
+
+function normalizeOptionalInteger(value, label) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || Math.abs(number) > MAX_POLICY_INTEGER) {
+    throw syncError(400, `${label}必须是 ${MAX_POLICY_INTEGER} 以内的整数`);
+  }
+  return number;
+}
+
+function publicPolicy(policy) {
+  const normalized = normalizePolicy(policy);
+  return { ...normalized, modelWhitelist: [...normalized.modelWhitelist] };
+}
+
+function publicInspection(inspection) {
+  if (!inspection || typeof inspection !== "object") return null;
+  return {
+    state: String(inspection.state || ""),
+    reason: inspection.reason ? String(inspection.reason).slice(0, 300) : null,
+    checkedAt: typeof inspection.checkedAt === "string" ? inspection.checkedAt : null,
+  };
 }
 
 function normalizeEmail(value) {
@@ -528,6 +787,8 @@ async function readConfig(configPath) {
       records: raw.records && typeof raw.records === "object" && !Array.isArray(raw.records) ? raw.records : {},
       lastError: typeof raw.lastError === "string" ? raw.lastError : null,
       lastSyncAt: typeof raw.lastSyncAt === "string" ? raw.lastSyncAt : null,
+      policy: normalizeStoredPolicy(raw.policy),
+      inspection: normalizeStoredInspection(raw.inspection),
     };
   } catch (error) {
     if (error?.code === "ENOENT") return emptyConfig();
@@ -536,7 +797,33 @@ async function readConfig(configPath) {
 }
 
 function emptyConfig() {
-  return { version: 1, baseUrl: "", autoSyncEnabled: false, autoSyncEnabledAt: null, records: {}, lastError: null, lastSyncAt: null, updatedAt: null };
+  return {
+    version: 2,
+    baseUrl: "",
+    autoSyncEnabled: false,
+    autoSyncEnabledAt: null,
+    records: {},
+    lastError: null,
+    lastSyncAt: null,
+    updatedAt: null,
+    policy: { newAccountEnabled: true, proxyMode: "none", fixedProxyUrl: "", priority: null, weight: null, modelWhitelist: [], syncConcurrency: 1 },
+    inspection: { enabled: false, supported: true, lastCheckAt: null, lastError: null, lastResult: null },
+  };
+}
+
+function normalizeStoredPolicy(value) {
+  try { return normalizePolicy(value); } catch { return emptyConfig().policy; }
+}
+
+function normalizeStoredInspection(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    enabled: source.enabled === true,
+    supported: source.supported !== false,
+    lastCheckAt: typeof source.lastCheckAt === "string" ? source.lastCheckAt : null,
+    lastError: typeof source.lastError === "string" ? source.lastError : null,
+    lastResult: source.lastResult && typeof source.lastResult === "object" ? source.lastResult : null,
+  };
 }
 
 function syncError(status, message) {
