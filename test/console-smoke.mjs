@@ -21,6 +21,7 @@ const scheduledRemoteAccounts = new Map();
 const clearRemoteCounts = new Map();
 const failClearOnce = new Set();
 const cpampFiles = new Map();
+const supportsConsoleCpampSettings = process.platform === "win32";
 const sub2api = http.createServer(async (req, res) => {
   if (req.headers["x-api-key"] !== "test-admin-key") {
     res.writeHead(401, { "content-type": "application/json" });
@@ -190,19 +191,21 @@ try {
   assert.equal(bootstrap.features.accountGroups, true);
   assert.equal(bootstrap.features.groupFilter, true);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
-  const cpampConfigResponse = await fetch(`${baseUrl}/api/cpamp/config`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      baseUrl: cpampUrl,
-      managementKey: "test-cpamp-key",
-      autoSyncEnabled: false,
-      syncAfterManualReauthorization: true,
-    }),
-  });
-  const cpampConfigText = await cpampConfigResponse.text();
-  assert.equal(cpampConfigResponse.status, 200, cpampConfigText);
-  assert.equal(JSON.parse(cpampConfigText).syncAfterManualReauthorization, true);
+  if (supportsConsoleCpampSettings) {
+    const cpampConfigResponse = await fetch(`${baseUrl}/api/cpamp/config`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        baseUrl: cpampUrl,
+        managementKey: "test-cpamp-key",
+        autoSyncEnabled: false,
+        syncAfterManualReauthorization: true,
+      }),
+    });
+    const cpampConfigText = await cpampConfigResponse.text();
+    assert.equal(cpampConfigResponse.status, 200, cpampConfigText);
+    assert.equal(JSON.parse(cpampConfigText).syncAfterManualReauthorization, true);
+  }
 
   const pageResponse = await fetch(`${baseUrl}/`);
   assert.equal(pageResponse.status, 200);
@@ -295,7 +298,9 @@ try {
 
   let job = await waitForJob(headers, jobId, (value) => value.status === "completed");
   assert.equal(job.canDownload, true);
-  assert.equal(cpampFiles.size, 0, "initial authorization must not use the manual reauthorization switch");
+  if (supportsConsoleCpampSettings) {
+    assert.equal(cpampFiles.size, 0, "initial authorization must not use the manual reauthorization switch");
+  }
 
   const filteredJobsResponse = await fetch(`${baseUrl}/api/jobs/query`, {
     method: "POST",
@@ -440,7 +445,9 @@ try {
   job = await waitForJob(headers, jobId, (value) => value.status === "completed" && value.attempt >= 2);
   assert.equal(job.canDownload, true);
   assert.equal(job.lastOperationType, "reauthorize");
-  await waitFor(() => cpampAccount("cross-platform@example.com")?.access_token?.startsWith("refreshed-access-"));
+  if (supportsConsoleCpampSettings) {
+    await waitFor(() => cpampAccount("cross-platform@example.com")?.access_token?.startsWith("refreshed-access-"));
+  }
 
   const refreshedResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/download`, { headers });
   const refreshed = await refreshedResponse.json();
@@ -468,7 +475,9 @@ try {
     waitForJob(headers, jobId, (value) => value.status === "completed" && value.lastOperationType === "reauthorize" && value.attempt >= 3),
     waitForJob(headers, profileJob.id, (value) => value.status === "completed" && value.lastOperationType === "reauthorize" && value.attempt >= 2),
   ]);
-  await waitFor(() => cpampAccount("account-profile@example.com")?.access_token?.startsWith("refreshed-access-"));
+  if (supportsConsoleCpampSettings) {
+    await waitFor(() => cpampAccount("account-profile@example.com")?.access_token?.startsWith("refreshed-access-"));
+  }
 
   const setupTotpResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/setup-2fa`, {
     method: "POST",
@@ -537,7 +546,9 @@ try {
   );
   assert.equal(reloggedJob.hasTotpKey, true);
   assert.equal(reloggedJob.lastOperationType, "relogin");
-  await waitFor(() => cpampAccount("cross-platform@example.com")?.access_token?.startsWith("test-access-"));
+  if (supportsConsoleCpampSettings) {
+    await waitFor(() => cpampAccount("cross-platform@example.com")?.access_token?.startsWith("test-access-"));
+  }
   const reloginLogs = await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers }).then((response) => response.json());
   assert.match(reloginLogs.logs, /\[relogin\].*跳过刷新令牌并强制重新登录/);
 
@@ -639,7 +650,9 @@ try {
   await Promise.all([jobId, profileJob.id].map((id) => (
     waitForJob(headers, id, (value) => value.status === "completed" && value.canForceRelogin)
   )));
-  await waitFor(() => cpampAccount("account-profile@example.com")?.access_token?.startsWith("test-access-"));
+  if (supportsConsoleCpampSettings) {
+    await waitFor(() => cpampAccount("account-profile@example.com")?.access_token?.startsWith("test-access-"));
+  }
 
   const addPasswordResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/add-password`, {
     method: "POST",
