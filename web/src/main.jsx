@@ -74,6 +74,12 @@ const EXTERNAL_SYNC_FILTER_OPTIONS = [
   ["failed", "同步失败"],
   ["synced", "已同步"],
 ];
+const EXTERNAL_REAUTH_FILTER_OPTIONS = [
+  ["", "全部"],
+  ["any", "任一外部站点"],
+  ["cpamp", "CPAMP"],
+  ["sub2api", "Sub2API"],
+];
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -106,6 +112,7 @@ function App() {
   const [groupFilter, setGroupFilter] = useState("");
   const [cpampStateFilter, setCpampStateFilter] = useState("");
   const [sub2apiStateFilter, setSub2apiStateFilter] = useState("");
+  const [externalReauthFilter, setExternalReauthFilter] = useState("");
   const [accountGroups, setAccountGroups] = useState([]);
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [groupTarget, setGroupTarget] = useState("");
@@ -167,6 +174,7 @@ function App() {
   const [cpampModels, setCpampModels] = useState([]);
   const [cpampModelsLoading, setCpampModelsLoading] = useState(false);
   const [cpampInspectionChecking, setCpampInspectionChecking] = useState(false);
+  const [externalReauthChecking, setExternalReauthChecking] = useState(false);
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
@@ -204,13 +212,13 @@ function App() {
     let stopped = false;
     let timer;
     const search = accountSearch.trim();
-    const hasQuery = emailFilter.length || statusFilter || groupFilter || cpampStateFilter || sub2apiStateFilter || search;
+    const hasQuery = emailFilter.length || statusFilter || groupFilter || cpampStateFilter || sub2apiStateFilter || externalReauthFilter || search;
     const poll = async () => {
       try {
         const data = hasQuery
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, pageSize, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(cpampStateFilter ? { cpampState: cpampStateFilter } : {}), ...(sub2apiStateFilter ? { sub2ApiState: sub2apiStateFilter } : {}), ...(search ? { search } : {}) }),
+              body: JSON.stringify({ page, pageSize, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(cpampStateFilter ? { cpampState: cpampStateFilter } : {}), ...(sub2apiStateFilter ? { sub2ApiState: sub2apiStateFilter } : {}), ...(externalReauthFilter ? { externalReauth: externalReauthFilter } : {}), ...(search ? { search } : {}) }),
             })
           : await apiFetch(token, `/api/jobs?page=${page}&pageSize=${pageSize}`);
         if (!stopped) {
@@ -233,7 +241,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, pageSize, emailFilter, statusFilter, groupFilter, cpampStateFilter, sub2apiStateFilter, accountSearch]);
+  }, [token, page, pageSize, emailFilter, statusFilter, groupFilter, cpampStateFilter, sub2apiStateFilter, externalReauthFilter, accountSearch]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -294,7 +302,7 @@ function App() {
   const downloadableSelectedCount = selectedJobs.filter((job) => job.canDownload).length;
   const allPageSelected = pageJobIds.length > 0 && pageJobIds.every((id) => selectedJobIds.has(id));
   const allMatchingSelected = matchingJobIds.length > 0 && matchingJobIds.every((id) => selectedJobIds.has(id));
-  const hasJobFilters = Boolean(emailFilter.length || statusFilter || groupFilter || cpampStateFilter || sub2apiStateFilter || accountSearch.trim());
+  const hasJobFilters = Boolean(emailFilter.length || statusFilter || groupFilter || cpampStateFilter || sub2apiStateFilter || externalReauthFilter || accountSearch.trim());
   const canDownloadSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && downloadableSelectedCount > 0;
   const canReauthorizeSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
@@ -305,6 +313,10 @@ function App() {
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
   const pendingCpampSelectedCount = selectedJobs.filter((job) => job.cpampSync?.state === "pending_confirmation").length;
   const pendingSub2ApiSelectedCount = selectedJobs.filter((job) => job.sub2ApiSync?.state === "pending_confirmation").length;
+  const externalReauthMatchedCount = Number(cpampStatus.externalReauth?.cpamp?.matchedCount || 0)
+    + Number(sub2apiMonitorStatus.externalReauth?.sub2api?.matchedCount || 0);
+  const externalReauthMissingCount = Number(cpampStatus.externalReauth?.cpamp?.missingTaskCount || 0)
+    + Number(sub2apiMonitorStatus.externalReauth?.sub2api?.missingTaskCount || 0);
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
@@ -686,6 +698,7 @@ function App() {
     setGroupFilter("");
     setCpampStateFilter("");
     setSub2apiStateFilter("");
+    setExternalReauthFilter("");
     setAccountSearch("");
     setSelectedJobIds(new Set());
     setExpandedJobId(null);
@@ -785,6 +798,27 @@ function App() {
     }
   }
 
+  async function refreshExternalReauthorization() {
+    if (externalReauthChecking) return;
+    setExternalReauthChecking(true);
+    try {
+      const result = await apiFetch(token, "/api/external-reauth/refresh", { method: "POST" });
+      const cpampCount = Number(result?.externalReauth?.cpamp?.count || 0);
+      const sub2apiCount = Number(result?.externalReauth?.sub2api?.count || 0);
+      const missing = Number(result?.missingTask || 0);
+      const failures = Array.isArray(result?.failures) ? result.failures : [];
+      const failureText = failures.length
+        ? `，未读取 ${failures.map((item) => item.source === "cpamp" ? "CPAMP" : "Sub2API").join("、")}`
+        : "";
+      setUploadNotice(`外部需重登账号已刷新：CPAMP ${cpampCount} 个，Sub2API ${sub2apiCount} 个${missing ? `，本地未找到 ${missing} 个` : ""}${failureText}`);
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setExternalReauthChecking(false);
+    }
+  }
+
   async function approveSelectedCpampSync() {
     if (batchAction) return;
     const pending = selectedJobs.filter((job) => job.cpampSync?.state === "pending_confirmation");
@@ -839,12 +873,35 @@ function App() {
     const ids = entries.map((item) => item.jobId || item.pendingJobId).filter(Boolean);
     setCpampStateFilter(system === "cpamp" ? state : "");
     setSub2apiStateFilter(system === "sub2api" ? state : "");
+    setExternalReauthFilter("");
     setEmailFilter([]);
     setFilterText("");
     setAccountSearch("");
     setSelectedJobIds(new Set(ids));
     setExpandedJobId(null);
     setPage(1);
+  }
+
+  async function focusExternalReauthorization(source) {
+    setCpampStateFilter("");
+    setSub2apiStateFilter("");
+    setExternalReauthFilter(source);
+    setEmailFilter([]);
+    setFilterText("");
+    setAccountSearch("");
+    setSelectedJobIds(new Set());
+    setExpandedJobId(null);
+    setPage(1);
+    try {
+      const data = await apiFetch(token, "/api/jobs/query", {
+        method: "POST",
+        body: JSON.stringify({ page: 1, pageSize, externalReauth: source }),
+      });
+      setSelectedJobIds(new Set((data.selection || []).map((job) => job.id)));
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
   }
 
   function selectAllMatchingJobs() {
@@ -1199,6 +1256,11 @@ function App() {
               <CircleAlert size={14} />同步失败 {sub2apiMonitorStatus.failedCount} 个
             </button>
           )}
+          {sub2apiMonitorStatus.externalReauth?.sub2api?.count > 0 && (
+            <button type="button" className="sync-attention-button error" onClick={() => focusExternalReauthorization("sub2api")} title="查看 Sub2API 标记为需重新登录的本地账号">
+              <LogIn size={14} />需重登 {sub2apiMonitorStatus.externalReauth.sub2api.matchedCount} 个
+            </button>
+          )}
           {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
             <button
               type="button"
@@ -1258,9 +1320,30 @@ function App() {
                 <CircleAlert size={14} />同步失败 {cpampStatus.failedCount} 个
               </button>
             )}
+            {cpampStatus.externalReauth?.cpamp?.count > 0 && (
+              <button type="button" className="sync-attention-button error" onClick={() => focusExternalReauthorization("cpamp")} title="查看 CPAMP 标记为需重新登录的本地账号">
+                <LogIn size={14} />需重登 {cpampStatus.externalReauth.cpamp.matchedCount} 个
+              </button>
+            )}
             <button type="button" className="secondary-button provider-settings-button" onClick={openCpampSettings} disabled={!token}>
               <Settings2 size={16} />配置
             </button>
+          </div>
+        )}
+
+        {features.externalReauthorization && (
+          <div className="provider-toolbar external-reauth-toolbar" aria-label="外部需重新登录账号">
+            <div className="provider-heading"><LogIn size={17} /><strong>外部需重登</strong></div>
+            <span className="provider-name">只读取 CPAMP 与 Sub2API 的异常账号，不会自动重新登录</span>
+            <button type="button" className="secondary-button provider-settings-button" onClick={refreshExternalReauthorization} disabled={externalReauthChecking || (!cpampStatus.configured && !sub2apiMonitorStatus.configured)}>
+              {externalReauthChecking ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}刷新异常账号
+            </button>
+            {(cpampStatus.externalReauth?.cpamp?.count || sub2apiMonitorStatus.externalReauth?.sub2api?.count) ? (
+              <span className="provider-ready monitor-ready incomplete">
+                <CircleAlert size={14} />已匹配 {externalReauthMatchedCount} 个本地账号
+                {externalReauthMissingCount ? ` · 本地未找到 ${externalReauthMissingCount} 个` : ""}
+              </span>
+            ) : null}
           </div>
         )}
 
@@ -1391,6 +1474,23 @@ function App() {
                 aria-label="按 Sub2API 同步状态筛选"
               >
                 {EXTERNAL_SYNC_FILTER_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
+              </select>
+            </label>
+          )}
+          {features.externalReauthorization && (
+            <label className="status-filter-field">
+              <span>需重登</span>
+              <select
+                value={externalReauthFilter}
+                onChange={(event) => {
+                  setExternalReauthFilter(event.target.value);
+                  setSelectedJobIds(new Set());
+                  setExpandedJobId(null);
+                  setPage(1);
+                }}
+                aria-label="按外部需重新登录来源筛选"
+              >
+                {EXTERNAL_REAUTH_FILTER_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
               </select>
             </label>
           )}
@@ -2518,6 +2618,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         {job.cpampSync?.inspection?.state && job.cpampSync.inspection.state !== "healthy" && (
           <div className="row-error">CPAMP 同步关联：{job.cpampSync.inspection.reason || cpampInspectionStateText(job.cpampSync.inspection.state)}</div>
         )}
+        <ExternalReauthorizationStatus state={job.externalReauth} />
         <ExternalSyncStatus system="CPAMP" sync={job.cpampSync} />
         <ExternalSyncStatus system="Sub2API" sync={job.sub2ApiSync} />
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
@@ -2680,6 +2781,20 @@ function ExternalSyncStatus({ system, sync }) {
     return <div className="external-sync-status success"><Check size={13} />{system} 已同步{sync.lastSyncAt ? ` · ${formatDateTime(sync.lastSyncAt)}` : ""}</div>;
   }
   return null;
+}
+
+function ExternalReauthorizationStatus({ state }) {
+  const sources = Array.isArray(state?.sources) ? state.sources : [];
+  if (!sources.length) return null;
+  return (
+    <>
+      {sources.map((entry, index) => (
+        <div className="row-error external-sync-error" key={`${entry.source}-${entry.remoteId || entry.remoteName || index}`}>
+          {entry.source === "cpamp" ? "CPAMP" : "Sub2API"} 提示需重新登录：{extractResponseMessage(entry.reason || "远端授权异常")}
+        </div>
+      ))}
+    </>
+  );
 }
 
 function JobLogs({ token, jobId }) {

@@ -315,15 +315,31 @@ try {
     expired: "2000-01-01T00:00:00Z",
     last_refresh: "2000-01-01T00:00:00Z",
   });
+  assert.equal(sync.recordFor("manual-reauthorization@example.com").state, "synced");
 
   const intentionallyDisabled = await writeJob("intentionally-disabled", "intentionally-disabled@example.com", "intentionally-disabled-access", "intentionally-disabled-refresh");
   const intentionallyDisabledCreated = await sync.syncManual([intentionallyDisabled]);
   const intentionallyDisabledFileName = intentionallyDisabledCreated.results[0].remoteFileName;
   fileStates.set(intentionallyDisabledFileName, { disabled: true, status: "disabled", failed: 0, success: 1 });
   const intentionallyDisabledRefresh = await writeJob("intentionally-disabled-refresh", "intentionally-disabled@example.com", "intentionally-disabled-new-access", "intentionally-disabled-new-refresh");
-  await sync.syncAfterManualReauthorization(intentionallyDisabledRefresh);
+  const intentionallyDisabledResult = await sync.syncAfterManualReauthorization(intentionallyDisabledRefresh);
+  assert.equal(intentionallyDisabledResult, true);
   assert.equal(fileStates.get(intentionallyDisabledFileName).disabled, true);
   assert.equal(credentialRefreshRequests.some((request) => request.name === intentionallyDisabledFileName), false);
+
+  const externalProblem = await writeJob("external-reauth-problem", "external-problem@example.com", "external-problem-access", "external-problem-refresh");
+  const externalProblemCreated = await sync.syncManual([externalProblem]);
+  const externalProblemFileName = externalProblemCreated.results[0].remoteFileName;
+  fileStates.set(externalProblemFileName, {
+    disabled: true,
+    status: "disabled",
+    failed: 2,
+    success: 0,
+  });
+  const externalRefresh = await sync.refreshExternalReauth();
+  assert.equal(externalRefresh.needsReauthorization, 1);
+  assert.equal(sync.externalReauthFor("external-problem@example.com").reason, "CPAMP 已禁用该账号，且存在失败记录");
+  assert.equal(sync.externalReauthFor("intentionally-disabled@example.com"), null, "没有认证失败记录的手动禁用账号不能被标记为需重登");
 
   await sync.configure({ baseUrl, managementKey: "", autoSyncEnabled: true });
   const automaticFirst = await writeJob("automatic-first", "auto@example.com", "auto-access-1", "auto-refresh-1", new Date(Date.now() + 1_000).toISOString());

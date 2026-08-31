@@ -24,6 +24,7 @@ export function createCpampSync(options) {
   let persistPromise = Promise.resolve();
   let inspectionTimer = null;
   let inspectionPromise = null;
+  let externalReauthPromise = null;
   let nextInspectionAt = null;
 
   return {
@@ -74,6 +75,13 @@ export function createCpampSync(options) {
           lastError: config.inspection.lastError || null,
           lastResult: config.inspection.lastResult || null,
         },
+        externalReauth: {
+          running: Boolean(externalReauthPromise),
+          lastCheckAt: config.externalReauth.lastCheckAt || null,
+          lastError: config.externalReauth.lastError || null,
+          lastResult: config.externalReauth.lastResult || null,
+          records: Object.values(config.externalReauth.records).map(publicExternalReauthRecord),
+        },
       };
     },
 
@@ -81,6 +89,15 @@ export function createCpampSync(options) {
       const record = config.records[normalizeEmail(email)];
       if (!record) return null;
       return publicSyncRecord(record);
+    },
+
+    externalReauthFor(email) {
+      const record = config.externalReauth.records[normalizeEmail(email)];
+      return record ? publicExternalReauthRecord(record) : null;
+    },
+
+    externalReauthEntries() {
+      return Object.values(config.externalReauth.records).map(publicExternalReauthRecord);
     },
 
     async configure(input) {
@@ -186,13 +203,18 @@ export function createCpampSync(options) {
       return runInspection("manual");
     },
 
+    async refreshExternalReauth() {
+      if (!managementKey || !config.baseUrl) throw syncError(409, "请先配置 CPAMP 服务器地址和管理密钥");
+      return runExternalReauthRefresh();
+    },
+
     async shutdown() {
       for (const timer of retryTimers.values()) clearTimeout(timer);
       retryTimers.clear();
       if (inspectionTimer) clearInterval(inspectionTimer);
       inspectionTimer = null;
       nextInspectionAt = null;
-      await Promise.allSettled([...requests, inspectionPromise, persistPromise].filter(Boolean));
+      await Promise.allSettled([...requests, inspectionPromise, externalReauthPromise, persistPromise].filter(Boolean));
     },
   };
 
@@ -549,6 +571,51 @@ export function createCpampSync(options) {
     }).catch(() => {});
     return task;
   }
+
+  function runExternalReauthRefresh() {
+    if (externalReauthPromise) return externalReauthPromise;
+    const task = (async () => {
+      const checkedAt = new Date().toISOString();
+      try {
+        const files = extractFiles(await request(config.baseUrl, managementKey, "/auth-files"));
+        const records = {};
+        const summary = { checked: files.length, needsReauthorization: 0, missingEmail: 0 };
+        for (const file of files) {
+          const email = remoteFileEmail(file);
+          if (!email) {
+            summary.missingEmail += 1;
+            continue;
+          }
+          const issue = cpampReauthorizationIssue(file);
+          if (!issue) continue;
+          records[email] = {
+            email,
+            remoteId: remoteMutationTarget(file, file.name),
+            remoteName: String(file.name || "").trim().slice(0, 300) || null,
+            reason: issue,
+            detectedAt: checkedAt,
+          };
+          summary.needsReauthorization += 1;
+        }
+        config.externalReauth.records = records;
+        config.externalReauth.lastCheckAt = checkedAt;
+        config.externalReauth.lastError = null;
+        config.externalReauth.lastResult = summary;
+        await persist();
+        return summary;
+      } catch (error) {
+        config.externalReauth.lastCheckAt = checkedAt;
+        config.externalReauth.lastError = redactSecrets(error.message);
+        await persist();
+        throw error;
+      }
+    })();
+    externalReauthPromise = task;
+    void task.finally(() => {
+      if (externalReauthPromise === task) externalReauthPromise = null;
+    }).catch(() => {});
+    return task;
+  }
 }
 
 function publicSyncRecord(record) {
@@ -565,6 +632,16 @@ function publicSyncRecord(record) {
     retryAttempt: Number(record.retryAttempt || 0),
     nextRetryAt: record.nextRetryAt || null,
     inspection: publicInspection(record.inspection),
+  };
+}
+
+function publicExternalReauthRecord(record) {
+  return {
+    email: record.email || null,
+    remoteId: record.remoteId || null,
+    remoteName: record.remoteName || null,
+    reason: record.reason || "CPAMP 要求重新授权",
+    detectedAt: record.detectedAt || null,
   };
 }
 
@@ -725,6 +802,38 @@ function hasRemoteProblem(file) {
   return ["problem", "error", "failed", "invalid", "unhealthy"].includes(status);
 }
 
+function remoteFileEmail(file) {
+  const direct = [file?.email, file?.account, file?.display_account, file?.displayAccount]
+    .map(normalizeEmail)
+    .find(isEmail);
+  if (direct) return direct;
+  const match = String(file?.name || file?.path || "").match(/[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}/i);
+  const fallback = normalizeEmail(match?.[0]);
+  return isEmail(fallback) ? fallback : null;
+}
+
+function cpampReauthorizationIssue(file) {
+  const status = String(file?.status || file?.state || file?.inspection_status || "").trim().toLowerCase();
+  const detail = remoteIssueDetail(file);
+  const authSignal = /reauth|auth(?:entication|orization)?|oauth|token|credential|login|sign[ -]?in|unauthori[sz]ed|forbidden|invalid_grant|expired/i.test(`${status} ${detail}`);
+  if (["reauth", "reauth_required", "auth_error", "authentication_failed", "token_expired", "expired", "invalid"].includes(status)) {
+    return detail || `CPAMP 状态为 ${status}`;
+  }
+  if (file?.disabled === true && Number(file?.failed || 0) > 0) {
+    return detail || "CPAMP 已禁用该账号，且存在失败记录";
+  }
+  if (authSignal && ["problem", "error", "failed", "unhealthy", "disabled"].includes(status)) {
+    return detail || `CPAMP 状态为 ${status}`;
+  }
+  return null;
+}
+
+function remoteIssueDetail(file) {
+  const candidates = [file?.status_message, file?.statusMessage, file?.error_message, file?.errorMessage, file?.last_error, file?.lastError, file?.reason, file?.message, file?.error];
+  const value = candidates.find((item) => typeof item === "string" && item.trim());
+  return value ? redactSecrets(value).slice(0, 300) : "";
+}
+
 function mapWithConcurrency(values, limit, callback) {
   const count = Math.max(1, Math.min(Number(limit) || 1, values.length || 1));
   const results = new Array(values.length);
@@ -833,6 +942,10 @@ function normalizeEmail(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function isEmail(value) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || ""));
+}
+
 function uniqueByEmail(jobs) {
   const values = new Map();
   jobs.filter((job) => job?.resultSaved).forEach((job) => values.set(normalizeEmail(job.email), job));
@@ -886,6 +999,7 @@ async function readConfig(configPath) {
       lastSyncAt: typeof raw.lastSyncAt === "string" ? raw.lastSyncAt : null,
       policy: normalizeStoredPolicy(raw.policy),
       inspection: normalizeStoredInspection(raw.inspection),
+      externalReauth: normalizeStoredExternalReauth(raw.externalReauth),
     };
   } catch (error) {
     if (error?.code === "ENOENT") return emptyConfig();
@@ -906,6 +1020,7 @@ function emptyConfig() {
     updatedAt: null,
     policy: { newAccountEnabled: true, proxyMode: "none", fixedProxyUrl: "", priority: null, weight: null, modelWhitelist: [], syncConcurrency: 1 },
     inspection: { enabled: false, supported: true, lastCheckAt: null, lastError: null, lastResult: null },
+    externalReauth: { lastCheckAt: null, lastError: null, lastResult: null, records: {} },
   };
 }
 
@@ -921,6 +1036,28 @@ function normalizeStoredInspection(value) {
     lastCheckAt: typeof source.lastCheckAt === "string" ? source.lastCheckAt : null,
     lastError: typeof source.lastError === "string" ? source.lastError : null,
     lastResult: source.lastResult && typeof source.lastResult === "object" ? source.lastResult : null,
+  };
+}
+
+function normalizeStoredExternalReauth(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const records = {};
+  for (const [key, raw] of Object.entries(source.records || {})) {
+    const email = normalizeEmail(raw?.email || key);
+    if (!isEmail(email)) continue;
+    records[email] = {
+      email,
+      remoteId: typeof raw?.remoteId === "string" ? raw.remoteId.slice(0, 300) : null,
+      remoteName: typeof raw?.remoteName === "string" ? raw.remoteName.slice(0, 300) : null,
+      reason: typeof raw?.reason === "string" ? redactSecrets(raw.reason).slice(0, 300) : "CPAMP 要求重新授权",
+      detectedAt: typeof raw?.detectedAt === "string" ? raw.detectedAt : null,
+    };
+  }
+  return {
+    lastCheckAt: typeof source.lastCheckAt === "string" ? source.lastCheckAt : null,
+    lastError: typeof source.lastError === "string" ? redactSecrets(source.lastError).slice(0, 500) : null,
+    lastResult: source.lastResult && typeof source.lastResult === "object" ? source.lastResult : null,
+    records,
   };
 }
 

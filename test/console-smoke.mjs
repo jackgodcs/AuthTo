@@ -136,7 +136,14 @@ const cpamp = http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url, cpampUrl);
   if (req.method === "GET" && requestUrl.pathname === "/auth-files") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ files: [...cpampFiles.entries()].map(([name, payload]) => ({ name, email: payload.email })) }));
+    res.end(JSON.stringify({ files: [...cpampFiles.entries()].map(([name, payload]) => ({
+      name,
+      email: payload.email,
+      disabled: payload.disabled === true,
+      status: payload.status,
+      failed: payload.failed || 0,
+      status_message: payload.status_message,
+    })) }));
     return;
   }
   if (req.method === "GET" && requestUrl.pathname === "/auth-files/download") {
@@ -1186,6 +1193,65 @@ try {
   const monitorSaved = JSON.parse(monitorSaveText);
   assert.equal(monitorSaved.enabled, true);
   assert.equal(monitorSaved.configured, true);
+
+  if (supportsConsoleCpampSettings) {
+    cpampFiles.set("external-cpamp-problem.json", {
+      email: "cross-platform@example.com",
+      disabled: true,
+      status: "disabled",
+      failed: 2,
+      status_message: "refresh token expired",
+    });
+    cpampFiles.set("external-cpamp-manually-disabled.json", {
+      email: "account-profile@example.com",
+      disabled: true,
+      status: "disabled",
+      failed: 0,
+    });
+  }
+  remoteErrorAccounts = [{
+    id: 90,
+    name: "oauth---cross-platform@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "error",
+    error_message: "refresh token expired",
+    credentials: { email: "cross-platform@example.com" },
+    group_ids: [7],
+  }, {
+    id: 89,
+    name: "oauth---missing-local@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "error",
+    error_message: "token invalid",
+    credentials: { email: "missing-local@example.com" },
+    group_ids: [7],
+  }];
+  const externalRefreshResponse = await fetch(`${baseUrl}/api/external-reauth/refresh`, { method: "POST", headers });
+  const externalRefreshText = await externalRefreshResponse.text();
+  assert.equal(externalRefreshResponse.status, 200, externalRefreshText);
+  const externalRefresh = JSON.parse(externalRefreshText);
+  assert.equal(externalRefresh.externalReauth.sub2api.count, 2);
+  assert.equal(externalRefresh.externalReauth.sub2api.matchedCount, 1);
+  assert.equal(externalRefresh.missingTask, supportsConsoleCpampSettings ? 1 : 1);
+  if (supportsConsoleCpampSettings) {
+    assert.equal(externalRefresh.externalReauth.cpamp.count, 1, "仅手动禁用的 CPAMP 账号不能列入需重登");
+    assert.equal(externalRefresh.externalReauth.cpamp.matchedCount, 1);
+  }
+  const externalQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, externalReauth: "any" }),
+  });
+  const externalQueryText = await externalQueryResponse.text();
+  assert.equal(externalQueryResponse.status, 200, externalQueryText);
+  const externalJobs = JSON.parse(externalQueryText).jobs;
+  assert.equal(externalJobs.length, 1);
+  assert.equal(externalJobs[0].id, jobId);
+  assert.equal(externalJobs[0].externalReauth.sources.some((entry) => entry.source === "sub2api"), true);
+  if (supportsConsoleCpampSettings) assert.equal(externalJobs[0].externalReauth.sources.some((entry) => entry.source === "cpamp"), true);
+  assert.equal(updatedRemoteAccounts.has(90), false, "只刷新外部异常不能触发自动重新登录或更新远端账号");
 
   remoteErrorAccounts = [{
     id: 91,
