@@ -180,6 +180,8 @@ try {
   assert.equal(blockedResult.failed, 1);
   assert.match(blockedResult.results[0].error, /模型目录读取失败/);
   assert.equal([...files.values()].some((payload) => payload.email === "blocked@example.com"), false);
+  assert.equal(sync.status().failedCount, 1);
+  assert.equal(sync.status().attention.find((item) => item.email === "blocked@example.com")?.lastError, blockedResult.results[0].error);
   modelDirectoryAvailable = true;
 
   await sync.configure({
@@ -254,6 +256,7 @@ try {
   const automaticFirst = await writeJob("automatic-first", "auto@example.com", "auto-access-1", "auto-refresh-1", new Date(Date.now() + 1_000).toISOString());
   await sync.queueCompleted(automaticFirst);
   assert.equal(sync.status().pendingCount, 1);
+  assert.equal(sync.status().attention.find((item) => item.email === "auto@example.com")?.jobId, automaticFirst.id);
   assert.equal([...files.values()].some((payload) => payload.email === "auto@example.com"), false);
 
   const approved = await sync.approvePending([automaticFirst]);

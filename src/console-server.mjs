@@ -58,6 +58,7 @@ const ACCOUNT_GROUPS_VERSION = 1;
 const ACCOUNT_GROUPS_MAX_COUNT = 200;
 const ACCOUNT_GROUP_NAME_MAX_LENGTH = 64;
 const UNGROUPED_ACCOUNT_FILTER = "__ungrouped__";
+const EXTERNAL_SYNC_STATES = new Set(["pending_confirmation", "syncing", "retrying", "failed", "synced"]);
 const LOGIN_CHECKPOINT_FILENAME = "login-checkpoint.json";
 const TOTP_SETUP_RESULT_FILENAME = "totp-setup-result.json";
 const PASSWORD_ADD_RESULT_FILENAME = "password-add-result.json";
@@ -108,6 +109,7 @@ let shutdownPromise = null;
 let sub2ApiMonitorConfig = null;
 let sub2ApiMonitorTimer = null;
 let sub2ApiMonitorPromise = null;
+let sub2ApiMonitorWritePromise = Promise.resolve();
 let mailRequestConfig = { method: "GET", url: null, headers: {} };
 const sub2ApiRequestControllers = new Set();
 const sub2ApiRequestPromises = new Set();
@@ -588,45 +590,12 @@ async function handleApi(req, res, requestUrl) {
     const selected = resolveSelectedJobs(body.ids);
     const downloadable = selected.filter((job) => job.resultSaved);
     if (downloadable.length === 0) throw httpError(409, "选中的任务里没有已完成的导入文件");
-    const payload = await buildSub2ApiUploadPayload(downloadable);
-    const idempotencyKey = `tosub2-upload-${crypto.randomUUID()}`;
-
-    const accounts = payload.accounts.map((account) => {
-      const { proxy_key: _proxyKey, ...accountData } = account;
-      const credentials = { ...(account.credentials || {}) };
-      const extra = {
-        ...(account.extra && typeof account.extra === "object" ? account.extra : {}),
-        codex_fingerprint_mode: config.codexFingerprintMode,
-      };
-      if (config.modelWhitelist.length) {
-        credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
-      }
-      return {
-        ...accountData,
-        credentials,
-        extra,
-        status: "active",
-        schedulable: true,
-        group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
-        ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
-        ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
-        ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
-        ...(config.priority !== null ? { priority: config.priority } : {}),
-      };
+    const summary = await syncSub2ApiJobs(config, downloadable, {
+      source: "manual",
+      approve: true,
+      selectedCount: selected.length,
     });
-    const result = await requestSub2Api(config, "/api/v1/admin/accounts/batch", {
-      method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
-      body: JSON.stringify({ accounts }),
-    });
-
-    sendJson(res, 200, {
-      selected: selected.length,
-      uploaded: downloadable.length,
-      skipped: selected.length - downloadable.length,
-      groupIds: config.groupIds,
-      result,
-    });
+    sendJson(res, 200, { ...summary, result: summary.results.find((item) => item.status === "success")?.result || null });
     return;
   }
 
@@ -637,12 +606,19 @@ async function handleApi(req, res, requestUrl) {
 
   if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/monitor") {
     const body = await readJson(req);
-    if (body.enabled) {
-      const config = normalizeSub2ApiConfig(body.config);
-      sub2ApiMonitorConfig = { ...config, enabled: true };
-    } else {
-      sub2ApiMonitorConfig = null;
-    }
+    const config = normalizeSub2ApiConfig(body.config);
+    const connectionChanged = sub2ApiConnectionChanged(config, sub2ApiMonitorConfig);
+    const autoSyncEnabled = body.autoSyncEnabled === true;
+    sub2ApiMonitorConfig = {
+      ...config,
+      enabled: body.enabled === true,
+      autoSyncEnabled,
+      autoSyncEnabledAt: autoSyncEnabled && (!sub2ApiMonitorConfig?.autoSyncEnabled || connectionChanged)
+        ? new Date().toISOString()
+        : autoSyncEnabled ? sub2ApiMonitorConfig?.autoSyncEnabledAt || new Date().toISOString() : null,
+      syncAfterManualReauthorization: body.syncAfterManualReauthorization === true,
+      records: connectionChanged ? {} : normalizeSub2ApiSyncRecords(sub2ApiMonitorConfig?.records),
+    };
     sub2ApiMonitorState.lastError = null;
     await persistSub2ApiMonitorConfiguration();
     scheduleSub2ApiMonitor();
@@ -654,6 +630,12 @@ async function handleApi(req, res, requestUrl) {
     if (!sub2ApiMonitorConfig?.enabled) throw httpError(409, "请先启用 Sub2API 号池监控");
     const result = await runSub2ApiMonitor("manual");
     sendJson(res, 200, { ...publicSub2ApiMonitorState(), result });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/sub2api/approve") {
+    const body = await readJson(req);
+    sendJson(res, 200, await approvePendingSub2ApiSync(resolveSelectedJobs(body.ids)));
     return;
   }
 
@@ -759,11 +741,15 @@ async function sendJobsPage(res, requestedPage, filters = {}) {
   const status = filters.status || null;
   const search = filters.search || "";
   const groupId = filters.groupId || null;
+  const cpampState = filters.cpampState || null;
+  const sub2ApiState = filters.sub2ApiState || null;
   const visibleJobs = allJobs.filter((job) => {
     if (emailSet && !emailSet.has(job.email.toLowerCase())) return false;
     if (status && job.status !== status) return false;
     if (groupId === UNGROUPED_ACCOUNT_FILTER && job.groupId) return false;
     if (groupId && groupId !== UNGROUPED_ACCOUNT_FILTER && job.groupId !== groupId) return false;
+    if (cpampState && cpampSync.recordFor(job.email)?.state !== cpampState) return false;
+    if (sub2ApiState && sub2ApiSyncRecordFor(job.email)?.state !== sub2ApiState) return false;
     if (search && !job.email.toLowerCase().includes(search) && !job.id.toLowerCase().includes(search)) return false;
     return true;
   });
@@ -782,6 +768,8 @@ async function sendJobsPage(res, requestedPage, filters = {}) {
       requested: filters.emails?.length || 0,
       status,
       groupId,
+      cpampState,
+      sub2ApiState,
       search,
       matched: total,
     },
@@ -812,8 +800,16 @@ function normalizeJobsQuery(body = {}) {
   const search = String(body.search || "").trim().toLowerCase();
   if (search.length > 254) throw httpError(400, "账号查找内容不能超过 254 个字符");
   const groupId = normalizeAccountGroupFilter(body.groupId);
+  const cpampState = normalizeExternalSyncState(body.cpampState, "CPAMP 同步状态");
+  const sub2ApiState = normalizeExternalSyncState(body.sub2ApiState, "Sub2API 同步状态");
   const pageSize = normalizePageSize(body.pageSize);
-  return { emails, status: status || null, groupId, search, pageSize };
+  return { emails, status: status || null, groupId, cpampState, sub2ApiState, search, pageSize };
+}
+
+function normalizeExternalSyncState(value, label) {
+  const state = String(value || "").trim();
+  if (state && !EXTERNAL_SYNC_STATES.has(state)) throw httpError(400, `${label}无效`);
+  return state || null;
 }
 
 function normalizePageSize(value) {
@@ -900,6 +896,7 @@ async function loadAccountGroups() {
     console.warn(`[warn] Unable to read account groups: ${error.message}`);
     return;
   }
+
   if (!Array.isArray(data?.groups)) return;
   for (const item of data.groups) {
     const id = String(item?.id || "").trim();
@@ -952,6 +949,7 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
     lastOperationAt: createdAt,
     lastOperationType: "initial_authorization",
     cpampSyncAfterManualReauthorization: false,
+    sub2ApiSyncAfterManualReauthorization: false,
     completedAt: null,
     outputPath,
     checkpointPath,
@@ -1212,14 +1210,30 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     job.completedAt = new Date().toISOString();
     touch(job);
     await saveJobMetadata(job);
-    await finishSub2ApiAutoRepairSuccess(job);
+    const wasSub2ApiAutoRepair = Boolean(job.autoRepairOperation);
+    const autoRepairHandled = await finishSub2ApiAutoRepairSuccess(job);
+    const shouldSyncSub2ApiManualReauthorization = job.sub2ApiSyncAfterManualReauthorization === true;
+    let sub2ApiManualReauthorizationHandled = false;
+    try {
+      if (!wasSub2ApiAutoRepair && !autoRepairHandled && shouldSyncSub2ApiManualReauthorization) {
+        sub2ApiManualReauthorizationHandled = await syncSub2ApiAfterManualReauthorization(job);
+      }
+      if (!wasSub2ApiAutoRepair && !autoRepairHandled && !shouldSyncSub2ApiManualReauthorization) await queueCompletedSub2ApiSync(job);
+    } catch (error) {
+      console.warn(`[sub2api] ${job.email} 的同步队列写入失败：${error.message}`);
+    } finally {
+      if (shouldSyncSub2ApiManualReauthorization) {
+        job.sub2ApiSyncAfterManualReauthorization = false;
+        await saveJobMetadata(job);
+      }
+    }
     const shouldSyncManualReauthorization = job.cpampSyncAfterManualReauthorization === true;
     let manualReauthorizationSyncHandled = false;
     try {
       if (shouldSyncManualReauthorization) {
         manualReauthorizationSyncHandled = await cpampSync.syncAfterManualReauthorization(job);
       }
-      if (!manualReauthorizationSyncHandled) await cpampSync.queueCompleted(job);
+      if (!shouldSyncManualReauthorization) await cpampSync.queueCompleted(job);
     } catch (error) {
       console.warn(`[cpamp] ${job.email} 的同步队列写入失败：${error.message}`);
     } finally {
@@ -1301,6 +1315,7 @@ async function retryJob(job, options = {}) {
   job.autoRepairPendingAccountIds = [];
   job.autoRepairPendingBackend = null;
   job.cpampSyncAfterManualReauthorization = true;
+  job.sub2ApiSyncAfterManualReauthorization = true;
   beginAuthorizationAutomationAttempt(job, "manual_retry");
   recordJobOperation(job, resumingCheckpoint ? "resume" : "reauthorize");
   appendJobLog(
@@ -1335,6 +1350,7 @@ async function regenerateJob(job, options = {}) {
   job.proxySessionAttemptIds.clear();
   job.proxyAttemptParserTail = "";
   job.cpampSyncAfterManualReauthorization = true;
+  job.sub2ApiSyncAfterManualReauthorization = true;
   recordJobOperation(job, "reauthorize");
   appendJobLog(job, `\n[refresh] 第 ${job.attempt} 次生成：优先使用已有刷新令牌。\n`);
   enqueueJob(job, "refresh", "正在使用已有刷新令牌直接生成新授权");
@@ -1386,6 +1402,7 @@ async function forceReloginJob(job, options = {}, context = {}) {
     job.autoRepairPendingAccountIds = [];
     job.autoRepairPendingBackend = null;
     job.cpampSyncAfterManualReauthorization = true;
+    job.sub2ApiSyncAfterManualReauthorization = true;
   }
   job.autoRepairOperation = context.autoRepair || null;
   if (context.autoRepair) {
@@ -2711,6 +2728,212 @@ function normalizeSub2ApiConfig(value) {
   return { baseUrl, adminApiKey, groupIds, proxyId, concurrency, loadFactor, priority, modelWhitelist, codexFingerprintMode };
 }
 
+function normalizeSub2ApiSyncRecords(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const records = {};
+  for (const [email, raw] of Object.entries(source)) {
+    const normalizedEmail = String(raw?.email || email || "").trim().toLowerCase();
+    if (!isEmail(normalizedEmail)) continue;
+    const state = EXTERNAL_SYNC_STATES.has(raw?.state) ? raw.state : null;
+    if (!state) continue;
+    records[normalizedEmail] = {
+      email: normalizedEmail,
+      state,
+      pendingJobId: typeof raw.pendingJobId === "string" ? raw.pendingJobId : null,
+      pendingSince: typeof raw.pendingSince === "string" ? raw.pendingSince : null,
+      approvedAt: typeof raw.approvedAt === "string" ? raw.approvedAt : null,
+      lastSyncAt: typeof raw.lastSyncAt === "string" ? raw.lastSyncAt : null,
+      lastError: typeof raw.lastError === "string" ? raw.lastError.slice(0, 500) : null,
+    };
+  }
+  return records;
+}
+
+function sub2ApiConnectionChanged(next, previous) {
+  if (!previous) return true;
+  return next.baseUrl !== previous.baseUrl || next.adminApiKey !== previous.adminApiKey;
+}
+
+function sub2ApiSyncRecordFor(email) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const record = sub2ApiMonitorConfig?.records?.[normalizedEmail];
+  if (!record) return null;
+  return publicSub2ApiSyncRecord(record);
+}
+
+function publicSub2ApiSyncRecord(record) {
+  return {
+    email: record.email || null,
+    state: record.state || null,
+    pendingJobId: record.pendingJobId || null,
+    requestedAt: record.pendingSince || null,
+    lastSyncAt: record.lastSyncAt || null,
+    lastError: record.lastError || null,
+  };
+}
+
+function getSub2ApiSyncRecord(email) {
+  if (!sub2ApiMonitorConfig) return null;
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!isEmail(normalizedEmail)) return null;
+  sub2ApiMonitorConfig.records ||= {};
+  if (!sub2ApiMonitorConfig.records[normalizedEmail]) {
+    sub2ApiMonitorConfig.records[normalizedEmail] = {
+      email: normalizedEmail,
+      state: null,
+      pendingJobId: null,
+      pendingSince: null,
+      approvedAt: null,
+      lastSyncAt: null,
+      lastError: null,
+    };
+  }
+  return sub2ApiMonitorConfig.records[normalizedEmail];
+}
+
+function hasSub2ApiAutomaticSyncConfiguration() {
+  return Boolean(sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey);
+}
+
+async function queueCompletedSub2ApiSync(job) {
+  if (!sub2ApiMonitorConfig?.autoSyncEnabled || !hasSub2ApiAutomaticSyncConfiguration() || !job?.resultSaved) return false;
+  const enabledAt = Date.parse(sub2ApiMonitorConfig.autoSyncEnabledAt || "");
+  const completedAt = Date.parse(job.completedAt || "");
+  if (!Number.isFinite(enabledAt) || !Number.isFinite(completedAt) || completedAt < enabledAt) return false;
+  const record = getSub2ApiSyncRecord(job.email);
+  if (!record) return false;
+  if (!record.approvedAt) {
+    record.state = "pending_confirmation";
+    record.pendingJobId = job.id;
+    record.pendingSince = new Date().toISOString();
+    record.lastError = null;
+    await persistSub2ApiMonitorConfiguration();
+    return true;
+  }
+  await syncSub2ApiJobs(sub2ApiMonitorConfig, [job], { source: "automatic", approve: false, selectedCount: 1 });
+  return true;
+}
+
+async function syncSub2ApiAfterManualReauthorization(job) {
+  if (!sub2ApiMonitorConfig?.syncAfterManualReauthorization || !hasSub2ApiAutomaticSyncConfiguration() || !job?.resultSaved) {
+    return false;
+  }
+  await syncSub2ApiJobs(sub2ApiMonitorConfig, [job], { source: "manual_reauthorization", approve: true, selectedCount: 1 });
+  return true;
+}
+
+async function approvePendingSub2ApiSync(jobsToApprove) {
+  if (!hasSub2ApiAutomaticSyncConfiguration()) throw httpError(409, "请先保存 Sub2API 后端地址和管理员 API Key");
+  const pending = jobsToApprove.filter((job) => {
+    const record = sub2ApiMonitorConfig.records?.[String(job.email || "").toLowerCase()];
+    return record?.state === "pending_confirmation" && record.pendingJobId === job.id && job.resultSaved;
+  });
+  if (!pending.length) throw httpError(409, "所选账号当前没有待确认的 Sub2API 同步");
+  return syncSub2ApiJobs(sub2ApiMonitorConfig, pending, { source: "automatic", approve: true, selectedCount: pending.length });
+}
+
+async function syncSub2ApiJobs(config, jobsToSync, options = {}) {
+  const unique = new Map();
+  jobsToSync.filter((job) => job?.resultSaved).forEach((job) => unique.set(String(job.email || "").toLowerCase(), job));
+  const jobsByEmail = [...unique.values()];
+  const summary = {
+    selected: Number(options.selectedCount ?? jobsToSync.length),
+    attempted: jobsByEmail.length,
+    uploaded: 0,
+    skipped: Math.max(0, Number(options.selectedCount ?? jobsToSync.length) - jobsByEmail.length),
+    failed: 0,
+    groupIds: [...config.groupIds],
+    results: [],
+  };
+  for (const job of jobsByEmail) {
+    const record = getSub2ApiSyncRecord(job.email);
+    if (record) {
+      record.state = "syncing";
+      record.pendingJobId = job.id;
+      record.lastError = null;
+      await persistSub2ApiMonitorConfiguration();
+    }
+    try {
+      const result = await uploadSub2ApiJob(config, job);
+      const failureMessage = sub2ApiBatchFailureMessage(result);
+      if (failureMessage) throw httpError(502, failureMessage);
+      if (record) {
+        record.state = "synced";
+        record.pendingJobId = null;
+        record.pendingSince = null;
+        record.lastSyncAt = new Date().toISOString();
+        record.lastError = null;
+        if (options.approve) record.approvedAt ||= new Date().toISOString();
+        await persistSub2ApiMonitorConfiguration();
+      }
+      summary.uploaded += 1;
+      summary.results.push({ email: job.email, status: "success", result });
+    } catch (error) {
+      const message = redactSub2ApiSyncError(error?.message || error);
+      if (record) {
+        record.state = "failed";
+        record.pendingJobId = job.id;
+        record.lastError = message;
+        await persistSub2ApiMonitorConfiguration();
+      }
+      summary.failed += 1;
+      summary.results.push({ email: job.email, status: "failed", error: message });
+    }
+  }
+  return summary;
+}
+
+async function uploadSub2ApiJob(config, job) {
+  const payload = await buildSub2ApiUploadPayload([job]);
+  const accounts = payload.accounts.map((account) => formatSub2ApiAccountForUpload(account, config));
+  if (!accounts.length) throw httpError(409, `${job.email} 的 OAuth 导入文件中没有可上传账号`);
+  return requestSub2Api(config, "/api/v1/admin/accounts/batch", {
+    method: "POST",
+    headers: { "Idempotency-Key": `tosub2-upload-${crypto.randomUUID()}` },
+    body: JSON.stringify({ accounts }),
+  });
+}
+
+function formatSub2ApiAccountForUpload(account, config) {
+  const { proxy_key: _proxyKey, ...accountData } = account;
+  const credentials = { ...(account.credentials || {}) };
+  const extra = {
+    ...(account.extra && typeof account.extra === "object" ? account.extra : {}),
+    codex_fingerprint_mode: config.codexFingerprintMode,
+  };
+  if (config.modelWhitelist.length) {
+    credentials.model_mapping = Object.fromEntries(config.modelWhitelist.map((model) => [model, model]));
+  }
+  return {
+    ...accountData,
+    credentials,
+    extra,
+    status: "active",
+    schedulable: true,
+    group_ids: config.groupIds.length ? config.groupIds : (account.group_ids || []),
+    ...(config.proxyId ? { proxy_id: config.proxyId } : {}),
+    ...(config.concurrency !== null ? { concurrency: config.concurrency } : {}),
+    ...(config.loadFactor !== null ? { load_factor: config.loadFactor } : {}),
+    ...(config.priority !== null ? { priority: config.priority } : {}),
+  };
+}
+
+function sub2ApiBatchFailureMessage(result) {
+  const failed = Number(result?.account_failed ?? result?.failed ?? 0);
+  if (!Number.isFinite(failed) || failed <= 0) return "";
+  const detail = Array.isArray(result?.results)
+    ? result.results.find((item) => item?.error || item?.message || item?.status === "failed")
+    : null;
+  const reason = detail?.error || detail?.message || result?.message || result?.error || "Sub2API 未接受该账号";
+  return `Sub2API 同步失败：${String(reason).slice(0, 500)}`;
+}
+
+function redactSub2ApiSyncError(value) {
+  return String(value || "Sub2API 同步失败")
+    .replace(/(x-api-key|authorization|bearer)\s*[:=]\s*[^\s,}\]]+/gi, "$1=[redacted]")
+    .slice(0, 500);
+}
+
 function readDurationEnv(name, fallback, minimum) {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
@@ -2800,7 +3023,14 @@ async function loadSub2ApiMonitorConfiguration() {
   try {
     const saved = JSON.parse(await fs.readFile(SUB2API_MONITOR_PATH, "utf8"));
     const config = normalizeSub2ApiConfig(saved.config);
-    sub2ApiMonitorConfig = { ...config, enabled: saved.enabled === true };
+    sub2ApiMonitorConfig = {
+      ...config,
+      enabled: saved.enabled === true,
+      autoSyncEnabled: saved.autoSyncEnabled === true,
+      autoSyncEnabledAt: typeof saved.autoSyncEnabledAt === "string" ? saved.autoSyncEnabledAt : null,
+      syncAfterManualReauthorization: saved.syncAfterManualReauthorization === true,
+      records: normalizeSub2ApiSyncRecords(saved.records),
+    };
     sub2ApiMonitorState.lastCheckAt = saved.state?.lastCheckAt || null;
     sub2ApiMonitorState.lastError = saved.state?.lastError || null;
     sub2ApiMonitorState.lastResult = saved.state?.lastResult && typeof saved.state.lastResult === "object"
@@ -2820,8 +3050,11 @@ async function persistSub2ApiMonitorConfiguration() {
     return;
   }
   const payload = {
-    version: 1,
+    version: 2,
     enabled: Boolean(sub2ApiMonitorConfig.enabled),
+    autoSyncEnabled: sub2ApiMonitorConfig.autoSyncEnabled === true,
+    autoSyncEnabledAt: sub2ApiMonitorConfig.autoSyncEnabledAt || null,
+    syncAfterManualReauthorization: sub2ApiMonitorConfig.syncAfterManualReauthorization === true,
     config: {
       baseUrl: sub2ApiMonitorConfig.baseUrl,
       adminApiKey: sub2ApiMonitorConfig.adminApiKey,
@@ -2838,17 +3071,32 @@ async function persistSub2ApiMonitorConfiguration() {
       lastError: sub2ApiMonitorState.lastError,
       lastResult: sub2ApiMonitorState.lastResult,
     },
+    records: normalizeSub2ApiSyncRecords(sub2ApiMonitorConfig.records),
     updatedAt: new Date().toISOString(),
   };
-  const tempPath = `${SUB2API_MONITOR_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-  await fs.rename(tempPath, SUB2API_MONITOR_PATH);
+  sub2ApiMonitorWritePromise = sub2ApiMonitorWritePromise.catch(() => {}).then(async () => {
+    const tempPath = `${SUB2API_MONITOR_PATH}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    await fs.writeFile(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+    await fs.rename(tempPath, SUB2API_MONITOR_PATH);
+  });
+  return sub2ApiMonitorWritePromise;
 }
 
 function publicSub2ApiMonitorState() {
+  const records = Object.values(normalizeSub2ApiSyncRecords(sub2ApiMonitorConfig?.records));
+  const pending = records
+    .filter((record) => record.state === "pending_confirmation" && record.pendingJobId)
+    .map((record) => publicSub2ApiSyncRecord(record));
+  const attention = records
+    .filter((record) => ["pending_confirmation", "syncing", "retrying", "failed"].includes(record.state))
+    .map((record) => publicSub2ApiSyncRecord(record))
+    .sort((left, right) => String(right.requestedAt || right.lastSyncAt || "").localeCompare(String(left.requestedAt || left.lastSyncAt || "")));
   return {
     configured: Boolean(sub2ApiMonitorConfig?.baseUrl && sub2ApiMonitorConfig?.adminApiKey),
     enabled: Boolean(sub2ApiMonitorConfig?.enabled),
+    autoSyncEnabled: sub2ApiMonitorConfig?.autoSyncEnabled === true,
+    autoSyncEnabledAt: sub2ApiMonitorConfig?.autoSyncEnabledAt || null,
+    syncAfterManualReauthorization: sub2ApiMonitorConfig?.syncAfterManualReauthorization === true,
     baseUrl: sub2ApiMonitorConfig?.baseUrl || null,
     groupIds: sub2ApiMonitorConfig?.groupIds || [],
     intervalMinutes: Math.max(1, Math.round(SUB2API_MONITOR_INTERVAL_MS / 60_000)),
@@ -2858,6 +3106,12 @@ function publicSub2ApiMonitorState() {
     nextCheckAt: sub2ApiMonitorState.nextCheckAt,
     lastError: sub2ApiMonitorState.lastError,
     lastResult: sub2ApiMonitorState.lastResult,
+    pending,
+    pendingCount: pending.length,
+    syncingCount: records.filter((record) => record.state === "syncing").length,
+    retryingCount: records.filter((record) => record.state === "retrying").length,
+    failedCount: records.filter((record) => record.state === "failed").length,
+    attention,
   };
 }
 
@@ -3317,6 +3571,7 @@ function publicJob(job) {
     autoRepairLastSuccessAt: job.autoRepairLastSuccessAt || null,
     autoRepairLastError: job.autoRepairLastError || null,
     cpampSync: cpamp,
+    sub2ApiSync: sub2ApiSyncRecordFor(job.email),
     attempt: job.attempt,
     queuePosition: job.status === "queued" ? getQueuePosition(job) : 0,
   };
@@ -3337,6 +3592,7 @@ function publicSelectionJob(job) {
     canSetupTotp: canSetupTotp(job),
     canAddPassword: canAddPassword(job),
     cpampSync: cpampSync.recordFor(job.email),
+    sub2ApiSync: sub2ApiSyncRecordFor(job.email),
   };
 }
 
@@ -3635,6 +3891,7 @@ async function syncCompletedOutputs(force = false) {
           lastOperationAt: metadata.last_operation_at || metadata.created_at || completedAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
           cpampSyncAfterManualReauthorization: Boolean(metadata.cpamp_sync_after_manual_reauthorization),
+          sub2ApiSyncAfterManualReauthorization: Boolean(metadata.sub2api_sync_after_manual_reauthorization),
           completedAt: metadata.completed_at || completedAt,
           outputPath,
           checkpointPath,
@@ -3722,6 +3979,7 @@ async function syncCompletedOutputs(force = false) {
           lastOperationAt: metadata.last_operation_at || metadata.created_at || restoredAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
           cpampSyncAfterManualReauthorization: Boolean(metadata.cpamp_sync_after_manual_reauthorization),
+          sub2ApiSyncAfterManualReauthorization: Boolean(metadata.sub2api_sync_after_manual_reauthorization),
           completedAt: null,
           outputPath,
           checkpointPath,
@@ -3816,6 +4074,7 @@ async function syncCompletedOutputs(force = false) {
           lastOperationAt: metadata.last_operation_at || metadata.created_at || restoredAt,
           lastOperationType: metadata.last_operation_type || "initial_authorization",
           cpampSyncAfterManualReauthorization: Boolean(metadata.cpamp_sync_after_manual_reauthorization),
+          sub2ApiSyncAfterManualReauthorization: Boolean(metadata.sub2api_sync_after_manual_reauthorization),
           completedAt: metadata.completed_at || null,
           outputPath,
           checkpointPath,
@@ -4668,6 +4927,7 @@ async function saveJobMetadata(job) {
         last_operation_at: job.lastOperationAt || job.createdAt,
         last_operation_type: job.lastOperationType || "initial_authorization",
         cpamp_sync_after_manual_reauthorization: Boolean(job.cpampSyncAfterManualReauthorization),
+        sub2api_sync_after_manual_reauthorization: Boolean(job.sub2ApiSyncAfterManualReauthorization),
         login_mode: job.loginMode || null,
         mail_api_url: job.mailApiUrl || null,
         mail_request_body: job.mailRequestBody || null,

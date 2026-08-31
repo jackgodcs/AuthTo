@@ -45,6 +45,10 @@ export function createCpampSync(options) {
       const pending = records
         .filter((record) => record.state === "pending_confirmation" && record.pendingJobId)
         .map((record) => ({ email: record.email, jobId: record.pendingJobId, requestedAt: record.pendingSince || null }));
+      const attention = records
+        .filter((record) => ["pending_confirmation", "syncing", "retrying", "failed"].includes(record.state))
+        .map((record) => publicSyncRecord(record))
+        .sort((left, right) => String(right.requestedAt || right.lastSyncAt || "").localeCompare(String(left.requestedAt || left.lastSyncAt || "")));
       return {
         configured: Boolean(config.baseUrl && managementKey),
         baseUrl: config.baseUrl || null,
@@ -54,6 +58,9 @@ export function createCpampSync(options) {
         pending,
         pendingCount: pending.length,
         syncingCount: records.filter((record) => record.state === "syncing").length,
+        retryingCount: records.filter((record) => record.state === "retrying").length,
+        failedCount: records.filter((record) => record.state === "failed").length,
+        attention,
         lastError: config.lastError || null,
         lastSyncAt: config.lastSyncAt || null,
         policy: publicPolicy(config.policy),
@@ -73,15 +80,7 @@ export function createCpampSync(options) {
     recordFor(email) {
       const record = config.records[normalizeEmail(email)];
       if (!record) return null;
-      return {
-        state: record.state || null,
-        remoteFileName: record.remoteFileName || null,
-        lastSyncAt: record.lastSyncAt || null,
-        lastError: record.lastError || null,
-        duplicateCount: Number(record.duplicateCount || 0),
-        retryAttempt: Number(record.retryAttempt || 0),
-        inspection: publicInspection(record.inspection),
-      };
+      return publicSyncRecord(record);
     },
 
     async configure(input) {
@@ -494,6 +493,23 @@ export function createCpampSync(options) {
     }).catch(() => {});
     return task;
   }
+}
+
+function publicSyncRecord(record) {
+  return {
+    email: record.email || null,
+    state: record.state || null,
+    pendingJobId: record.pendingJobId || null,
+    jobId: record.pendingJobId || null,
+    requestedAt: record.pendingSince || null,
+    remoteFileName: record.remoteFileName || null,
+    lastSyncAt: record.lastSyncAt || null,
+    lastError: record.lastError || null,
+    duplicateCount: Number(record.duplicateCount || 0),
+    retryAttempt: Number(record.retryAttempt || 0),
+    nextRetryAt: record.nextRetryAt || null,
+    inspection: publicInspection(record.inspection),
+  };
 }
 
 async function buildCodexAuth(job) {

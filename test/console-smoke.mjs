@@ -14,6 +14,7 @@ const baseUrl = `http://127.0.0.1:${port}`;
 const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
+let rejectSub2ApiEmail = "";
 let remoteErrorAccounts = [];
 const updatedRemoteAccounts = new Map();
 const clearedRemoteAccountIds = new Set();
@@ -47,7 +48,10 @@ const sub2api = http.createServer(async (req, res) => {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     uploadedAccounts = body.accounts || [];
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0, results: [] }));
+    const rejected = uploadedAccounts.find((account) => account?.credentials?.email === rejectSub2ApiEmail);
+    res.end(JSON.stringify(rejected
+      ? { success: 0, failed: 1, results: [{ status: "failed", email: rejectSub2ApiEmail, message: "mock rejected credential" }] }
+      : { success: uploadedAccounts.length, failed: 0, results: [] }));
     return;
   }
   if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
@@ -913,6 +917,115 @@ try {
   });
   assert.equal(invalidFingerprintUploadResponse.status, 400, await invalidFingerprintUploadResponse.text());
 
+  const automaticSyncConfig = {
+    baseUrl: sub2apiUrl,
+    adminApiKey: "test-admin-key",
+    groupIds: ["7"],
+    codexFingerprintMode: "session",
+  };
+  const automaticSyncSaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      enabled: false,
+      autoSyncEnabled: true,
+      syncAfterManualReauthorization: true,
+      config: automaticSyncConfig,
+    }),
+  });
+  const automaticSyncSaveText = await automaticSyncSaveResponse.text();
+  assert.equal(automaticSyncSaveResponse.status, 200, automaticSyncSaveText);
+  const automaticSyncSaved = JSON.parse(automaticSyncSaveText);
+  assert.equal(automaticSyncSaved.enabled, false, "automatic sync settings must not enable pool monitoring");
+  assert.equal(automaticSyncSaved.autoSyncEnabled, true);
+  assert.equal(automaticSyncSaved.syncAfterManualReauthorization, true);
+  const storedAutomaticSyncConfig = JSON.parse(await fs.readFile(path.join(outputRoot, "sub2api-monitor.json"), "utf8"));
+  assert.equal(storedAutomaticSyncConfig.enabled, false);
+  assert.equal(storedAutomaticSyncConfig.autoSyncEnabled, true);
+  assert.equal(storedAutomaticSyncConfig.syncAfterManualReauthorization, true);
+
+  const automaticManualReauthorizationResponse = await fetch(`${baseUrl}/api/jobs/reauthorize-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId, profileJob.id] }),
+  });
+  const automaticManualReauthorizationText = await automaticManualReauthorizationResponse.text();
+  assert.equal(automaticManualReauthorizationResponse.status, 200, automaticManualReauthorizationText);
+  await Promise.all([
+    waitForJob(headers, jobId, (value) => value.status === "completed" && value.sub2ApiSync?.state === "synced"),
+    waitForJob(headers, profileJob.id, (value) => value.status === "completed" && value.sub2ApiSync?.state === "synced"),
+  ]);
+
+  const automaticPendingCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "sub2api-auto-pending@example.com" }),
+  });
+  const automaticPendingCreateText = await automaticPendingCreateResponse.text();
+  assert.equal(automaticPendingCreateResponse.status, 201, automaticPendingCreateText);
+  const automaticPendingJobId = JSON.parse(automaticPendingCreateText).job.id;
+  const automaticPendingJob = await waitForJob(
+    headers,
+    automaticPendingJobId,
+    (value) => value.status === "completed" && value.sub2ApiSync?.state === "pending_confirmation",
+  );
+  const automaticSyncStatus = await fetch(`${baseUrl}/api/sub2api/monitor`, { headers }).then((response) => response.json());
+  assert.equal(automaticSyncStatus.pendingCount, 1);
+  assert.equal(automaticSyncStatus.pending[0].pendingJobId, automaticPendingJob.id);
+  assert.equal(automaticSyncStatus.enabled, false);
+
+  const pendingSub2ApiQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, sub2ApiState: "pending_confirmation" }),
+  });
+  const pendingSub2ApiQueryText = await pendingSub2ApiQueryResponse.text();
+  assert.equal(pendingSub2ApiQueryResponse.status, 200, pendingSub2ApiQueryText);
+  assert.equal(JSON.parse(pendingSub2ApiQueryText).jobs.some((item) => item.id === automaticPendingJobId), true);
+
+  const approveAutomaticSyncResponse = await fetch(`${baseUrl}/api/sub2api/approve`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [automaticPendingJobId] }),
+  });
+  const approveAutomaticSyncText = await approveAutomaticSyncResponse.text();
+  assert.equal(approveAutomaticSyncResponse.status, 200, approveAutomaticSyncText);
+  assert.equal(JSON.parse(approveAutomaticSyncText).uploaded, 1);
+  const approvedAutomaticJob = await waitForJob(headers, automaticPendingJobId, (value) => value.sub2ApiSync?.state === "synced");
+  assert.equal(approvedAutomaticJob.sub2ApiSync.lastError, null);
+
+  rejectSub2ApiEmail = "sub2api-manual-failure@example.com";
+  const manualFailureCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: rejectSub2ApiEmail }),
+  });
+  const manualFailureCreateText = await manualFailureCreateResponse.text();
+  assert.equal(manualFailureCreateResponse.status, 201, manualFailureCreateText);
+  const manualFailureJobId = JSON.parse(manualFailureCreateText).job.id;
+  await waitForJob(headers, manualFailureJobId, (value) => value.status === "completed" && value.sub2ApiSync?.state === "pending_confirmation");
+  const rejectApproveResponse = await fetch(`${baseUrl}/api/sub2api/approve`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [manualFailureJobId] }),
+  });
+  const rejectApproveText = await rejectApproveResponse.text();
+  assert.equal(rejectApproveResponse.status, 200, rejectApproveText);
+  const rejectApprove = JSON.parse(rejectApproveText);
+  assert.equal(rejectApprove.failed, 1);
+  assert.match(rejectApprove.results[0].error, /mock rejected credential/);
+  const failedAutomaticJob = await waitForJob(headers, manualFailureJobId, (value) => value.sub2ApiSync?.state === "failed");
+  assert.match(failedAutomaticJob.sub2ApiSync.lastError, /mock rejected credential/);
+  const failedSub2ApiQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, sub2ApiState: "failed" }),
+  });
+  const failedSub2ApiQueryText = await failedSub2ApiQueryResponse.text();
+  assert.equal(failedSub2ApiQueryResponse.status, 200, failedSub2ApiQueryText);
+  assert.equal(JSON.parse(failedSub2ApiQueryText).jobs.some((item) => item.id === manualFailureJobId), true);
+  rejectSub2ApiEmail = "";
+
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [
     `password-mail@example.com---test-password----${mailApiUrl}`,
@@ -1268,13 +1381,15 @@ try {
       phoneFallbackJobId,
       incompleteAuthorizationId,
       incompleteTotpId,
+      automaticPendingJobId,
+      manualFailureJobId,
     ] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 27);
+  assert.equal(deleted.deleted, 29);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);

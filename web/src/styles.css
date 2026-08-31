@@ -123,6 +123,23 @@ button { letter-spacing: 0; }
 .cpamp-toolbar .provider-name { max-width: min(360px, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .monitor-ready { padding-left: 8px; border-left: 1px solid var(--line); }
 .monitor-check-button { width: 34px; height: 34px; }
+.sync-attention-button {
+  height: 30px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--amber);
+  background: var(--amber-soft);
+  border: 1px solid #e5ca91;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.sync-attention-button:hover { color: #fff; background: #a66d12; border-color: #a66d12; }
+.sync-attention-button.error { color: var(--danger); background: var(--danger-soft); border-color: #edc0c0; }
+.sync-attention-button.error:hover { color: #fff; background: var(--danger); border-color: var(--danger); }
 
 .add-form { display: flex; gap: 8px; }
 .email-field {
@@ -402,6 +419,19 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .sms-status.error { color: var(--danger); }
 .sms-status svg { flex: 0 0 auto; margin-top: 1px; }
+.external-sync-status {
+  margin-top: 5px;
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  color: var(--blue);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.external-sync-status svg { flex: 0 0 auto; margin-top: 1px; }
+.external-sync-status.pending { color: var(--amber); }
+.external-sync-status.success { color: var(--green-strong); }
+.external-sync-error { margin-top: 5px; }
 .totp-setup-secret {
   width: min(100%, 440px);
   margin-top: 7px;

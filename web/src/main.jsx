@@ -66,6 +66,14 @@ const STATUS_FILTER_OPTIONS = [
   ["reauth_required", "待重新授权"],
   ["resume_available", "可继续"],
 ];
+const EXTERNAL_SYNC_FILTER_OPTIONS = [
+  ["", "全部"],
+  ["pending_confirmation", "待确认"],
+  ["syncing", "同步中"],
+  ["retrying", "重试中"],
+  ["failed", "同步失败"],
+  ["synced", "已同步"],
+];
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -96,6 +104,8 @@ function App() {
   const [emailFilter, setEmailFilter] = useState([]);
   const [statusFilter, setStatusFilter] = useState("");
   const [groupFilter, setGroupFilter] = useState("");
+  const [cpampStateFilter, setCpampStateFilter] = useState("");
+  const [sub2apiStateFilter, setSub2apiStateFilter] = useState("");
   const [accountGroups, setAccountGroups] = useState([]);
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [groupTarget, setGroupTarget] = useState("");
@@ -141,9 +151,12 @@ function App() {
     lastError: null,
     lastResult: null,
     intervalMinutes: 5,
+    autoSyncEnabled: false,
+    syncAfterManualReauthorization: false,
+    pending: [], pendingCount: 0, syncingCount: 0, retryingCount: 0, failedCount: 0, attention: [],
   });
   const [cpampStatus, setCpampStatus] = useState({
-    configured: false, baseUrl: null, autoSyncEnabled: false, syncAfterManualReauthorization: false, pending: [], pendingCount: 0, syncingCount: 0, lastError: null,
+    configured: false, baseUrl: null, autoSyncEnabled: false, syncAfterManualReauthorization: false, pending: [], pendingCount: 0, syncingCount: 0, retryingCount: 0, failedCount: 0, attention: [], lastError: null,
     policy: defaultCpampPolicy(),
     inspection: { enabled: false, running: false, lastCheckAt: null, lastError: null, lastResult: null, intervalMinutes: 5 },
   });
@@ -191,13 +204,13 @@ function App() {
     let stopped = false;
     let timer;
     const search = accountSearch.trim();
-    const hasQuery = emailFilter.length || statusFilter || groupFilter || search;
+    const hasQuery = emailFilter.length || statusFilter || groupFilter || cpampStateFilter || sub2apiStateFilter || search;
     const poll = async () => {
       try {
         const data = hasQuery
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, pageSize, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(search ? { search } : {}) }),
+              body: JSON.stringify({ page, pageSize, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(cpampStateFilter ? { cpampState: cpampStateFilter } : {}), ...(sub2apiStateFilter ? { sub2ApiState: sub2apiStateFilter } : {}), ...(search ? { search } : {}) }),
             })
           : await apiFetch(token, `/api/jobs?page=${page}&pageSize=${pageSize}`);
         if (!stopped) {
@@ -220,7 +233,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, pageSize, emailFilter, statusFilter, groupFilter, accountSearch]);
+  }, [token, page, pageSize, emailFilter, statusFilter, groupFilter, cpampStateFilter, sub2apiStateFilter, accountSearch]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -230,7 +243,12 @@ function App() {
         const data = await apiFetch(token, "/api/sub2api/monitor");
         if (!stopped) {
           setSub2apiMonitorStatus(data);
-          setSub2apiSettings((current) => ({ ...current, monitorEnabled: Boolean(data.enabled) }));
+          setSub2apiSettings((current) => ({
+            ...current,
+            monitorEnabled: Boolean(data.enabled),
+            autoSyncEnabled: Boolean(data.autoSyncEnabled),
+            syncAfterManualReauthorization: Boolean(data.syncAfterManualReauthorization),
+          }));
         }
       } catch {}
     };
@@ -276,7 +294,7 @@ function App() {
   const downloadableSelectedCount = selectedJobs.filter((job) => job.canDownload).length;
   const allPageSelected = pageJobIds.length > 0 && pageJobIds.every((id) => selectedJobIds.has(id));
   const allMatchingSelected = matchingJobIds.length > 0 && matchingJobIds.every((id) => selectedJobIds.has(id));
-  const hasJobFilters = Boolean(emailFilter.length || statusFilter || groupFilter || accountSearch.trim());
+  const hasJobFilters = Boolean(emailFilter.length || statusFilter || groupFilter || cpampStateFilter || sub2apiStateFilter || accountSearch.trim());
   const canDownloadSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && downloadableSelectedCount > 0;
   const canReauthorizeSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
@@ -286,6 +304,7 @@ function App() {
     && forceReloginSelectedCount > 0;
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
   const pendingCpampSelectedCount = selectedJobs.filter((job) => job.cpampSync?.state === "pending_confirmation").length;
+  const pendingSub2ApiSelectedCount = selectedJobs.filter((job) => job.sub2ApiSync?.state === "pending_confirmation").length;
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
@@ -332,7 +351,12 @@ function App() {
   }
 
   function openSub2ApiSettings() {
-    setSub2apiSettingsDraft({ ...sub2apiSettings, monitorEnabled: Boolean(sub2apiMonitorStatus.enabled) });
+    setSub2apiSettingsDraft({
+      ...sub2apiSettings,
+      monitorEnabled: Boolean(sub2apiMonitorStatus.enabled),
+      autoSyncEnabled: Boolean(sub2apiMonitorStatus.autoSyncEnabled),
+      syncAfterManualReauthorization: Boolean(sub2apiMonitorStatus.syncAfterManualReauthorization),
+    });
     setSub2apiSettingsError("");
     setSub2apiSettingsOpen(true);
   }
@@ -445,7 +469,12 @@ function App() {
     try {
       const monitor = await apiFetch(token, "/api/sub2api/monitor", {
         method: "POST",
-        body: JSON.stringify({ enabled: nextSettings.monitorEnabled, config: nextSettings }),
+        body: JSON.stringify({
+          enabled: nextSettings.monitorEnabled,
+          autoSyncEnabled: nextSettings.autoSyncEnabled,
+          syncAfterManualReauthorization: nextSettings.syncAfterManualReauthorization,
+          config: nextSettings,
+        }),
       });
       setSub2apiSettings(nextSettings);
       setSub2apiMonitorStatus(monitor);
@@ -498,10 +527,7 @@ function App() {
         method: "POST",
         body: JSON.stringify({ ids, config: sub2apiSettings }),
       });
-      const result = data.result || {};
-      const created = result.account_created ?? result.success ?? data.uploaded;
-      const failed = result.account_failed ?? result.failed ?? 0;
-      setUploadNotice(`已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`);
+      setUploadNotice(formatSub2ApiResult(data));
       setSelectedJobIds(new Set());
       setError("");
     } catch (requestError) {
@@ -658,6 +684,8 @@ function App() {
     setFilterText("");
     setStatusFilter("");
     setGroupFilter("");
+    setCpampStateFilter("");
+    setSub2apiStateFilter("");
     setAccountSearch("");
     setSelectedJobIds(new Set());
     setExpandedJobId(null);
@@ -780,6 +808,43 @@ function App() {
     } finally {
       setBatchAction("");
     }
+  }
+
+  async function approveSelectedSub2ApiSync() {
+    if (batchAction) return;
+    const pending = selectedJobs.filter((job) => job.sub2ApiSync?.state === "pending_confirmation");
+    if (!pending.length) {
+      setError("请选择至少一条待确认的 Sub2API 同步任务");
+      return;
+    }
+    const domain = displaySub2ApiHost(sub2apiMonitorStatus.baseUrl || sub2apiSettings.baseUrl);
+    if (!window.confirm(`确定允许将 ${pending.length} 个账号的 OAuth 授权信息发送到 ${domain} 吗？确认后，这些邮箱以后新完成的授权会自动更新到该服务器。`)) return;
+    setBatchAction("sub2api-approve");
+    try {
+      const result = await apiFetch(token, "/api/sub2api/approve", {
+        method: "POST",
+        body: JSON.stringify({ ids: pending.map((job) => job.id) }),
+      });
+      setUploadNotice(formatSub2ApiResult(result));
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  function focusExternalSync(system, state, entries = []) {
+    const ids = entries.map((item) => item.jobId || item.pendingJobId).filter(Boolean);
+    setCpampStateFilter(system === "cpamp" ? state : "");
+    setSub2apiStateFilter(system === "sub2api" ? state : "");
+    setEmailFilter([]);
+    setFilterText("");
+    setAccountSearch("");
+    setSelectedJobIds(new Set(ids));
+    setExpandedJobId(null);
+    setPage(1);
   }
 
   function selectAllMatchingJobs() {
@@ -1116,6 +1181,24 @@ function App() {
                   : "号池监控未启用"}
             </span>
           )}
+          <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.autoSyncEnabled ? "" : "incomplete"}`}>
+            {sub2apiMonitorStatus.autoSyncEnabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+            {sub2apiMonitorStatus.autoSyncEnabled ? "新完成任务自动同步" : "自动同步未启用"}
+          </span>
+          <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.syncAfterManualReauthorization ? "" : "incomplete"}`}>
+            {sub2apiMonitorStatus.syncAfterManualReauthorization ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+            {sub2apiMonitorStatus.syncAfterManualReauthorization ? "手动重新授权后自动同步" : "手动重新授权后不自动同步"}
+          </span>
+          {sub2apiMonitorStatus.pendingCount > 0 && (
+            <button type="button" className="sync-attention-button" onClick={() => focusExternalSync("sub2api", "pending_confirmation", sub2apiMonitorStatus.pending)} title="查看并确认待同步的 Sub2API 账号">
+              <CircleAlert size={14} />待确认 {sub2apiMonitorStatus.pendingCount} 个账号
+            </button>
+          )}
+          {sub2apiMonitorStatus.failedCount > 0 && (
+            <button type="button" className="sync-attention-button error" onClick={() => focusExternalSync("sub2api", "failed", sub2apiMonitorStatus.attention)} title="查看 Sub2API 同步失败的账号和原因">
+              <CircleAlert size={14} />同步失败 {sub2apiMonitorStatus.failedCount} 个
+            </button>
+          )}
           {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
             <button
               type="button"
@@ -1166,7 +1249,14 @@ function App() {
               </>
             )}
             {cpampStatus.pendingCount > 0 && (
-              <span className="provider-ready monitor-ready incomplete"><CircleAlert size={14} />待确认 {cpampStatus.pendingCount} 个账号</span>
+              <button type="button" className="sync-attention-button" onClick={() => focusExternalSync("cpamp", "pending_confirmation", cpampStatus.pending)} title="查看并确认待同步的 CPAMP 账号">
+                <CircleAlert size={14} />待确认 {cpampStatus.pendingCount} 个账号
+              </button>
+            )}
+            {cpampStatus.failedCount > 0 && (
+              <button type="button" className="sync-attention-button error" onClick={() => focusExternalSync("cpamp", "failed", cpampStatus.attention)} title="查看 CPAMP 同步失败的账号和原因">
+                <CircleAlert size={14} />同步失败 {cpampStatus.failedCount} 个
+              </button>
             )}
             <button type="button" className="secondary-button provider-settings-button" onClick={openCpampSettings} disabled={!token}>
               <Settings2 size={16} />配置
@@ -1270,6 +1360,40 @@ function App() {
               </select>
             </label>
           )}
+          {features.cpampSync && (
+            <label className="status-filter-field">
+              <span>CPAMP</span>
+              <select
+                value={cpampStateFilter}
+                onChange={(event) => {
+                  setCpampStateFilter(event.target.value);
+                  setSelectedJobIds(new Set());
+                  setExpandedJobId(null);
+                  setPage(1);
+                }}
+                aria-label="按 CPAMP 同步状态筛选"
+              >
+                {EXTERNAL_SYNC_FILTER_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
+              </select>
+            </label>
+          )}
+          {features.sub2apiUpload && (
+            <label className="status-filter-field">
+              <span>Sub2API</span>
+              <select
+                value={sub2apiStateFilter}
+                onChange={(event) => {
+                  setSub2apiStateFilter(event.target.value);
+                  setSelectedJobIds(new Set());
+                  setExpandedJobId(null);
+                  setPage(1);
+                }}
+                aria-label="按 Sub2API 同步状态筛选"
+              >
+                {EXTERNAL_SYNC_FILTER_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
+              </select>
+            </label>
+          )}
           <span className="job-filter-match">匹配 {pagination.total} 条</span>
           {features.accountGroups && (
             <button type="button" className="icon-button" onClick={openGroupDialog} title="管理账号分组">
@@ -1340,6 +1464,12 @@ function App() {
                 <button type="button" className="secondary-button bulk-button" onClick={approveSelectedCpampSync} disabled={Boolean(batchAction)}>
                   {batchAction === "cpamp-approve" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
                   确认待同步 {pendingCpampSelectedCount}
+                </button>
+              )}
+              {features.sub2apiUpload && pendingSub2ApiSelectedCount > 0 && (
+                <button type="button" className="secondary-button bulk-button" onClick={approveSelectedSub2ApiSync} disabled={Boolean(batchAction)}>
+                  {batchAction === "sub2api-approve" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
+                  确认待同步 {pendingSub2ApiSelectedCount}
                 </button>
               )}
               {features.sourceExport && (
@@ -1704,6 +1834,28 @@ function App() {
                   </span>
                 </label>
               )}
+              <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(sub2apiSettingsDraft.autoSyncEnabled)}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, autoSyncEnabled: event.target.checked }))}
+                />
+                <span>
+                  <strong>自动同步以后新完成的任务</strong>
+                  <small>首次同步某个邮箱前会进入待确认队列。勾选账号后点击“确认待同步”，以后该邮箱会自动更新。</small>
+                </span>
+              </label>
+              <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(sub2apiSettingsDraft.syncAfterManualReauthorization)}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, syncAfterManualReauthorization: event.target.checked }))}
+                />
+                <span>
+                  <strong>手动重新授权成功后自动同步</strong>
+                  <small>适用于单个或批量“重新授权”和“重新登录并授权”。号池巡检的自动修复仍只更新对应远端账号，不会重复创建。</small>
+                </span>
+              </label>
               <label className="settings-field wide-settings-field">
                 <span>管理员 API Key</span>
                 <input
@@ -2366,6 +2518,8 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         {job.cpampSync?.inspection?.state && job.cpampSync.inspection.state !== "healthy" && (
           <div className="row-error">CPAMP 同步关联：{job.cpampSync.inspection.reason || cpampInspectionStateText(job.cpampSync.inspection.state)}</div>
         )}
+        <ExternalSyncStatus system="CPAMP" sync={job.cpampSync} />
+        <ExternalSyncStatus system="Sub2API" sync={job.sub2ApiSync} />
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
         {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
@@ -2505,6 +2659,27 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       </td>
     </tr>
   );
+}
+
+function ExternalSyncStatus({ system, sync }) {
+  if (!sync?.state) return null;
+  const state = sync.state;
+  if (state === "failed") {
+    return <div className="row-error external-sync-error">{system} 同步失败：{extractResponseMessage(sync.lastError || "未知错误")}</div>;
+  }
+  if (state === "pending_confirmation") {
+    return <div className="external-sync-status pending"><CircleAlert size={13} />{system} 待确认同步</div>;
+  }
+  if (state === "syncing") {
+    return <div className="external-sync-status"><LoaderCircle className="spin" size={13} />{system} 正在同步</div>;
+  }
+  if (state === "retrying") {
+    return <div className="external-sync-status pending"><RefreshCw className="spin" size={13} />{system} 正在重试：{extractResponseMessage(sync.lastError || "远端暂时不可用")}</div>;
+  }
+  if (state === "synced") {
+    return <div className="external-sync-status success"><Check size={13} />{system} 已同步{sync.lastSyncAt ? ` · ${formatDateTime(sync.lastSyncAt)}` : ""}</div>;
+  }
+  return null;
 }
 
 function JobLogs({ token, jobId }) {
@@ -2681,6 +2856,24 @@ function formatCpampResult(result) {
   if (updated) parts.push(`更新 ${updated} 个`);
   if (duplicates) parts.push(`发现 ${duplicates} 份同邮箱凭证，仅更新主凭证`);
   if (failed) parts.push(`失败 ${failed} 个`);
+  const failures = Array.isArray(result?.results)
+    ? result.results.filter((item) => item?.status === "failed").slice(0, 3)
+    : [];
+  if (failures.length) parts.push(`失败详情：${failures.map((item) => `${item.email}（${extractResponseMessage(item.error || "同步失败")}）`).join("；")}`);
+  return parts.join("，");
+}
+
+function formatSub2ApiResult(result) {
+  const uploaded = Number(result?.uploaded ?? result?.result?.success ?? 0);
+  const failed = Number(result?.failed ?? result?.result?.failed ?? 0);
+  const skipped = Number(result?.skipped || 0);
+  const parts = [`Sub2API 已同步 ${uploaded} 个账号`];
+  if (failed) parts.push(`失败 ${failed} 个`);
+  if (skipped) parts.push(`跳过未完成任务 ${skipped} 个`);
+  const failures = Array.isArray(result?.results)
+    ? result.results.filter((item) => item?.status === "failed").slice(0, 3)
+    : [];
+  if (failures.length) parts.push(`失败详情：${failures.map((item) => `${item.email}（${extractResponseMessage(item.error || "同步失败")}）`).join("；")}`);
   return parts.join("，");
 }
 
@@ -2740,6 +2933,10 @@ function cpampInspectionStateText(state) {
 
 function displayCpampHost(value) {
   try { return new URL(value).host; } catch { return String(value || "CPAMP 服务器"); }
+}
+
+function displaySub2ApiHost(value) {
+  try { return new URL(value).host; } catch { return String(value || "Sub2API 服务器"); }
 }
 
 function formatRelativeMonitorTime(value) {
@@ -2961,6 +3158,8 @@ function normalizeSub2ApiSettings(value) {
       ? stored.codexFingerprintMode
       : "session",
     monitorEnabled: stored.monitorEnabled === true,
+    autoSyncEnabled: stored.autoSyncEnabled === true,
+    syncAfterManualReauthorization: stored.syncAfterManualReauthorization === true,
   };
 }
 
