@@ -47,7 +47,7 @@ toSub2 是一个本地网页工具，通过协议请求完成 ChatGPT 登录和 
 ## 安装与启动
 
 ```bash
-git clone git@github.com:jackwog/toSub2.git
+git clone git@github.com:jackgodcs/AuthTo.git
 cd toSub2
 npm ci
 python -m pip install -r requirements.txt
