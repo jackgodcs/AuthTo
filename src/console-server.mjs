@@ -3510,19 +3510,31 @@ function resolveSelectedJobs(ids) {
 async function deleteJobsByEmail(email) {
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   const directories = new Set();
+  const childWaits = [];
   matching.forEach((job) => {
     job.deleted = true;
     stopMailPolling(job);
     releaseSmsNumber(job, "idle");
     job.runId = crypto.randomUUID();
-    job.child?.kill("SIGTERM");
+    if (job.child) {
+      job.child.kill("SIGTERM");
+      childWaits.push(waitForChildExit(job.child, 3_000));
+    }
     job.child = null;
     directories.add(path.dirname(job.outputPath));
     jobs.delete(job.id);
   });
-  await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
+  await Promise.allSettled([
+    ...childWaits,
+    ...matching.map((job) => job.metadataWritePromise).filter(Boolean),
+  ]);
   await Promise.all([
-    ...[...directories].map((directory) => fs.rm(directory, { recursive: true, force: true })),
+    ...[...directories].map((directory) => fs.rm(directory, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 100,
+    })),
     deleteStoredLoginCredentials(email),
   ]);
   scheduleQueuedJobs();
