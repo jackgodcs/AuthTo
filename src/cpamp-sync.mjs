@@ -97,7 +97,10 @@ export function createCpampSync(options) {
       const inspectionEnabled = input.inspectionEnabled === undefined
         ? config.inspection.enabled === true
         : input.inspectionEnabled === true;
-      const apiBase = await discoverApiBase(baseUrl, nextKey);
+      // Local policy changes must remain editable when a previously saved remote key has expired.
+      const apiBase = suppliedKey || !config.baseUrl || baseUrl !== config.baseUrl
+        ? await discoverApiBase(baseUrl, nextKey)
+        : config.baseUrl;
       const connectionChanged = config.baseUrl !== apiBase || (Boolean(suppliedKey) && suppliedKey !== managementKey);
       if (suppliedKey) await secretStore.save(MANAGEMENT_KEY_ID, suppliedKey);
       const enabling = nextAuto && (!config.autoSyncEnabled || connectionChanged);

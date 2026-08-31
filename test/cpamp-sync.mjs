@@ -10,13 +10,14 @@ const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-cpamp-sync-")
 const files = new Map();
 let storedManagementKey = "";
 let requiresManagementPrefix = false;
+let rejectsManagementKey = false;
 let codexModels = ["gpt-5", "gpt-5-mini", "gpt-4.1"];
 let modelDirectoryAvailable = true;
 let uploadDelayMs = 0;
 let uploadsInFlight = 0;
 let maxUploadsInFlight = 0;
 const server = http.createServer(async (req, res) => {
-  if (req.headers.authorization !== "Bearer test-management-key") {
+  if (rejectsManagementKey || req.headers.authorization !== "Bearer test-management-key") {
     res.writeHead(401, { "content-type": "application/json" });
     res.end(JSON.stringify({ message: "invalid management key" }));
     return;
@@ -102,7 +103,7 @@ try {
   assert.equal(configured.baseUrl, baseUrl);
 
   requiresManagementPrefix = true;
-  const prefixedConfigured = await sync.configure({ baseUrl, managementKey: "", autoSyncEnabled: false });
+  const prefixedConfigured = await sync.configure({ baseUrl: `${baseUrl}/v0/management`, managementKey: "", autoSyncEnabled: false });
   assert.equal(prefixedConfigured.configured, true);
   assert.equal(prefixedConfigured.baseUrl, `${baseUrl}/v0/management`);
   assert.deepEqual((await sync.options()).models, codexModels);
@@ -235,6 +236,15 @@ try {
     syncAfterManualReauthorization: true,
   });
   assert.equal(reauthorizationConfigured.syncAfterManualReauthorization, true);
+  rejectsManagementKey = true;
+  const locallySavedReauthorization = await sync.configure({
+    baseUrl: `${baseUrl}/v0/management`,
+    managementKey: "",
+    autoSyncEnabled: false,
+    syncAfterManualReauthorization: true,
+  });
+  assert.equal(locallySavedReauthorization.syncAfterManualReauthorization, true);
+  rejectsManagementKey = false;
   const manualReauthorization = await writeJob("manual-reauthorization", "manual-reauthorization@example.com", "manual-reauthorization-access", "manual-reauthorization-refresh");
   const manualReauthorizationHandled = await sync.syncAfterManualReauthorization(manualReauthorization);
   assert.equal(manualReauthorizationHandled, true);
