@@ -665,7 +665,11 @@ try {
   assert.equal(incompletePasswordAdded.canRetry, true);
   assert.equal(incompletePasswordAdded.canAddPassword, false);
   assert.equal(incompletePasswordAdded.loginMode, "password");
-  assert.match(incompletePasswordAdded.prompt, /可以继续未完成的 Codex 授权/);
+  if (process.platform === "linux") {
+    assert.match(incompletePasswordAdded.prompt, /新密码未能持久保存/);
+  } else {
+    assert.match(incompletePasswordAdded.prompt, /可以继续未完成的 Codex 授权/);
+  }
   const incompletePasswordLogs = await fetch(`${baseUrl}/api/jobs/${incompleteAuthorizationId}/logs`, { headers })
     .then((response) => response.json());
   assert.match(incompletePasswordLogs.logs, /Reusing verified login checkpoint/);
