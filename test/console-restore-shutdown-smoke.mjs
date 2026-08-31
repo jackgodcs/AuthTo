@@ -182,9 +182,14 @@ try {
   assert.equal(recoveredTotp.hasTotpKey, true);
   assert.equal(recoveredTotp.canSetupTotp, false);
   assert.equal(recoveredTotp.canRetry, true);
-  assert.equal(recoveredTotp.totpSetupError, null);
-  assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
-  await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
+  if (process.platform === "linux") {
+    assert.match(recoveredTotp.totpSetupError || "", /不支持持久凭据存储/);
+    await fs.access(path.join(interruptedTotpDir, "totp-setup-result.json"));
+  } else {
+    assert.equal(recoveredTotp.totpSetupError, null);
+    assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
+    await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
+  }
 
   const createResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
