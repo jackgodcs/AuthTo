@@ -4894,6 +4894,14 @@ function httpError(status, message) {
 
 process.on("SIGINT", () => void shutdown().catch(reportShutdownFailure));
 process.on("SIGTERM", () => void shutdown().catch(reportShutdownFailure));
+process.on("message", (message) => {
+  if (message?.type !== "shutdown") return;
+  void shutdown()
+    .then(() => {
+      if (process.connected) process.disconnect();
+    })
+    .catch(reportShutdownFailure);
+});
 
 async function shutdown() {
   if (shutdownPromise) return shutdownPromise;

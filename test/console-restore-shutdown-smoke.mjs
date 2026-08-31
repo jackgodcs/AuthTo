@@ -135,7 +135,7 @@ const child = spawn(process.execPath, [
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
     TOSUB2_TLS_PROFILE: "chrome142",
   },
-  stdio: ["ignore", "pipe", "pipe"],
+  stdio: ["ignore", "pipe", "pipe", "ipc"],
   windowsHide: true,
 });
 
@@ -205,9 +205,9 @@ try {
     delay(3_000).then(() => { throw new Error("monitor request did not start"); }),
   ]);
   const shutdownStartedAt = Date.now();
-  child.kill("SIGTERM");
+  assert.equal(child.send({ type: "shutdown" }), true, "console shutdown request was not sent");
   const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
-  assert.ok(exit, "console did not exit after SIGTERM");
+  assert.ok(exit, "console did not exit after the shutdown request");
   assert.equal(exit.code, 0, logs);
   assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
   const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));
