@@ -69,10 +69,10 @@ export function createCpampSync(options) {
       const nextKey = suppliedKey || managementKey;
       if (!nextKey) throw syncError(400, "请填写 CPAMP 管理密钥");
       const nextAuto = input.autoSyncEnabled === true;
-      await request(baseUrl, nextKey, "/auth-files");
+      const apiBase = await discoverApiBase(baseUrl, nextKey);
       if (suppliedKey) await secretStore.save(MANAGEMENT_KEY_ID, suppliedKey);
       const enabling = nextAuto && !config.autoSyncEnabled;
-      config.baseUrl = baseUrl;
+      config.baseUrl = apiBase;
       config.autoSyncEnabled = nextAuto;
       config.autoSyncEnabledAt = enabling ? new Date().toISOString() : (nextAuto ? config.autoSyncEnabledAt || new Date().toISOString() : null);
       config.lastError = null;
@@ -298,6 +298,18 @@ export function createCpampSync(options) {
       clearTimeout(timeout);
       if (requestPromise) requests.delete(requestPromise);
     }
+  }
+
+  async function discoverApiBase(baseUrl, key) {
+    try {
+      await request(baseUrl, key, "/auth-files");
+      return baseUrl;
+    } catch (error) {
+      if (error?.remoteStatus !== 404 || /\/v0\/management$/i.test(baseUrl)) throw error;
+    }
+    const managementApiBase = `${baseUrl}/v0/management`;
+    await request(managementApiBase, key, "/auth-files");
+    return managementApiBase;
   }
 
   async function uploadAuthFile(baseUrl, key, fileName, payload) {

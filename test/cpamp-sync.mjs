@@ -9,6 +9,7 @@ import { createCpampSync } from "../src/cpamp-sync.mjs";
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-cpamp-sync-"));
 const files = new Map();
 let storedManagementKey = "";
+let requiresManagementPrefix = false;
 const server = http.createServer(async (req, res) => {
   if (req.headers.authorization !== "Bearer test-management-key") {
     res.writeHead(401, { "content-type": "application/json" });
@@ -17,7 +18,8 @@ const server = http.createServer(async (req, res) => {
   }
 
   const requestUrl = new URL(req.url, "http://127.0.0.1");
-  if (req.method === "GET" && requestUrl.pathname === "/auth-files") {
+  const authFilesPath = requiresManagementPrefix ? "/v0/management/auth-files" : "/auth-files";
+  if (req.method === "GET" && requestUrl.pathname === authFilesPath) {
     const listed = [...files.entries()].map(([name, payload]) => ({
       name,
       email: Array.isArray(payload) ? payload[0]?.email : payload?.email,
@@ -28,7 +30,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && requestUrl.pathname === "/auth-files/download") {
+  if (req.method === "GET" && requestUrl.pathname === `${authFilesPath}/download`) {
     const payload = files.get(requestUrl.searchParams.get("name"));
     if (!payload) {
       res.writeHead(404, { "content-type": "application/json" });
@@ -40,7 +42,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  if (req.method === "POST" && requestUrl.pathname === "/auth-files") {
+  if (req.method === "POST" && requestUrl.pathname === authFilesPath) {
     const raw = await readBody(req);
     const parsed = parseMultipartJson(raw, String(req.headers["content-type"] || ""));
     files.set(parsed.name, parsed.payload);
@@ -73,6 +75,11 @@ try {
   assert.equal(configured.configured, true);
   assert.equal(configured.autoSyncEnabled, false);
   assert.equal(configured.baseUrl, baseUrl);
+
+  requiresManagementPrefix = true;
+  const prefixedConfigured = await sync.configure({ baseUrl, managementKey: "", autoSyncEnabled: false });
+  assert.equal(prefixedConfigured.configured, true);
+  assert.equal(prefixedConfigured.baseUrl, `${baseUrl}/v0/management`);
 
   const primary = await writeJob("primary-job", "user@example.com", "access-1", "refresh-1");
   const created = await sync.syncManual([primary]);
