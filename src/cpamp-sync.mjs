@@ -13,6 +13,9 @@ const SYNC_CONCURRENCY_OPTIONS = new Set([1, 3, 5]);
 const MAX_POLICY_INTEGER = 1_000_000;
 const ACCOUNT_HISTORY_BATCH_SIZE = 200;
 const TRANSIENT_FAILURE_THRESHOLD = 3;
+const CREDENTIAL_CONFIRMATION_ATTEMPTS = 6;
+const CREDENTIAL_CONFIRMATION_DELAY_MS = 1_000;
+const CREDENTIAL_TIMESTAMP_TOLERANCE_MS = 5_000;
 const CODEX_QUOTA_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_QUOTA_USAGE_HEADERS = {
   Authorization: "Bearer $TOKEN$",
@@ -25,6 +28,12 @@ export function createCpampSync(options) {
   const configPath = path.join(outputRoot, CONFIG_FILENAME);
   const secretStore = options.secretStore || createProtectedStore();
   const fetchImpl = options.fetchImpl || fetch;
+  const credentialConfirmationAttempts = Number.isFinite(Number(options.credentialConfirmationAttempts))
+    ? Math.max(1, Number(options.credentialConfirmationAttempts))
+    : CREDENTIAL_CONFIRMATION_ATTEMPTS;
+  const credentialConfirmationDelayMs = Number.isFinite(Number(options.credentialConfirmationDelayMs))
+    ? Math.max(0, Number(options.credentialConfirmationDelayMs))
+    : CREDENTIAL_CONFIRMATION_DELAY_MS;
   let config = emptyConfig();
   let managementKey = null;
   const retryTimers = new Map();
@@ -228,7 +237,7 @@ export function createCpampSync(options) {
 
   async function syncJobs(jobs, syncOptions) {
     const unique = uniqueByEmail(jobs);
-    const summary = { selected: jobs.length, attempted: unique.length, created: 0, updated: 0, recovered: 0, quotaRefreshed: 0, recoveryPending: 0, failed: 0, duplicates: 0, results: [] };
+    const summary = { selected: jobs.length, attempted: unique.length, created: 0, updated: 0, recovered: 0, credentialVerified: 0, runtimeStateRecovered: 0, stateEvidencePersisted: 0, quotaRefreshed: 0, recoveryPending: 0, failed: 0, duplicates: 0, results: [] };
     let modelIdsPromise = null;
     const context = {
       async getModelIds() {
@@ -255,6 +264,9 @@ export function createCpampSync(options) {
       else if (result.operation === "created") summary.created += 1;
       else summary.updated += 1;
       if (result.recovered === true) summary.recovered += 1;
+      if (result.credentialVerified === true) summary.credentialVerified += 1;
+      if (result.runtimeStateRecovered === true) summary.runtimeStateRecovered += 1;
+      if (result.stateEvidencePersisted === true) summary.stateEvidencePersisted += 1;
       if (result.quotaRefreshed === true) summary.quotaRefreshed += 1;
       if (result.recoveryWarning) summary.recoveryPending += 1;
       summary.duplicates += Number(result.duplicateCount || 0);
@@ -282,6 +294,9 @@ export function createCpampSync(options) {
     const record = recordForWrite(email);
     record.state = "syncing";
     record.lastError = null;
+    record.credentialVerifiedAt = null;
+    record.runtimeStateRecoveredAt = null;
+    record.stateEvidencePersistedAt = null;
     record.quotaRefreshedAt = null;
     await persist();
     const auth = await buildCodexAuth(job);
@@ -301,8 +316,8 @@ export function createCpampSync(options) {
     }
     await uploadAuthFile(config.baseUrl, managementKey, fileName, payload);
     const recovery = shouldRecoverAfterManualReauthorization(selection.file, syncOptions)
-      ? await recoverAfterManualReauthorization(email, selection.file, fileName, context)
-      : { recovered: false, quotaRefreshed: false, warning: null };
+      ? await recoverAfterManualReauthorization(email, selection.file, fileName, auth.last_refresh, context)
+      : { recovered: false, credentialVerified: false, runtimeStateRecovered: false, stateEvidencePersisted: false, quotaRefreshed: false, warning: null };
     record.email = email;
     record.remoteFileName = fileName;
     record.pendingJobId = null;
@@ -310,6 +325,9 @@ export function createCpampSync(options) {
     record.state = "synced";
     record.lastSyncAt = new Date().toISOString();
     record.lastError = recovery.warning;
+    record.credentialVerifiedAt = recovery.credentialVerified ? record.lastSyncAt : null;
+    record.runtimeStateRecoveredAt = recovery.runtimeStateRecovered ? record.lastSyncAt : null;
+    record.stateEvidencePersistedAt = recovery.stateEvidencePersisted ? record.lastSyncAt : null;
     record.quotaRefreshedAt = recovery.quotaRefreshed ? record.lastSyncAt : null;
     record.retryAttempt = 0;
     record.nextRetryAt = null;
@@ -323,12 +341,15 @@ export function createCpampSync(options) {
       remoteFileName: fileName,
       duplicateCount: selection.duplicateCount,
       recovered: recovery.recovered,
+      credentialVerified: recovery.credentialVerified,
+      runtimeStateRecovered: recovery.runtimeStateRecovered,
+      stateEvidencePersisted: recovery.stateEvidencePersisted,
       quotaRefreshed: recovery.quotaRefreshed,
       recoveryWarning: recovery.warning,
     };
   }
 
-  async function recoverAfterManualReauthorization(email, file, fileName, context) {
+  async function recoverAfterManualReauthorization(email, file, fileName, uploadedLastRefresh, context) {
     const candidates = await context.getReauthorizationCandidates();
     const matchesCandidate = candidates.some((candidate) => actionCandidateMatches(candidate, email, fileName, remoteMutationTarget(file, fileName)));
     const externalIssue = config.externalReauth.records[normalizeEmail(email)];
@@ -336,32 +357,55 @@ export function createCpampSync(options) {
     if (needsReenable) {
       const targetName = remoteMutationTarget(file, fileName);
       if (!targetName) throw syncError(409, "CPAMP 返回的凭证标识无效，无法恢复重新授权后的账号");
-      await patchAuthFileFields(config.baseUrl, managementKey, targetName, {
-        expired: "2000-01-01T00:00:00Z",
-        last_refresh: "2000-01-01T00:00:00Z",
-      });
       const statusPayload = buildAuthFileStatusPayload(file, targetName, false);
       await patchAuthFileStatus(config.baseUrl, managementKey, statusPayload);
     }
-    const files = extractFiles(await request(config.baseUrl, managementKey, "/auth-files"));
-    const updated = selectRecoveredRemoteFile(files, file, fileName);
+    const expectedRefreshAt = parseTimestamp(uploadedLastRefresh);
+    const updated = await waitForUploadedCredential(file, fileName, expectedRefreshAt);
     if (!updated) {
       return {
         recovered: false,
+        credentialVerified: false,
+        runtimeStateRecovered: false,
+        stateEvidencePersisted: false,
         quotaRefreshed: false,
-        warning: "CPAMP 已上传最新 OAuth，但未能重新读取远端凭证；请稍后重试同步",
+        warning: "CPAMP 已上传最新 OAuth，但未确认远端已载入本次新凭证；请稍后重试同步",
       };
     }
     if (updated.disabled === true || isDisabledRemoteStatus(updated)) {
-      if (!needsReenable) return { recovered: false, quotaRefreshed: false, warning: null };
+      if (!needsReenable) return { recovered: false, credentialVerified: true, runtimeStateRecovered: false, stateEvidencePersisted: false, quotaRefreshed: false, warning: null };
       return {
         recovered: false,
+        credentialVerified: true,
+        runtimeStateRecovered: false,
+        stateEvidencePersisted: false,
         quotaRefreshed: false,
         warning: "CPAMP 已上传最新 OAuth，但远端仍保持禁用；请使用重新登录并授权",
       };
     }
-    const quotaRefreshWarning = await refreshCodexQuotaAfterReauthorization(updated);
-    if (quotaRefreshWarning) return { recovered: false, quotaRefreshed: false, warning: quotaRefreshWarning };
+    const runtimeRecovery = await resetCpampRuntimeStateAfterReauthorization(updated, fileName);
+    if (runtimeRecovery.warning) {
+      return { recovered: false, credentialVerified: true, runtimeStateRecovered: false, stateEvidencePersisted: false, quotaRefreshed: false, warning: runtimeRecovery.warning };
+    }
+    const stateEvidence = await persistCpampHealthEvidenceAfterReauthorization(runtimeRecovery.file);
+    if (stateEvidence.warning) {
+      return { recovered: false, credentialVerified: true, runtimeStateRecovered: runtimeRecovery.recovered, stateEvidencePersisted: false, quotaRefreshed: false, warning: stateEvidence.warning };
+    }
+    const histories = await listAccountHistories([runtimeRecovery.file]);
+    const historyIssue = cpampAccountHistoryIssue(
+      histories.byFileName.get(String(runtimeRecovery.file.name || "")),
+      Math.max(remoteCredentialRefreshAt(runtimeRecovery.file), stateEvidence.observedAtMs || 0),
+    );
+    if (historyIssue?.action === "reauth") {
+      return {
+        recovered: false,
+        credentialVerified: true,
+        runtimeStateRecovered: runtimeRecovery.recovered,
+        stateEvidencePersisted: true,
+        quotaRefreshed: false,
+        warning: `CPAMP 已载入新 OAuth 并写入状态证据，但复核后仍提示需重登：${historyIssue.reason}`,
+      };
+    }
     if (needsReenable) {
       await resolveReauthorizationCandidates(candidates, email, file, fileName);
       delete config.externalReauth.records[email];
@@ -369,13 +413,57 @@ export function createCpampSync(options) {
         config.externalReauth.lastResult.needsReauthorization = Object.keys(config.externalReauth.records).length;
       }
     }
-    return { recovered: needsReenable, quotaRefreshed: true, warning: null };
+    return { recovered: needsReenable, credentialVerified: true, runtimeStateRecovered: runtimeRecovery.recovered, stateEvidencePersisted: true, quotaRefreshed: true, warning: null };
   }
 
-  async function refreshCodexQuotaAfterReauthorization(file) {
+  async function waitForUploadedCredential(file, fileName, expectedRefreshAt) {
+    let latest = null;
+    for (let attempt = 0; attempt < credentialConfirmationAttempts; attempt += 1) {
+      if (attempt > 0) await delay(credentialConfirmationDelayMs);
+      const files = extractFiles(await request(config.baseUrl, managementKey, "/auth-files"));
+      latest = selectRecoveredRemoteFile(files, file, fileName);
+      if (latest && expectedRefreshAt > 0
+        && remoteCredentialRefreshAt(latest) >= expectedRefreshAt - CREDENTIAL_TIMESTAMP_TOLERANCE_MS) return latest;
+    }
+    return null;
+  }
+
+  async function resetCpampRuntimeStateAfterReauthorization(file, fileName) {
+    if (!cpampRuntimeStateIssue(file)) return { file, recovered: false, warning: null };
     const authIndex = remoteAuthIndex(file);
     if (!authIndex) {
-      return "CPAMP 已上传最新 OAuth，但未返回可用于刷新额度的凭证索引；请在 CPAMP 刷新额度后复核状态";
+      return { file, recovered: false, warning: "CPAMP 已上传最新 OAuth，但未返回可用于刷新账号状态的凭证索引；请稍后重试同步" };
+    }
+    try {
+      const result = await request(config.baseUrl, managementKey, "/reset-quota", {
+        method: "POST",
+        body: JSON.stringify({ auth_index: authIndex }),
+      });
+      const returnedAuthIndex = String(result?.auth_index ?? result?.authIndex ?? "").trim();
+      if (returnedAuthIndex && returnedAuthIndex !== authIndex) {
+        return { file, recovered: false, warning: "CPAMP 刷新账号状态时返回了不匹配的凭证索引，已停止后续复核" };
+      }
+      for (let attempt = 0; attempt < credentialConfirmationAttempts; attempt += 1) {
+        if (attempt > 0) await delay(credentialConfirmationDelayMs);
+        const files = extractFiles(await request(config.baseUrl, managementKey, "/auth-files"));
+        const refreshed = selectRecoveredRemoteFile(files, file, fileName);
+        if (!refreshed) continue;
+        const issue = cpampRuntimeStateIssue(refreshed);
+        if (!issue) return { file: refreshed, recovered: true, warning: null };
+      }
+      return { file, recovered: false, warning: "CPAMP 已载入新 OAuth，但账号运行状态回读仍显示异常；请稍后重试同步" };
+    } catch (error) {
+      const detail = error?.remoteStatus === 404
+        ? "当前 CPAMP 或 CLIProxyAPI 不支持账号状态重置接口，请先更新服务端"
+        : redactSecrets(error.message);
+      return { file, recovered: false, warning: `CPAMP 已载入新 OAuth，但${detail}` };
+    }
+  }
+
+  async function persistCpampHealthEvidenceAfterReauthorization(file) {
+    const authIndex = remoteAuthIndex(file);
+    if (!authIndex) {
+      return { warning: "CPAMP 已上传最新 OAuth，但未返回可用于状态复核的凭证索引；请稍后重试同步", observedAtMs: null };
     }
     try {
       const result = await request(config.baseUrl, managementKey, "/api-call", {
@@ -389,14 +477,38 @@ export function createCpampSync(options) {
       });
       const status = apiCallStatusCode(result);
       if (status === null) {
-        return "CPAMP 已上传最新 OAuth，但自动刷新额度未返回远端状态；请稍后重试同步";
+        return { warning: "CPAMP 已上传最新 OAuth，但状态复核请求未返回远端状态；请稍后重试同步", observedAtMs: null };
       }
       if (status < 200 || status >= 300) {
-        return `CPAMP 已上传最新 OAuth，但自动刷新额度返回 HTTP ${status}；请稍后重试同步`;
+        return { warning: `CPAMP 已上传最新 OAuth，但状态复核请求返回 HTTP ${status}；请稍后重试同步`, observedAtMs: null };
       }
-      return null;
+      const observedAtMs = Date.now();
+      const quotaBody = parseApiCallBody(result);
+      const snapshot = buildCodexQuotaSnapshot(file, quotaBody, observedAtMs);
+      if (!snapshot.windows.length) {
+        return { warning: "CPAMP 状态复核请求成功，但返回内容中没有可持久化的状态证据", observedAtMs: null };
+      }
+      try {
+        await request(config.baseUrl, managementKey, "/quota-snapshots", {
+          method: "POST",
+          body: JSON.stringify({ entries: [snapshot] }),
+        });
+        const queried = await request(config.baseUrl, managementKey, "/quota-snapshots/query", {
+          method: "POST",
+          body: JSON.stringify({ accounts: [quotaSnapshotQueryAccount(snapshot)], now_ms: observedAtMs, include_inactive: true }),
+        });
+        if (!quotaSnapshotWasPersisted(queried, snapshot.row_key, observedAtMs)) {
+          return { warning: "CPAMP 状态证据回读未包含本次结果，无法确认状态已经持久化", observedAtMs: null };
+        }
+      } catch (error) {
+        const detail = error?.remoteStatus === 404
+          ? "当前 CPAMP 不支持额度快照接口"
+          : redactSecrets(error.message);
+        return { warning: `CPAMP 状态复核请求成功，但${detail}，无法确认状态证据已经持久化`, observedAtMs: null };
+      }
+      return { warning: null, observedAtMs };
     } catch (error) {
-      return `CPAMP 已上传最新 OAuth，但自动刷新额度失败：${redactSecrets(error.message)}`;
+      return { warning: `CPAMP 已上传最新 OAuth，但状态复核失败：${redactSecrets(error.message)}`, observedAtMs: null };
     }
   }
 
@@ -567,10 +679,6 @@ export function createCpampSync(options) {
     }
   }
 
-  async function patchAuthFileFields(baseUrl, key, name, fields) {
-    await patchJson(baseUrl, key, "/auth-files/fields", { name, ...fields }, "更新 CPAMP 凭证状态");
-  }
-
   async function patchAuthFileStatus(baseUrl, key, payload) {
     await patchJson(baseUrl, key, "/auth-files/status", payload, "恢复 CPAMP 账号状态");
   }
@@ -711,7 +819,10 @@ export function createCpampSync(options) {
             summary.missingEmail += 1;
             continue;
           }
-          const historyIssue = cpampAccountHistoryIssue(histories.byFileName.get(String(file.name || "")));
+          const historyIssue = cpampAccountHistoryIssue(
+            histories.byFileName.get(String(file.name || "")),
+            remoteCredentialRefreshAt(file),
+          );
           const issue = historyIssue || cpampReauthorizationIssue(file);
           if (!issue) continue;
           if (records[email]) continue;
@@ -790,6 +901,9 @@ function publicSyncRecord(record) {
     remoteFileName: record.remoteFileName || null,
     lastSyncAt: record.lastSyncAt || null,
     lastError: record.lastError || null,
+    credentialVerifiedAt: record.credentialVerifiedAt || null,
+    runtimeStateRecoveredAt: record.runtimeStateRecoveredAt || null,
+    stateEvidencePersistedAt: record.stateEvidencePersistedAt || null,
     quotaRefreshedAt: record.quotaRefreshedAt || null,
     duplicateCount: Number(record.duplicateCount || 0),
     retryAttempt: Number(record.retryAttempt || 0),
@@ -909,6 +1023,223 @@ function apiCallStatusCode(payload) {
   const value = payload?.status_code ?? payload?.statusCode ?? payload?.status;
   const status = Number.parseInt(String(value ?? ""), 10);
   return Number.isSafeInteger(status) && status >= 100 && status <= 599 ? status : null;
+}
+
+function parseApiCallBody(payload) {
+  const value = payload?.body ?? payload?.bodyText ?? payload?.data;
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function buildCodexQuotaSnapshot(file, body, observedAtMs) {
+  const rowKey = cpampSelectionKey(file);
+  const sourceObservationId = `accounts-provider-query:${observedAtMs}`;
+  const windows = [
+    ...codexRateLimitWindows(body?.rate_limit ?? body?.rateLimit, "", observedAtMs, sourceObservationId, body),
+    ...codexRateLimitWindows(body?.code_review_rate_limit ?? body?.codeReviewRateLimit, "code-review-", observedAtMs, sourceObservationId, body),
+    ...codexAdditionalRateLimitWindows(body?.additional_rate_limits ?? body?.additionalRateLimits, observedAtMs, sourceObservationId, body),
+  ];
+  linkCodexQuotaWindows(windows);
+  return {
+    row_key: rowKey,
+    provider: "codex",
+    account: quotaSnapshotAccount(file),
+    observation: {
+      source: "api_query",
+      source_observation_id: sourceObservationId,
+      observed_at_ms: observedAtMs,
+      inventory_scope_key: "codex:rate-limits",
+      inventory_mode: codexQuotaInventoryObserved(body) ? "complete" : "partial",
+    },
+    windows,
+  };
+}
+
+function linkCodexQuotaWindows(windows) {
+  const mainWeekly = windows.find((window) => window.provider_window_id === "weekly"
+    && window.model_scope_kind === "family"
+    && window.model_scope_key === "codex_main");
+  if (!mainWeekly) return;
+  const mainFiveHour = windows.find((window) => window.provider_window_id === "five-hour"
+    && window.model_scope_kind === "family"
+    && window.model_scope_key === "codex_main");
+  if (!mainFiveHour) return;
+  mainFiveHour.relationship_kind = "concurrent_subwindow";
+  mainFiveHour.container_provider_window_id = mainWeekly.provider_window_id;
+}
+
+function codexAdditionalRateLimitWindows(values, observedAtMs, sourceObservationId, body) {
+  if (!Array.isArray(values)) return [];
+  return values.flatMap((entry, index) => {
+    const rateLimit = entry?.rate_limit ?? entry?.rateLimit;
+    const label = String(entry?.metered_feature ?? entry?.meteredFeature ?? entry?.limit_name ?? entry?.limitName ?? `additional-${index + 1}`);
+    const prefix = `${sanitizeQuotaId(label) || `additional-${index + 1}`}-`;
+    return codexRateLimitWindows(rateLimit, prefix, observedAtMs, sourceObservationId, body, index);
+  });
+}
+
+function codexRateLimitWindows(rateLimit, prefix, observedAtMs, sourceObservationId, body, index = null) {
+  if (!rateLimit || typeof rateLimit !== "object" || Array.isArray(rateLimit)) return [];
+  const primary = rateLimit.primary_window ?? rateLimit.primaryWindow;
+  const secondary = rateLimit.secondary_window ?? rateLimit.secondaryWindow;
+  const windows = [];
+  const primaryDuration = quotaWindowDuration(primary);
+  const secondaryDuration = quotaWindowDuration(secondary);
+  const suffix = index === null ? "" : `-${index}`;
+  const main = prefix === "";
+  const scopeKind = main ? "family" : "feature";
+  const scopeKey = main ? "codex_main" : prefix === "code-review-" ? "code_review" : sanitizeQuotaId(prefix) || "scope_unknown";
+  if (primary) windows.push(buildQuotaWindow(
+    primary,
+    `${prefix}${quotaWindowId(primaryDuration, "five-hour")}${suffix}`,
+    observedAtMs,
+    sourceObservationId,
+    body,
+    { scopeKind, scopeKey, completeScope: main, aliases: main ? ["primary"] : [] },
+  ));
+  if (secondary) windows.push(buildQuotaWindow(
+    secondary,
+    `${prefix}${quotaWindowId(secondaryDuration, "weekly")}${suffix}`,
+    observedAtMs,
+    sourceObservationId,
+    body,
+    { scopeKind, scopeKey, completeScope: main, aliases: main ? ["secondary"] : [] },
+  ));
+  return windows.filter(Boolean);
+}
+
+function buildQuotaWindow(window, providerWindowId, observedAtMs, sourceObservationId, body, scope) {
+  const durationSeconds = quotaWindowDuration(window);
+  const usedPercent = finiteNumber(window?.used_percent ?? window?.usedPercent);
+  const cycleEndMs = quotaWindowResetAt(window, observedAtMs);
+  const cycleStartMs = durationSeconds && cycleEndMs ? cycleEndMs - durationSeconds * 1_000 : null;
+  if (usedPercent === null && durationSeconds === null && cycleEndMs === null) return null;
+  return removeEmpty({
+    provider_window_id: providerWindowId,
+    provider_window_aliases: scope.aliases.length ? scope.aliases : null,
+    window_kind: quotaWindowKind(providerWindowId),
+    window_mode: scope.completeScope && durationSeconds && cycleEndMs ? "fixed" : "unknown",
+    model_scope_kind: scope.scopeKind,
+    model_scope_key: scope.scopeKey,
+    source: "api_query",
+    source_observation_id: sourceObservationId,
+    observed_at_ms: observedAtMs,
+    boundary_accuracy: scope.completeScope && cycleEndMs ? "estimated" : "unknown",
+    cycle_start_ms: cycleStartMs,
+    cycle_end_ms: cycleEndMs,
+    duration_seconds: durationSeconds,
+    used_percent: usedPercent,
+    remaining_percent: usedPercent === null ? null : Math.max(0, Math.min(100, 100 - usedPercent)),
+    plan_type: String(body?.plan_type ?? body?.planType ?? "").trim(),
+  });
+}
+
+function quotaWindowDuration(window) {
+  const value = finiteNumber(window?.limit_window_seconds ?? window?.limitWindowSeconds);
+  return value !== null && value > 0 ? value : null;
+}
+
+function quotaWindowResetAt(window, observedAtMs) {
+  const direct = finiteNumber(window?.reset_at_ms ?? window?.resetAtMs);
+  if (direct !== null && direct > 0) return direct < 100_000_000_000 ? direct * 1_000 : direct;
+  const resetAt = finiteNumber(window?.reset_at ?? window?.resetAt);
+  if (resetAt !== null && resetAt > 0) return resetAt < 100_000_000_000 ? resetAt * 1_000 : resetAt;
+  const resetAfter = finiteNumber(window?.reset_after_seconds ?? window?.resetAfterSeconds);
+  return resetAfter !== null && resetAfter >= 0 ? observedAtMs + resetAfter * 1_000 : null;
+}
+
+function quotaWindowId(durationSeconds, fallback) {
+  if (durationSeconds === 18_000) return "five-hour";
+  if (durationSeconds === 604_800) return "weekly";
+  if (durationSeconds !== null && durationSeconds >= 28 * 86_400 && durationSeconds <= 31 * 86_400) return "monthly";
+  return fallback;
+}
+
+function quotaWindowKind(providerWindowId) {
+  if (/(?:^|-)five-hour(?:-|$)/.test(providerWindowId)) return "five_hour";
+  if (/(?:^|-)monthly(?:-|$)/.test(providerWindowId)) return "monthly";
+  if (/(?:^|-)weekly(?:-|$)/.test(providerWindowId)) return "weekly";
+  return "unknown";
+}
+
+function sanitizeQuotaId(value) {
+  return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function codexQuotaInventoryObserved(body) {
+  const structured = [body?.rate_limit, body?.rateLimit, body?.code_review_rate_limit, body?.codeReviewRateLimit]
+    .some((value) => value && typeof value === "object" && !Array.isArray(value));
+  const additional = [body?.additional_rate_limits, body?.additionalRateLimits].some(Array.isArray);
+  return structured || additional;
+}
+
+function quotaSnapshotAccount(file) {
+  return removeEmpty({
+    account_snapshot: remoteFileEmail(file),
+    auth_label_snapshot: String(file?.label ?? file?.note ?? file?.email ?? file?.account ?? "").trim(),
+    auth_file_snapshot: String(file?.name || "").trim(),
+    auth_provider_snapshot: String(file?.provider ?? file?.type ?? "codex").trim(),
+    auth_account_id_snapshot: remoteChatgptAccountId(file),
+    auth_index: remoteAuthIndex(file),
+    source: String(file?.name || "").trim(),
+  });
+}
+
+function quotaSnapshotQueryAccount(snapshot) {
+  return { row_key: snapshot.row_key, provider: snapshot.provider, account: snapshot.account };
+}
+
+function quotaSnapshotWasPersisted(payload, rowKey, observedAtMs) {
+  const items = Array.isArray(payload?.items)
+    ? payload.items
+    : Array.isArray(payload?.data?.items)
+      ? payload.data.items
+      : [];
+  const item = items.find((entry) => String(entry?.row_key ?? entry?.rowKey ?? "") === rowKey);
+  if (!item) return false;
+  const observationAt = parseTimestamp(item?.observation?.observed_at_ms ?? item?.observation?.observedAtMs);
+  if (observationAt >= observedAtMs) return true;
+  const windows = Array.isArray(item.windows) ? item.windows : [];
+  return windows.some((window) => parseTimestamp(window?.observed_at_ms ?? window?.observedAtMs) >= observedAtMs);
+}
+
+function cpampSelectionKey(file) {
+  const name = String(file?.name || "").trim();
+  const authIndex = remoteAuthIndex(file);
+  if (authIndex) return `${name}\u0000${authIndex}`;
+  return `${name}\u0000-\u0000${name}::-`;
+}
+
+function remoteCredentialRefreshAt(file) {
+  const refreshValues = [file?.lastRefresh, file?.last_refresh, file?.lastRefreshedAt, file?.last_refreshed_at]
+    .map(parseTimestamp)
+    .filter((value) => value > 0);
+  if (!refreshValues.length) return 0;
+  const refreshAt = Math.max(...refreshValues);
+  const coupledUpdates = [file?.updatedAtMs, file?.updated_at_ms, file?.updatedAt, file?.updated_at, file?.modified, file?.modtime]
+    .map(parseTimestamp)
+    .filter((value) => value > refreshAt && value - refreshAt <= CREDENTIAL_TIMESTAMP_TOLERANCE_MS);
+  return coupledUpdates.length ? Math.max(refreshAt, ...coupledUpdates) : refreshAt;
+}
+
+function parseTimestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value < 100_000_000_000 ? value * 1_000 : value;
+  if (typeof value !== "string" || !value.trim()) return 0;
+  const numeric = Number(value.trim());
+  if (Number.isFinite(numeric)) return numeric < 100_000_000_000 ? numeric * 1_000 : numeric;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function finiteNumber(value) {
+  const number = typeof value === "number" ? value : Number(String(value ?? "").trim());
+  return Number.isFinite(number) ? number : null;
 }
 
 function buildAuthFileStatusPayload(file, targetName, disabled) {
@@ -1065,10 +1396,11 @@ function extractAccountHistoryItems(payload) {
         : [];
 }
 
-function cpampAccountHistoryIssue(history) {
+function cpampAccountHistoryIssue(history, supersededAtMs = 0) {
   if (!history || typeof history !== "object") return null;
   const requests = [history.latest_request, history.latestRequest, ...(history.recent_requests ?? history.recentRequests ?? [])]
     .filter((request) => request && typeof request === "object")
+    .filter((request) => requestTimestamp(request) > supersededAtMs)
     .sort((left, right) => requestTimestamp(right) - requestTimestamp(left));
   if (!requests.length) return null;
 
@@ -1142,6 +1474,26 @@ function cpampReauthorizationIssue(file) {
   return null;
 }
 
+function cpampRuntimeStateIssue(file) {
+  if (!file || typeof file !== "object") return "账号不存在";
+  if (file.disabled === true || isDisabledRemoteStatus(file)) return "账号仍处于禁用状态";
+  const status = String(file.status || file.state || "").trim().toLowerCase();
+  const statusMessage = String(file.status_message ?? file.statusMessage ?? "").trim();
+  const lastError = file.last_error ?? file.lastError;
+  if (file.unavailable === true) return statusMessage || "账号仍处于不可用状态";
+  if (lastError && typeof lastError === "object" && Object.keys(lastError).length) {
+    return remoteIssueDetail(lastError) || "账号仍保留运行错误";
+  }
+  if (lastError && typeof lastError !== "object") return String(lastError).trim() || "账号仍保留运行错误";
+  if (["error", "failed", "unavailable", "reauth", "reauth_required"].includes(status)) {
+    return statusMessage || `账号状态仍为 ${status}`;
+  }
+  if (statusMessage && !["active", "ok", "healthy", "available"].includes(statusMessage.toLowerCase())) {
+    return statusMessage;
+  }
+  return null;
+}
+
 function extractActionCandidates(payload) {
   const values = Array.isArray(payload?.items)
     ? payload.items
@@ -1211,6 +1563,10 @@ function mapWithConcurrency(values, limit, callback) {
       results[index] = await callback(values[index], index);
     }
   })).then(() => results);
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function codexFileName(auth) {

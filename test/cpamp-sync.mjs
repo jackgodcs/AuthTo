@@ -12,6 +12,9 @@ const fileStates = new Map();
 const accountHistoryByFile = new Map();
 const credentialRefreshRequests = [];
 const quotaRefreshRequests = [];
+const runtimeResetRequests = [];
+const quotaSnapshotEntries = new Map();
+const quotaSnapshotQueries = [];
 const actionCandidates = [];
 let storedManagementKey = "";
 let requiresManagementPrefix = false;
@@ -19,6 +22,9 @@ let rejectsManagementKey = false;
 let ignoresEnableRequests = false;
 let requiresStatusIdentityMetadata = false;
 let quotaRefreshStatus = 200;
+let runtimeResetStatus = 200;
+let ignoresRuntimeResetRequests = false;
+let quotaSnapshotsAvailable = true;
 let codexModels = ["gpt-5", "gpt-5-mini", "gpt-4.1"];
 let modelDirectoryAvailable = true;
 let uploadDelayMs = 0;
@@ -37,6 +43,8 @@ const server = http.createServer(async (req, res) => {
   const accountHistoryPath = requiresManagementPrefix ? "/v0/management/monitoring/account-history" : "/monitoring/account-history";
   const modelDefinitionsPath = requiresManagementPrefix ? "/v0/management/model-definitions/codex" : "/model-definitions/codex";
   const apiCallPath = requiresManagementPrefix ? "/v0/management/api-call" : "/api-call";
+  const resetQuotaPath = requiresManagementPrefix ? "/v0/management/reset-quota" : "/reset-quota";
+  const quotaSnapshotsPath = requiresManagementPrefix ? "/v0/management/quota-snapshots" : "/quota-snapshots";
   if (req.method === "GET" && requestUrl.pathname === actionCandidatesPath) {
     const status = requestUrl.searchParams.get("status") || "pending";
     res.writeHead(200, { "content-type": "application/json" });
@@ -67,8 +75,12 @@ const server = http.createServer(async (req, res) => {
         id: state.id || name,
         auth_index: state.authIndex || undefined,
         email: Array.isArray(payload) ? payload[0]?.email : payload?.email,
+        last_refresh: state.listedLastRefresh ?? (Array.isArray(payload) ? payload[0]?.last_refresh : payload?.last_refresh),
+        modtime: Array.isArray(payload) ? payload[0]?.modtime : payload?.modtime,
         disabled: state.disabled ?? (Array.isArray(payload) ? payload[0]?.disabled : payload?.disabled),
         status: state.status ?? (Array.isArray(payload) ? payload[0]?.status : payload?.status),
+        status_message: state.statusMessage || "",
+        unavailable: state.unavailable === true,
         failed: state.failed ?? 0,
         success: state.success ?? 0,
       };
@@ -99,15 +111,75 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ message: "invalid quota refresh request" }));
       return;
     }
-    const [fileName] = fileEntry;
-    if (quotaRefreshStatus >= 200 && quotaRefreshStatus < 300) {
-      accountHistoryByFile.set(fileName, {
-        latest_request: { timestamp_ms: Date.now(), failed: false, fail_status_code: 200 },
-        recent_requests: [{ timestamp_ms: Date.now() - 1, failed: true, fail_status_code: 401, fail_summary: "token invalidated" }],
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      status_code: quotaRefreshStatus,
+      body: {
+        plan_type: "plus",
+        rate_limit: {
+          primary_window: { limit_window_seconds: 18_000, used_percent: 41, reset_at: Math.floor(Date.now() / 1_000) + 1_800 },
+          secondary_window: { limit_window_seconds: 604_800, used_percent: 23, reset_at: Math.floor(Date.now() / 1_000) + 86_400 },
+        },
+      },
+    }));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === resetQuotaPath) {
+    const payload = JSON.parse(await readBody(req));
+    runtimeResetRequests.push(payload);
+    const fileEntry = [...fileStates.entries()].find(([, state]) => String(state.authIndex || "") === String(payload.auth_index || ""));
+    if (!fileEntry) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "auth not found" }));
+      return;
+    }
+    if (runtimeResetStatus < 200 || runtimeResetStatus >= 300) {
+      res.writeHead(runtimeResetStatus, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "runtime reset rejected" }));
+      return;
+    }
+    const [fileName, state] = fileEntry;
+    if (!ignoresRuntimeResetRequests) {
+      fileStates.set(fileName, {
+        ...state,
+        status: "active",
+        statusMessage: "",
+        unavailable: false,
       });
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status_code: quotaRefreshStatus, body: { plan_type: "plus", limits: [] } }));
+    res.end(JSON.stringify({ status: "ok", auth_index: payload.auth_index, models: ["gpt-5"] }));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === quotaSnapshotsPath) {
+    if (!quotaSnapshotsAvailable) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "quota snapshots unavailable" }));
+      return;
+    }
+    const payload = JSON.parse(await readBody(req));
+    for (const entry of payload.entries || []) quotaSnapshotEntries.set(entry.row_key, entry);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ written: payload.entries?.length || 0 }));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === `${quotaSnapshotsPath}/query`) {
+    if (!quotaSnapshotsAvailable) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "quota snapshots unavailable" }));
+      return;
+    }
+    const payload = JSON.parse(await readBody(req));
+    quotaSnapshotQueries.push(payload);
+    const items = (payload.accounts || []).map((account) => {
+      const entry = quotaSnapshotEntries.get(account.row_key);
+      return entry ? { row_key: account.row_key, windows: entry.windows, observation: entry.observation } : { row_key: account.row_key, windows: [] };
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ items }));
     return;
   }
 
@@ -205,7 +277,7 @@ try {
     async load() { return storedManagementKey || null; },
     async delete() { storedManagementKey = ""; },
   };
-  const sync = createCpampSync({ outputRoot, secretStore });
+  const sync = createCpampSync({ outputRoot, secretStore, credentialConfirmationAttempts: 3, credentialConfirmationDelayMs: 1 });
   await sync.load();
   const configured = await sync.configure({
     baseUrl: `${baseUrl}/management.html#/accounts?status=problem`,
@@ -372,6 +444,8 @@ try {
   fileStates.set(manualReauthorizationFileName, {
     disabled: true,
     status: "disabled",
+    statusMessage: "unauthorized",
+    unavailable: true,
     failed: 1,
     success: 1,
     authIndex: "manual-reauthorization-index",
@@ -395,11 +469,10 @@ try {
   assert.equal(files.get(manualReauthorizationFileName).refresh_token, "manual-reauthorization-new-refresh");
   assert.equal(fileStates.get(manualReauthorizationFileName).disabled, false);
   assert.equal(fileStates.get(manualReauthorizationFileName).status, "active");
-  assert.deepEqual(credentialRefreshRequests.at(-1), {
-    name: manualReauthorizationFileName,
-    expired: "2000-01-01T00:00:00Z",
-    last_refresh: "2000-01-01T00:00:00Z",
-  });
+  assert.equal(fileStates.get(manualReauthorizationFileName).unavailable, false, "重新授权必须清理 CLIProxyAPI 保存的不可用状态");
+  assert.deepEqual(runtimeResetRequests.at(-1), { auth_index: "manual-reauthorization-index" }, "必须通过官方 reset-quota 接口清理目标凭证的运行状态");
+  assert.match(sync.recordFor("manual-reauthorization@example.com").runtimeStateRecoveredAt || "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(credentialRefreshRequests.some((request) => request.name === manualReauthorizationFileName), false, "上传的新 OAuth 已携带当前刷新时间，不能再改回 2000 年触发值");
   assert.deepEqual(quotaRefreshRequests.at(-1), {
     authIndex: "manual-reauthorization-index",
     method: "GET",
@@ -413,6 +486,19 @@ try {
   const refreshedHistory = await sync.refreshExternalReauth();
   assert.equal(refreshedHistory.needsReauthorization, 0, "重新授权后的成功额度查询必须覆盖 CPAMP 的旧登录失效记录");
   assert.equal(sync.recordFor("manual-reauthorization@example.com").state, "synced");
+  const manualSnapshot = [...quotaSnapshotEntries.values()].find((entry) => entry.account.auth_file_snapshot === manualReauthorizationFileName);
+  assert.ok(manualSnapshot, "重新授权后的额度结果必须写入 CPAMP 快照");
+  assert.equal(manualSnapshot.row_key, `${manualReauthorizationFileName}\u0000manual-reauthorization-index`);
+  assert.equal(manualSnapshot.observation.inventory_mode, "complete");
+  assert.deepEqual(manualSnapshot.windows.map((window) => window.provider_window_id), ["five-hour", "weekly"]);
+  assert.equal(manualSnapshot.windows[0].relationship_kind, "concurrent_subwindow");
+  assert.equal(manualSnapshot.windows[0].container_provider_window_id, "weekly");
+  assert.deepEqual(quotaSnapshotQueries.at(-1).accounts, [{
+    row_key: `${manualReauthorizationFileName}\u0000manual-reauthorization-index`,
+    provider: "codex",
+    account: manualSnapshot.account,
+  }], "额度快照回读必须使用 CPAMP 官方页面的嵌套账号载荷");
+  assert.match(sync.recordFor("manual-reauthorization@example.com").stateEvidencePersistedAt || "", /^\d{4}-\d{2}-\d{2}T/);
   requiresStatusIdentityMetadata = false;
 
   const historyOnlyReauthorization = await writeJob("history-only-reauthorization", "history-only@example.com", "history-only-access", "history-only-refresh");
@@ -424,10 +510,16 @@ try {
     authIndex: "history-only-index",
     publicFields: { account_id: "history-only-account" },
   });
+  accountHistoryByFile.set(historyOnlyFileName, {
+    latest_request: { timestamp_ms: 4_000, failed: true, fail_status_code: 401, fail_summary: "token invalidated" },
+  });
+  files.set(historyOnlyFileName, { ...files.get(historyOnlyFileName), last_refresh: "1970-01-01T00:00:05.000Z" });
   const quotaRefreshCount = quotaRefreshRequests.length;
+  const runtimeResetCount = runtimeResetRequests.length;
   const historyOnlyRefresh = await writeJob("history-only-reauthorization-refresh", "history-only@example.com", "history-only-new-access", "history-only-new-refresh");
   await sync.syncAfterManualReauthorization(historyOnlyRefresh);
   assert.equal(quotaRefreshRequests.length, quotaRefreshCount + 1, "已有账号完成手动重新授权后，即使 CPAMP 尚未返回候选项，也必须刷新额度以清除请求历史中的需重登状态");
+  assert.equal(runtimeResetRequests.length, runtimeResetCount, "运行状态已经健康的账号不应清除真实的额度冷却");
   assert.equal(quotaRefreshRequests.at(-1).authIndex, "history-only-index");
   assert.equal(quotaRefreshRequests.at(-1).header["Chatgpt-Account-Id"], "history-only-account");
   assert.equal(sync.recordFor("history-only@example.com").lastError, null);
@@ -456,7 +548,45 @@ try {
   const missingAuthIndexQuotaRefreshCount = quotaRefreshRequests.length;
   await sync.syncAfterManualReauthorization(missingAuthIndexRefresh);
   assert.equal(quotaRefreshRequests.length, missingAuthIndexQuotaRefreshCount);
-  assert.match(sync.recordFor("missing-auth-index@example.com").lastError || "", /未返回可用于刷新额度的凭证索引/);
+  assert.match(sync.recordFor("missing-auth-index@example.com").lastError || "", /未返回可用于状态复核的凭证索引/);
+
+  const rejectedRuntimeReset = await writeJob("rejected-runtime-reset", "rejected-runtime-reset@example.com", "rejected-runtime-reset-access", "rejected-runtime-reset-refresh");
+  const rejectedRuntimeResetCreated = await sync.syncManual([rejectedRuntimeReset]);
+  const rejectedRuntimeResetFileName = rejectedRuntimeResetCreated.results[0].remoteFileName;
+  fileStates.set(rejectedRuntimeResetFileName, {
+    disabled: false,
+    status: "error",
+    statusMessage: "unauthorized",
+    unavailable: true,
+    authIndex: "rejected-runtime-reset-index",
+  });
+  runtimeResetStatus = 503;
+  const rejectedRuntimeResetQuotaCount = quotaRefreshRequests.length;
+  const rejectedRuntimeResetRetry = await writeJob("rejected-runtime-reset-retry", "rejected-runtime-reset@example.com", "rejected-runtime-reset-new-access", "rejected-runtime-reset-new-refresh");
+  await sync.syncAfterManualReauthorization(rejectedRuntimeResetRetry);
+  assert.equal(quotaRefreshRequests.length, rejectedRuntimeResetQuotaCount, "运行状态重置失败后不能继续写入误导性的健康证据");
+  assert.match(sync.recordFor("rejected-runtime-reset@example.com").lastError || "", /HTTP 503|runtime reset rejected/);
+  assert.equal(sync.recordFor("rejected-runtime-reset@example.com").runtimeStateRecoveredAt, null);
+  runtimeResetStatus = 200;
+
+  const staleRuntimeState = await writeJob("stale-runtime-state", "stale-runtime-state@example.com", "stale-runtime-state-access", "stale-runtime-state-refresh");
+  const staleRuntimeStateCreated = await sync.syncManual([staleRuntimeState]);
+  const staleRuntimeStateFileName = staleRuntimeStateCreated.results[0].remoteFileName;
+  fileStates.set(staleRuntimeStateFileName, {
+    disabled: false,
+    status: "error",
+    statusMessage: "unauthorized",
+    unavailable: true,
+    authIndex: "stale-runtime-state-index",
+  });
+  ignoresRuntimeResetRequests = true;
+  const staleRuntimeStateQuotaCount = quotaRefreshRequests.length;
+  const staleRuntimeStateRetry = await writeJob("stale-runtime-state-retry", "stale-runtime-state@example.com", "stale-runtime-state-new-access", "stale-runtime-state-new-refresh");
+  await sync.syncAfterManualReauthorization(staleRuntimeStateRetry);
+  assert.equal(quotaRefreshRequests.length, staleRuntimeStateQuotaCount, "状态重置回读仍异常时不能继续写入健康证据");
+  assert.match(sync.recordFor("stale-runtime-state@example.com").lastError || "", /运行状态回读仍显示异常/);
+  assert.equal(sync.recordFor("stale-runtime-state@example.com").runtimeStateRecoveredAt, null);
+  ignoresRuntimeResetRequests = false;
 
   const rejectedQuotaRefresh = await writeJob("rejected-quota-refresh", "rejected-quota@example.com", "rejected-quota-access", "rejected-quota-refresh");
   const rejectedQuotaCreated = await sync.syncManual([rejectedQuotaRefresh]);
@@ -467,8 +597,36 @@ try {
   const rejectedQuotaRefreshCount = quotaRefreshRequests.length;
   await sync.syncAfterManualReauthorization(rejectedQuotaRetry);
   assert.equal(quotaRefreshRequests.length, rejectedQuotaRefreshCount + 1);
-  assert.match(sync.recordFor("rejected-quota@example.com").lastError || "", /自动刷新额度返回 HTTP 503/);
+  assert.match(sync.recordFor("rejected-quota@example.com").lastError || "", /状态复核请求返回 HTTP 503/);
   quotaRefreshStatus = 200;
+
+  const snapshotsUnavailable = await writeJob("snapshots-unavailable", "snapshots-unavailable@example.com", "snapshots-unavailable-access", "snapshots-unavailable-refresh");
+  const snapshotsUnavailableCreated = await sync.syncManual([snapshotsUnavailable]);
+  const snapshotsUnavailableFileName = snapshotsUnavailableCreated.results[0].remoteFileName;
+  fileStates.set(snapshotsUnavailableFileName, { disabled: false, status: "active", authIndex: "snapshots-unavailable-index" });
+  quotaSnapshotsAvailable = false;
+  const snapshotsUnavailableRetry = await writeJob("snapshots-unavailable-retry", "snapshots-unavailable@example.com", "snapshots-unavailable-new-access", "snapshots-unavailable-new-refresh");
+  await sync.syncAfterManualReauthorization(snapshotsUnavailableRetry);
+  assert.match(sync.recordFor("snapshots-unavailable@example.com").lastError || "", /额度快照|状态证据/);
+  assert.equal(sync.recordFor("snapshots-unavailable@example.com").quotaRefreshedAt, null);
+  quotaSnapshotsAvailable = true;
+
+  const staleCredential = await writeJob("stale-credential", "stale-credential@example.com", "stale-credential-access", "stale-credential-refresh");
+  const staleCredentialCreated = await sync.syncManual([staleCredential]);
+  const staleCredentialFileName = staleCredentialCreated.results[0].remoteFileName;
+  fileStates.set(staleCredentialFileName, {
+    disabled: false,
+    status: "active",
+    authIndex: "stale-credential-index",
+    listedLastRefresh: "2000-01-01T00:00:00Z",
+  });
+  const staleCredentialQuotaRefreshCount = quotaRefreshRequests.length;
+  const staleCredentialRetry = await writeJob("stale-credential-retry", "stale-credential@example.com", "stale-credential-new-access", "stale-credential-new-refresh");
+  await sync.syncAfterManualReauthorization(staleCredentialRetry);
+  assert.equal(quotaRefreshRequests.length, staleCredentialQuotaRefreshCount, "未确认 CPAMP 已载入本次新凭证时不能继续状态复核");
+  assert.match(sync.recordFor("stale-credential@example.com").lastError || "", /未确认远端已载入本次新凭证/);
+  assert.equal(sync.recordFor("stale-credential@example.com").credentialVerifiedAt, null);
+  assert.equal(sync.recordFor("stale-credential@example.com").quotaRefreshedAt, null);
 
   const externalProblem = await writeJob("external-reauth-problem", "external-problem@example.com", "external-problem-access", "external-problem-refresh");
   const externalProblemCreated = await sync.syncManual([externalProblem]);
@@ -504,6 +662,7 @@ try {
     latest_request: { timestamp_ms: 4_000, failed: true, fail_status_code: 401, fail_summary: "token invalidated" },
     recent_requests: [{ timestamp_ms: 3_000, failed: false, fail_status_code: 200 }],
   });
+  files.set(historyCredentialFileName, { ...files.get(historyCredentialFileName), last_refresh: "1970-01-01T00:00:03.000Z" });
 
   const historyTransientFailure = await writeJob("history-transient-failure", "history-transient@example.com", "history-transient-access", "history-transient-refresh");
   const historyTransientCreated = await sync.syncManual([historyTransientFailure]);
@@ -515,6 +674,7 @@ try {
       { timestamp_ms: 5_000, failed: true, fail_status_code: 503, fail_summary: "upstream unavailable" },
     ],
   });
+  files.set(historyTransientFileName, { ...files.get(historyTransientFileName), last_refresh: "1970-01-01T00:00:04.000Z" });
 
   const quotaRiskOnly = await writeJob("history-quota-risk", "history-quota@example.com", "history-quota-access", "history-quota-refresh");
   const quotaRiskCreated = await sync.syncManual([quotaRiskOnly]);
@@ -530,6 +690,7 @@ try {
     latest_request: { timestamp_ms: 10_000, failed: false, fail_status_code: 200 },
     recent_requests: [{ timestamp_ms: 9_000, failed: true, fail_status_code: 401, fail_summary: "token invalidated" }],
   });
+  files.set(recoveredHistoryFileName, { ...files.get(recoveredHistoryFileName), last_refresh: "1970-01-01T00:00:11.000Z" });
 
   const historyRefresh = await sync.refreshExternalReauth();
   assert.equal(historyRefresh.needsReauthorization, 3, "CPAMP 请求历史的异常账号必须与官方候选合并，而不能因候选存在而提前返回");
