@@ -14,12 +14,15 @@ const baseUrl = `http://127.0.0.1:${port}`;
 const sub2apiPort = await findAvailablePort();
 const sub2apiUrl = `http://127.0.0.1:${sub2apiPort}`;
 let uploadedAccounts = [];
+let rejectSub2ApiEmail = "";
 let remoteErrorAccounts = [];
 const updatedRemoteAccounts = new Map();
 const clearedRemoteAccountIds = new Set();
 const scheduledRemoteAccounts = new Map();
 const clearRemoteCounts = new Map();
 const failClearOnce = new Set();
+const cpampFiles = new Map();
+const supportsConsoleCpampSettings = process.platform === "win32";
 const sub2api = http.createServer(async (req, res) => {
   if (req.headers["x-api-key"] !== "test-admin-key") {
     res.writeHead(401, { "content-type": "application/json" });
@@ -45,7 +48,10 @@ const sub2api = http.createServer(async (req, res) => {
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     uploadedAccounts = body.accounts || [];
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ success: uploadedAccounts.length, failed: 0, results: [] }));
+    const rejected = uploadedAccounts.find((account) => account?.credentials?.email === rejectSub2ApiEmail);
+    res.end(JSON.stringify(rejected
+      ? { success: 0, failed: 1, results: [{ status: "failed", email: rejectSub2ApiEmail, message: "mock rejected credential" }] }
+      : { success: uploadedAccounts.length, failed: 0, results: [] }));
     return;
   }
   if (req.method === "GET" && req.url?.startsWith("/api/v1/admin/accounts?")) {
@@ -119,6 +125,49 @@ const sub2api = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ message: "not found" }));
 });
 await new Promise((resolve) => sub2api.listen(sub2apiPort, "127.0.0.1", resolve));
+const cpampPort = await findAvailablePort();
+const cpampUrl = `http://127.0.0.1:${cpampPort}`;
+const cpamp = http.createServer(async (req, res) => {
+  if (req.headers.authorization !== "Bearer test-cpamp-key") {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ message: "invalid management key" }));
+    return;
+  }
+  const requestUrl = new URL(req.url, cpampUrl);
+  if (req.method === "GET" && requestUrl.pathname === "/auth-files") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ files: [...cpampFiles.entries()].map(([name, payload]) => ({
+      name,
+      email: payload.email,
+      disabled: payload.disabled === true,
+      status: payload.status,
+      failed: payload.failed || 0,
+      status_message: payload.status_message,
+    })) }));
+    return;
+  }
+  if (req.method === "GET" && requestUrl.pathname === "/auth-files/download") {
+    const payload = cpampFiles.get(requestUrl.searchParams.get("name"));
+    if (!payload) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "not found" }));
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(payload));
+    return;
+  }
+  if (req.method === "POST" && requestUrl.pathname === "/auth-files") {
+    const parsed = parseMultipartJson(await readBody(req), String(req.headers["content-type"] || ""));
+    cpampFiles.set(parsed.name, parsed.payload);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ success: true }));
+    return;
+  }
+  res.writeHead(404, { "content-type": "application/json" });
+  res.end(JSON.stringify({ message: "not found" }));
+});
+await new Promise((resolve) => cpamp.listen(cpampPort, "127.0.0.1", resolve));
 const child = spawn(process.execPath, [
   path.join(projectRoot, "src", "console-server.mjs"),
   "--host",
@@ -153,6 +202,21 @@ try {
   assert.equal(bootstrap.features.accountGroups, true);
   assert.equal(bootstrap.features.groupFilter, true);
   const headers = { "content-type": "application/json", "x-console-token": bootstrap.token };
+  if (supportsConsoleCpampSettings) {
+    const cpampConfigResponse = await fetch(`${baseUrl}/api/cpamp/config`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        baseUrl: cpampUrl,
+        managementKey: "test-cpamp-key",
+        autoSyncEnabled: false,
+        syncAfterManualReauthorization: true,
+      }),
+    });
+    const cpampConfigText = await cpampConfigResponse.text();
+    assert.equal(cpampConfigResponse.status, 200, cpampConfigText);
+    assert.equal(JSON.parse(cpampConfigText).syncAfterManualReauthorization, true);
+  }
 
   const pageResponse = await fetch(`${baseUrl}/`);
   assert.equal(pageResponse.status, 200);
@@ -245,6 +309,9 @@ try {
 
   let job = await waitForJob(headers, jobId, (value) => value.status === "completed");
   assert.equal(job.canDownload, true);
+  if (supportsConsoleCpampSettings) {
+    assert.equal(cpampFiles.size, 0, "initial authorization must not use the manual reauthorization switch");
+  }
 
   const filteredJobsResponse = await fetch(`${baseUrl}/api/jobs/query`, {
     method: "POST",
@@ -389,6 +456,9 @@ try {
   job = await waitForJob(headers, jobId, (value) => value.status === "completed" && value.attempt >= 2);
   assert.equal(job.canDownload, true);
   assert.equal(job.lastOperationType, "reauthorize");
+  if (supportsConsoleCpampSettings) {
+    await waitFor(() => cpampAccount("cross-platform@example.com")?.access_token?.startsWith("refreshed-access-"));
+  }
 
   const refreshedResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/download`, { headers });
   const refreshed = await refreshedResponse.json();
@@ -403,6 +473,22 @@ try {
   const profileCreated = await profileResponse.json();
   const profileJob = await waitForJob(headers, profileCreated.job.id, (value) => value.status === "completed");
   assert.equal(profileJob.canDownload, true);
+
+  const batchReauthorizeResponse = await fetch(`${baseUrl}/api/jobs/reauthorize-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId, profileJob.id] }),
+  });
+  const batchReauthorizeText = await batchReauthorizeResponse.text();
+  assert.equal(batchReauthorizeResponse.status, 200, batchReauthorizeText);
+  assert.equal(JSON.parse(batchReauthorizeText).started, 2);
+  await Promise.all([
+    waitForJob(headers, jobId, (value) => value.status === "completed" && value.lastOperationType === "reauthorize" && value.attempt >= 3),
+    waitForJob(headers, profileJob.id, (value) => value.status === "completed" && value.lastOperationType === "reauthorize" && value.attempt >= 2),
+  ]);
+  if (supportsConsoleCpampSettings) {
+    await waitFor(() => cpampAccount("account-profile@example.com")?.access_token?.startsWith("refreshed-access-"));
+  }
 
   const setupTotpResponse = await fetch(`${baseUrl}/api/jobs/${profileJob.id}/setup-2fa`, {
     method: "POST",
@@ -471,6 +557,9 @@ try {
   );
   assert.equal(reloggedJob.hasTotpKey, true);
   assert.equal(reloggedJob.lastOperationType, "relogin");
+  if (supportsConsoleCpampSettings) {
+    await waitFor(() => cpampAccount("cross-platform@example.com")?.access_token?.startsWith("test-access-"));
+  }
   const reloginLogs = await fetch(`${baseUrl}/api/jobs/${jobId}/logs`, { headers }).then((response) => response.json());
   assert.match(reloginLogs.logs, /\[relogin\].*跳过刷新令牌并强制重新登录/);
 
@@ -572,6 +661,9 @@ try {
   await Promise.all([jobId, profileJob.id].map((id) => (
     waitForJob(headers, id, (value) => value.status === "completed" && value.canForceRelogin)
   )));
+  if (supportsConsoleCpampSettings) {
+    await waitFor(() => cpampAccount("account-profile@example.com")?.access_token?.startsWith("test-access-"));
+  }
 
   const addPasswordResponse = await fetch(`${baseUrl}/api/jobs/${jobId}/add-password`, {
     method: "POST",
@@ -587,7 +679,11 @@ try {
     (value) => value.status === "completed" && value.passwordAddedAt,
   );
   assert.equal(passwordAddedJob.lastOperationType, "add_password");
-  assert.equal(passwordAddedJob.passwordAddError, null);
+  if (process.platform === "linux") {
+    assert.match(passwordAddedJob.passwordAddError || "", /不支持持久凭据存储/);
+  } else {
+    assert.equal(passwordAddedJob.passwordAddError, null);
+  }
   assert.equal(passwordAddedJob.canAddPassword, false);
 
   const passwordSourceResponse = await fetch(`${baseUrl}/api/jobs/export-source`, {
@@ -623,7 +719,11 @@ try {
     profileJob.id,
     (value) => value.status === "completed" && value.passwordAddedAt,
   );
-  assert.equal(profilePasswordAdded.passwordAddError, null);
+  if (process.platform === "linux") {
+    assert.match(profilePasswordAdded.passwordAddError || "", /不支持持久凭据存储/);
+  } else {
+    assert.equal(profilePasswordAdded.passwordAddError, null);
+  }
   assert.equal(profilePasswordAdded.canAddPassword, false);
 
   const incompleteAuthorizationResponse = await fetch(`${baseUrl}/api/jobs`, {
@@ -657,7 +757,11 @@ try {
   assert.equal(incompletePasswordAdded.canRetry, true);
   assert.equal(incompletePasswordAdded.canAddPassword, false);
   assert.equal(incompletePasswordAdded.loginMode, "password");
-  assert.match(incompletePasswordAdded.prompt, /可以继续未完成的 Codex 授权/);
+  if (process.platform === "linux") {
+    assert.match(incompletePasswordAdded.prompt, /新密码未能持久保存/);
+  } else {
+    assert.match(incompletePasswordAdded.prompt, /可以继续未完成的 Codex 授权/);
+  }
   const incompletePasswordLogs = await fetch(`${baseUrl}/api/jobs/${incompleteAuthorizationId}/logs`, { headers })
     .then((response) => response.json());
   assert.match(incompletePasswordLogs.logs, /Reusing verified login checkpoint/);
@@ -820,6 +924,115 @@ try {
   });
   assert.equal(invalidFingerprintUploadResponse.status, 400, await invalidFingerprintUploadResponse.text());
 
+  const automaticSyncConfig = {
+    baseUrl: sub2apiUrl,
+    adminApiKey: "test-admin-key",
+    groupIds: ["7"],
+    codexFingerprintMode: "session",
+  };
+  const automaticSyncSaveResponse = await fetch(`${baseUrl}/api/sub2api/monitor`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      enabled: false,
+      autoSyncEnabled: true,
+      syncAfterManualReauthorization: true,
+      config: automaticSyncConfig,
+    }),
+  });
+  const automaticSyncSaveText = await automaticSyncSaveResponse.text();
+  assert.equal(automaticSyncSaveResponse.status, 200, automaticSyncSaveText);
+  const automaticSyncSaved = JSON.parse(automaticSyncSaveText);
+  assert.equal(automaticSyncSaved.enabled, false, "automatic sync settings must not enable pool monitoring");
+  assert.equal(automaticSyncSaved.autoSyncEnabled, true);
+  assert.equal(automaticSyncSaved.syncAfterManualReauthorization, true);
+  const storedAutomaticSyncConfig = JSON.parse(await fs.readFile(path.join(outputRoot, "sub2api-monitor.json"), "utf8"));
+  assert.equal(storedAutomaticSyncConfig.enabled, false);
+  assert.equal(storedAutomaticSyncConfig.autoSyncEnabled, true);
+  assert.equal(storedAutomaticSyncConfig.syncAfterManualReauthorization, true);
+
+  const automaticManualReauthorizationResponse = await fetch(`${baseUrl}/api/jobs/reauthorize-batch`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [jobId, profileJob.id] }),
+  });
+  const automaticManualReauthorizationText = await automaticManualReauthorizationResponse.text();
+  assert.equal(automaticManualReauthorizationResponse.status, 200, automaticManualReauthorizationText);
+  await Promise.all([
+    waitForJob(headers, jobId, (value) => value.status === "completed" && value.sub2ApiSync?.state === "synced"),
+    waitForJob(headers, profileJob.id, (value) => value.status === "completed" && value.sub2ApiSync?.state === "synced"),
+  ]);
+
+  const automaticPendingCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: "sub2api-auto-pending@example.com" }),
+  });
+  const automaticPendingCreateText = await automaticPendingCreateResponse.text();
+  assert.equal(automaticPendingCreateResponse.status, 201, automaticPendingCreateText);
+  const automaticPendingJobId = JSON.parse(automaticPendingCreateText).job.id;
+  const automaticPendingJob = await waitForJob(
+    headers,
+    automaticPendingJobId,
+    (value) => value.status === "completed" && value.sub2ApiSync?.state === "pending_confirmation",
+  );
+  const automaticSyncStatus = await fetch(`${baseUrl}/api/sub2api/monitor`, { headers }).then((response) => response.json());
+  assert.equal(automaticSyncStatus.pendingCount, 1);
+  assert.equal(automaticSyncStatus.pending[0].pendingJobId, automaticPendingJob.id);
+  assert.equal(automaticSyncStatus.enabled, false);
+
+  const pendingSub2ApiQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, sub2ApiState: "pending_confirmation" }),
+  });
+  const pendingSub2ApiQueryText = await pendingSub2ApiQueryResponse.text();
+  assert.equal(pendingSub2ApiQueryResponse.status, 200, pendingSub2ApiQueryText);
+  assert.equal(JSON.parse(pendingSub2ApiQueryText).jobs.some((item) => item.id === automaticPendingJobId), true);
+
+  const approveAutomaticSyncResponse = await fetch(`${baseUrl}/api/sub2api/approve`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [automaticPendingJobId] }),
+  });
+  const approveAutomaticSyncText = await approveAutomaticSyncResponse.text();
+  assert.equal(approveAutomaticSyncResponse.status, 200, approveAutomaticSyncText);
+  assert.equal(JSON.parse(approveAutomaticSyncText).uploaded, 1);
+  const approvedAutomaticJob = await waitForJob(headers, automaticPendingJobId, (value) => value.sub2ApiSync?.state === "synced");
+  assert.equal(approvedAutomaticJob.sub2ApiSync.lastError, null);
+
+  rejectSub2ApiEmail = "sub2api-manual-failure@example.com";
+  const manualFailureCreateResponse = await fetch(`${baseUrl}/api/jobs`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ email: rejectSub2ApiEmail }),
+  });
+  const manualFailureCreateText = await manualFailureCreateResponse.text();
+  assert.equal(manualFailureCreateResponse.status, 201, manualFailureCreateText);
+  const manualFailureJobId = JSON.parse(manualFailureCreateText).job.id;
+  await waitForJob(headers, manualFailureJobId, (value) => value.status === "completed" && value.sub2ApiSync?.state === "pending_confirmation");
+  const rejectApproveResponse = await fetch(`${baseUrl}/api/sub2api/approve`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ ids: [manualFailureJobId] }),
+  });
+  const rejectApproveText = await rejectApproveResponse.text();
+  assert.equal(rejectApproveResponse.status, 200, rejectApproveText);
+  const rejectApprove = JSON.parse(rejectApproveText);
+  assert.equal(rejectApprove.failed, 1);
+  assert.match(rejectApprove.results[0].error, /mock rejected credential/);
+  const failedAutomaticJob = await waitForJob(headers, manualFailureJobId, (value) => value.sub2ApiSync?.state === "failed");
+  assert.match(failedAutomaticJob.sub2ApiSync.lastError, /mock rejected credential/);
+  const failedSub2ApiQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, sub2ApiState: "failed" }),
+  });
+  const failedSub2ApiQueryText = await failedSub2ApiQueryResponse.text();
+  assert.equal(failedSub2ApiQueryResponse.status, 200, failedSub2ApiQueryText);
+  assert.equal(JSON.parse(failedSub2ApiQueryText).jobs.some((item) => item.id === manualFailureJobId), true);
+  rejectSub2ApiEmail = "";
+
   const mailApiUrl = `${baseUrl}/api/bootstrap`;
   const sourceLines = [
     `password-mail@example.com---test-password----${mailApiUrl}`,
@@ -980,6 +1193,65 @@ try {
   const monitorSaved = JSON.parse(monitorSaveText);
   assert.equal(monitorSaved.enabled, true);
   assert.equal(monitorSaved.configured, true);
+
+  if (supportsConsoleCpampSettings) {
+    cpampFiles.set("external-cpamp-problem.json", {
+      email: "cross-platform@example.com",
+      disabled: true,
+      status: "disabled",
+      failed: 2,
+      status_message: "refresh token expired",
+    });
+    cpampFiles.set("external-cpamp-manually-disabled.json", {
+      email: "account-profile@example.com",
+      disabled: true,
+      status: "disabled",
+      failed: 0,
+    });
+  }
+  remoteErrorAccounts = [{
+    id: 90,
+    name: "oauth---cross-platform@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "error",
+    error_message: "refresh token expired",
+    credentials: { email: "cross-platform@example.com" },
+    group_ids: [7],
+  }, {
+    id: 89,
+    name: "oauth---missing-local@example.com",
+    platform: "openai",
+    type: "oauth",
+    status: "error",
+    error_message: "token invalid",
+    credentials: { email: "missing-local@example.com" },
+    group_ids: [7],
+  }];
+  const externalRefreshResponse = await fetch(`${baseUrl}/api/external-reauth/refresh`, { method: "POST", headers });
+  const externalRefreshText = await externalRefreshResponse.text();
+  assert.equal(externalRefreshResponse.status, 200, externalRefreshText);
+  const externalRefresh = JSON.parse(externalRefreshText);
+  assert.equal(externalRefresh.externalReauth.sub2api.count, 2);
+  assert.equal(externalRefresh.externalReauth.sub2api.matchedCount, 1);
+  assert.equal(externalRefresh.missingTask, supportsConsoleCpampSettings ? 1 : 1);
+  if (supportsConsoleCpampSettings) {
+    assert.equal(externalRefresh.externalReauth.cpamp.count, 1, "仅手动禁用的 CPAMP 账号不能列入需重登");
+    assert.equal(externalRefresh.externalReauth.cpamp.matchedCount, 1);
+  }
+  const externalQueryResponse = await fetch(`${baseUrl}/api/jobs/query`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, externalReauth: "any" }),
+  });
+  const externalQueryText = await externalQueryResponse.text();
+  assert.equal(externalQueryResponse.status, 200, externalQueryText);
+  const externalJobs = JSON.parse(externalQueryText).jobs;
+  assert.equal(externalJobs.length, 1);
+  assert.equal(externalJobs[0].id, jobId);
+  assert.equal(externalJobs[0].externalReauth.sources.some((entry) => entry.source === "sub2api"), true);
+  if (supportsConsoleCpampSettings) assert.equal(externalJobs[0].externalReauth.sources.some((entry) => entry.source === "cpamp"), true);
+  assert.equal(updatedRemoteAccounts.has(90), false, "只刷新外部异常不能触发自动重新登录或更新远端账号");
 
   remoteErrorAccounts = [{
     id: 91,
@@ -1175,13 +1447,15 @@ try {
       phoneFallbackJobId,
       incompleteAuthorizationId,
       incompleteTotpId,
+      automaticPendingJobId,
+      manualFailureJobId,
     ] }),
   });
   if (!deleteResponse.ok) {
     throw new Error(`delete request failed with HTTP ${deleteResponse.status}: ${await deleteResponse.text()}`);
   }
   const deleted = await deleteResponse.json();
-  assert.equal(deleted.deleted, 27);
+  assert.equal(deleted.deleted, 29);
 
   const finalPage = await (await fetch(`${baseUrl}/api/jobs`, { headers })).json();
   assert.equal(finalPage.pagination.total, 0);
@@ -1193,6 +1467,7 @@ try {
   if (isRunning(child)) child.kill("SIGKILL");
   await Promise.race([childExit, delay(2_000)]);
   await new Promise((resolve) => sub2api.close(resolve));
+  await new Promise((resolve) => cpamp.close(resolve));
   await fs.rm(outputRoot, { recursive: true, force: true });
 }
 
@@ -1258,6 +1533,27 @@ function findAvailablePort() {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cpampAccount(email) {
+  return [...cpampFiles.values()].find((account) => account.email === email) || null;
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function parseMultipartJson(raw, contentType) {
+  const boundary = /boundary=([^;]+)/i.exec(contentType)?.[1]?.replace(/^\"|\"$/g, "");
+  assert.ok(boundary, "expected CPAMP multipart boundary");
+  const name = /filename=\"([^\"]+)\"/i.exec(raw)?.[1];
+  assert.ok(name, "expected CPAMP uploaded file name");
+  const contentStart = raw.indexOf("\r\n\r\n");
+  const contentEnd = raw.indexOf(`\r\n--${boundary}`, contentStart);
+  assert.ok(contentStart >= 0 && contentEnd > contentStart, "expected CPAMP uploaded JSON body");
+  return { name, payload: JSON.parse(raw.slice(contentStart + 4, contentEnd)) };
 }
 
 function isRunning(processHandle) {

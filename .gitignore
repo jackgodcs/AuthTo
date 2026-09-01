@@ -12,3 +12,9 @@ chatgpt-protocol-session.json
 sub2api-import*.json
 login-checkpoint.json
 job-meta.json
+account-groups.json
+sub2api-monitor.json
+cpamp-sync.json
+*.dpapi
+python/
+docs/console.png

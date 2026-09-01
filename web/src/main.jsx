@@ -66,6 +66,20 @@ const STATUS_FILTER_OPTIONS = [
   ["reauth_required", "待重新授权"],
   ["resume_available", "可继续"],
 ];
+const EXTERNAL_SYNC_FILTER_OPTIONS = [
+  ["", "全部"],
+  ["pending_confirmation", "待确认"],
+  ["syncing", "同步中"],
+  ["retrying", "重试中"],
+  ["failed", "同步失败"],
+  ["synced", "已同步"],
+];
+const EXTERNAL_REAUTH_FILTER_OPTIONS = [
+  ["", "全部"],
+  ["any", "任一外部站点"],
+  ["cpamp", "CPAMP"],
+  ["sub2api", "Sub2API"],
+];
 const SMS_PROVIDER_EXTERNAL_LINKS = {
   luban: {
     href: "https://lubansms.com/",
@@ -96,6 +110,9 @@ function App() {
   const [emailFilter, setEmailFilter] = useState([]);
   const [statusFilter, setStatusFilter] = useState("");
   const [groupFilter, setGroupFilter] = useState("");
+  const [cpampStateFilter, setCpampStateFilter] = useState("");
+  const [sub2apiStateFilter, setSub2apiStateFilter] = useState("");
+  const [externalReauthFilter, setExternalReauthFilter] = useState("");
   const [accountGroups, setAccountGroups] = useState([]);
   const [groupDialogOpen, setGroupDialogOpen] = useState(false);
   const [groupTarget, setGroupTarget] = useState("");
@@ -141,7 +158,23 @@ function App() {
     lastError: null,
     lastResult: null,
     intervalMinutes: 5,
+    autoSyncEnabled: false,
+    syncAfterManualReauthorization: false,
+    pending: [], pendingCount: 0, syncingCount: 0, retryingCount: 0, failedCount: 0, attention: [],
   });
+  const [cpampStatus, setCpampStatus] = useState({
+    configured: false, baseUrl: null, autoSyncEnabled: false, syncAfterManualReauthorization: false, pending: [], pendingCount: 0, syncingCount: 0, retryingCount: 0, failedCount: 0, attention: [], lastError: null,
+    policy: defaultCpampPolicy(),
+    inspection: { enabled: false, running: false, lastCheckAt: null, lastError: null, lastResult: null, intervalMinutes: 5 },
+  });
+  const [cpampSettingsOpen, setCpampSettingsOpen] = useState(false);
+  const [cpampSettingsDraft, setCpampSettingsDraft] = useState({ baseUrl: "", managementKey: "", autoSyncEnabled: false, syncAfterManualReauthorization: false, policy: defaultCpampPolicy(), inspectionEnabled: false });
+  const [cpampSettingsError, setCpampSettingsError] = useState("");
+  const [cpampSettingsSaving, setCpampSettingsSaving] = useState(false);
+  const [cpampModels, setCpampModels] = useState([]);
+  const [cpampModelsLoading, setCpampModelsLoading] = useState(false);
+  const [cpampInspectionChecking, setCpampInspectionChecking] = useState(false);
+  const [externalReauthChecking, setExternalReauthChecking] = useState(false);
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
 
@@ -179,13 +212,13 @@ function App() {
     let stopped = false;
     let timer;
     const search = accountSearch.trim();
-    const hasQuery = emailFilter.length || statusFilter || groupFilter || search;
+    const hasQuery = emailFilter.length || statusFilter || groupFilter || cpampStateFilter || sub2apiStateFilter || externalReauthFilter || search;
     const poll = async () => {
       try {
         const data = hasQuery
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, pageSize, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(search ? { search } : {}) }),
+              body: JSON.stringify({ page, pageSize, ...(emailFilter.length ? { emails: emailFilter } : {}), ...(statusFilter ? { status: statusFilter } : {}), ...(groupFilter ? { groupId: groupFilter } : {}), ...(cpampStateFilter ? { cpampState: cpampStateFilter } : {}), ...(sub2apiStateFilter ? { sub2ApiState: sub2apiStateFilter } : {}), ...(externalReauthFilter ? { externalReauth: externalReauthFilter } : {}), ...(search ? { search } : {}) }),
             })
           : await apiFetch(token, `/api/jobs?page=${page}&pageSize=${pageSize}`);
         if (!stopped) {
@@ -208,7 +241,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, pageSize, emailFilter, statusFilter, groupFilter, accountSearch]);
+  }, [token, page, pageSize, emailFilter, statusFilter, groupFilter, cpampStateFilter, sub2apiStateFilter, externalReauthFilter, accountSearch]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -218,7 +251,12 @@ function App() {
         const data = await apiFetch(token, "/api/sub2api/monitor");
         if (!stopped) {
           setSub2apiMonitorStatus(data);
-          setSub2apiSettings((current) => ({ ...current, monitorEnabled: Boolean(data.enabled) }));
+          setSub2apiSettings((current) => ({
+            ...current,
+            monitorEnabled: Boolean(data.enabled),
+            autoSyncEnabled: Boolean(data.autoSyncEnabled),
+            syncAfterManualReauthorization: Boolean(data.syncAfterManualReauthorization),
+          }));
         }
       } catch {}
     };
@@ -229,6 +267,22 @@ function App() {
       window.clearInterval(timer);
     };
   }, [token, features.sub2apiMonitor]);
+
+  useEffect(() => {
+    if (!token || !features.cpampSync) return undefined;
+    let stopped = false;
+    const load = async () => {
+      try {
+        const data = await apiFetch(token, "/api/cpamp/status");
+        if (!stopped) setCpampStatus(data);
+      } catch (requestError) {
+        if (!stopped) setError(requestError.message);
+      }
+    };
+    void load();
+    const timer = window.setInterval(load, 3_000);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [token, features.cpampSync]);
 
   const pageJobIds = useMemo(() => jobs.map((job) => job.id), [jobs]);
   const matchingJobIds = useMemo(() => jobSelectionIndex.map((job) => job.id), [jobSelectionIndex]);
@@ -248,7 +302,7 @@ function App() {
   const downloadableSelectedCount = selectedJobs.filter((job) => job.canDownload).length;
   const allPageSelected = pageJobIds.length > 0 && pageJobIds.every((id) => selectedJobIds.has(id));
   const allMatchingSelected = matchingJobIds.length > 0 && matchingJobIds.every((id) => selectedJobIds.has(id));
-  const hasJobFilters = Boolean(emailFilter.length || statusFilter || groupFilter || accountSearch.trim());
+  const hasJobFilters = Boolean(emailFilter.length || statusFilter || groupFilter || cpampStateFilter || sub2apiStateFilter || externalReauthFilter || accountSearch.trim());
   const canDownloadSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && downloadableSelectedCount > 0;
   const canReauthorizeSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
@@ -257,6 +311,12 @@ function App() {
   const canForceReloginSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && forceReloginSelectedCount > 0;
   const canUploadSelected = selectedJobs.length > 0 && downloadableSelectedCount > 0;
+  const pendingCpampSelectedCount = selectedJobs.filter((job) => job.cpampSync?.state === "pending_confirmation").length;
+  const pendingSub2ApiSelectedCount = selectedJobs.filter((job) => job.sub2ApiSync?.state === "pending_confirmation").length;
+  const externalReauthMatchedCount = Number(cpampStatus.externalReauth?.cpamp?.matchedCount || 0)
+    + Number(sub2apiMonitorStatus.externalReauth?.sub2api?.matchedCount || 0);
+  const externalReauthMissingCount = Number(cpampStatus.externalReauth?.cpamp?.missingTaskCount || 0)
+    + Number(sub2apiMonitorStatus.externalReauth?.sub2api?.missingTaskCount || 0);
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
@@ -303,9 +363,82 @@ function App() {
   }
 
   function openSub2ApiSettings() {
-    setSub2apiSettingsDraft({ ...sub2apiSettings, monitorEnabled: Boolean(sub2apiMonitorStatus.enabled) });
+    setSub2apiSettingsDraft({
+      ...sub2apiSettings,
+      monitorEnabled: Boolean(sub2apiMonitorStatus.enabled),
+      autoSyncEnabled: Boolean(sub2apiMonitorStatus.autoSyncEnabled),
+      syncAfterManualReauthorization: Boolean(sub2apiMonitorStatus.syncAfterManualReauthorization),
+    });
     setSub2apiSettingsError("");
     setSub2apiSettingsOpen(true);
+  }
+
+  function openCpampSettings() {
+    setCpampSettingsDraft({
+      baseUrl: cpampStatus.baseUrl || "",
+      managementKey: "",
+      autoSyncEnabled: Boolean(cpampStatus.autoSyncEnabled),
+      syncAfterManualReauthorization: Boolean(cpampStatus.syncAfterManualReauthorization),
+      policy: normalizeCpampPolicy(cpampStatus.policy),
+      inspectionEnabled: Boolean(cpampStatus.inspection?.enabled),
+    });
+    setCpampModels([]);
+    setCpampSettingsError("");
+    setCpampSettingsOpen(true);
+  }
+
+  async function saveCpampSettings(event) {
+    event.preventDefault();
+    const baseUrl = String(cpampSettingsDraft.baseUrl || "").trim().replace(/\/+$/, "");
+    if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
+      setCpampSettingsError("请输入 http:// 或 https:// 开头的 CPAMP API 根地址");
+      return;
+    }
+    if (!cpampStatus.configured && !String(cpampSettingsDraft.managementKey || "").trim()) {
+      setCpampSettingsError("请输入 CPAMP 管理密钥");
+      return;
+    }
+    setCpampSettingsSaving(true);
+    setCpampSettingsError("");
+    try {
+      const nextStatus = await apiFetch(token, "/api/cpamp/config", {
+        method: "POST",
+        body: JSON.stringify({
+          baseUrl,
+          managementKey: String(cpampSettingsDraft.managementKey || "").trim(),
+          autoSyncEnabled: cpampSettingsDraft.autoSyncEnabled === true,
+          syncAfterManualReauthorization: cpampSettingsDraft.syncAfterManualReauthorization === true,
+          policy: cpampSettingsDraft.policy,
+          inspectionEnabled: cpampSettingsDraft.inspectionEnabled === true,
+        }),
+      });
+      setCpampStatus(nextStatus);
+      setCpampSettingsOpen(false);
+      setUploadNotice(`CPAMP 已连接${nextStatus.autoSyncEnabled ? "，已启用以后完成任务的自动同步" : ""}${nextStatus.syncAfterManualReauthorization ? "，手动重新授权成功后会自动同步" : ""}`);
+      setError("");
+    } catch (requestError) {
+      setCpampSettingsError(requestError.message);
+    } finally {
+      setCpampSettingsSaving(false);
+    }
+  }
+
+  async function loadCpampModels() {
+    if (!cpampStatus.configured) {
+      setCpampSettingsError("请先保存 CPAMP 服务器地址和管理密钥，再读取模型目录");
+      return;
+    }
+    setCpampModelsLoading(true);
+    setCpampSettingsError("");
+    try {
+      const data = await apiFetch(token, "/api/cpamp/options");
+      setCpampModels(Array.isArray(data.models) ? data.models : []);
+    } catch (requestError) {
+      setCpampModels([]);
+      setCpampSettingsError(requestError.message);
+    } finally {
+      setCpampModelsLoading(false);
+    }
   }
 
   async function loadSub2ApiOptions(settings = sub2apiSettingsDraft) {
@@ -348,7 +481,12 @@ function App() {
     try {
       const monitor = await apiFetch(token, "/api/sub2api/monitor", {
         method: "POST",
-        body: JSON.stringify({ enabled: nextSettings.monitorEnabled, config: nextSettings }),
+        body: JSON.stringify({
+          enabled: nextSettings.monitorEnabled,
+          autoSyncEnabled: nextSettings.autoSyncEnabled,
+          syncAfterManualReauthorization: nextSettings.syncAfterManualReauthorization,
+          config: nextSettings,
+        }),
       });
       setSub2apiSettings(nextSettings);
       setSub2apiMonitorStatus(monitor);
@@ -401,10 +539,7 @@ function App() {
         method: "POST",
         body: JSON.stringify({ ids, config: sub2apiSettings }),
       });
-      const result = data.result || {};
-      const created = result.account_created ?? result.success ?? data.uploaded;
-      const failed = result.account_failed ?? result.failed ?? 0;
-      setUploadNotice(`已上传 ${created} 条${failed ? `，失败 ${failed} 条` : ""}${data.skipped ? `，跳过未完成任务 ${data.skipped} 条` : ""}`);
+      setUploadNotice(formatSub2ApiResult(data));
       setSelectedJobIds(new Set());
       setError("");
     } catch (requestError) {
@@ -561,6 +696,9 @@ function App() {
     setFilterText("");
     setStatusFilter("");
     setGroupFilter("");
+    setCpampStateFilter("");
+    setSub2apiStateFilter("");
+    setExternalReauthFilter("");
     setAccountSearch("");
     setSelectedJobIds(new Set());
     setExpandedJobId(null);
@@ -586,6 +724,184 @@ function App() {
       });
       return next;
     });
+  }
+
+  async function syncSelectedToCpamp(ids) {
+    if (!cpampStatus.configured) {
+      openCpampSettings();
+      setCpampSettingsError("请先配置 CPAMP API 根地址和管理密钥");
+      return;
+    }
+    if (batchAction) return;
+    const selected = selectedJobs.filter((job) => ids.includes(job.id) && job.canDownload);
+    if (!selected.length) {
+      setError("请选择至少一条已完成的 OAuth 授权任务");
+      return;
+    }
+    const domain = displayCpampHost(cpampStatus.baseUrl);
+    if (!window.confirm(`确定将 ${selected.length} 个账号的 OAuth 授权信息同步到 ${domain} 吗？这会向该服务器发送访问令牌和刷新令牌，并为相同邮箱更新已有凭证。`)) return;
+    setBatchAction("cpamp-sync");
+    try {
+      const result = await apiFetch(token, "/api/cpamp/sync", { method: "POST", body: JSON.stringify({ ids }) });
+      setUploadNotice(formatCpampResult(result));
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function applyCpampPolicyToSelected() {
+    if (!cpampStatus.configured) {
+      openCpampSettings();
+      setCpampSettingsError("请先配置 CPAMP API 根地址和管理密钥");
+      return;
+    }
+    if (batchAction) return;
+    const selected = selectedJobs.filter((job) => job.canDownload);
+    if (!selected.length) {
+      setError("请选择至少一条已完成的 OAuth 授权任务");
+      return;
+    }
+    const domain = displayCpampHost(cpampStatus.baseUrl);
+    if (!window.confirm(`确定强制将 CPAMP 同步策略应用到 ${selected.length} 个账号吗？这会覆盖 ${domain} 上对应账号的代理、优先级、调度权重、启停状态和模型限制。`)) return;
+    if (!window.confirm("请再次确认：此操作会替换上述远端设置，但不会修改 CPAMP 备注。")) return;
+    setBatchAction("cpamp-policy");
+    try {
+      const result = await apiFetch(token, "/api/cpamp/apply-policy", {
+        method: "POST",
+        body: JSON.stringify({ ids: selected.map((job) => job.id) }),
+      });
+      setUploadNotice(`${formatCpampResult(result)}，已强制应用同步策略`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function checkCpampInspectionNow() {
+    if (!cpampStatus.configured || !cpampStatus.inspection?.enabled || cpampInspectionChecking) return;
+    setCpampInspectionChecking(true);
+    try {
+      const result = await apiFetch(token, "/api/cpamp/inspection/check", { method: "POST" });
+      setUploadNotice(formatCpampInspectionResult(result));
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setCpampInspectionChecking(false);
+    }
+  }
+
+  async function refreshExternalReauthorization() {
+    if (externalReauthChecking) return;
+    setExternalReauthChecking(true);
+    try {
+      const result = await apiFetch(token, "/api/external-reauth/refresh", { method: "POST" });
+      const cpampCount = Number(result?.externalReauth?.cpamp?.count || 0);
+      const sub2apiCount = Number(result?.externalReauth?.sub2api?.count || 0);
+      const missing = Number(result?.missingTask || 0);
+      const failures = Array.isArray(result?.failures) ? result.failures : [];
+      const failureText = failures.length
+        ? `，未读取 ${failures.map((item) => item.source === "cpamp" ? "CPAMP" : "Sub2API").join("、")}`
+        : "";
+      setUploadNotice(`外部需重登账号已刷新：CPAMP ${cpampCount} 个，Sub2API ${sub2apiCount} 个${missing ? `，本地未找到 ${missing} 个` : ""}${failureText}`);
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setExternalReauthChecking(false);
+    }
+  }
+
+  async function approveSelectedCpampSync() {
+    if (batchAction) return;
+    const pending = selectedJobs.filter((job) => job.cpampSync?.state === "pending_confirmation");
+    if (!pending.length) {
+      setError("请选择至少一条待确认的 CPAMP 同步任务");
+      return;
+    }
+    const domain = displayCpampHost(cpampStatus.baseUrl);
+    if (!window.confirm(`确定允许将 ${pending.length} 个账号的 OAuth 授权信息发送到 ${domain} 吗？确认后，这些邮箱以后新完成的授权会自动更新到该服务器。`)) return;
+    setBatchAction("cpamp-approve");
+    try {
+      const result = await apiFetch(token, "/api/cpamp/approve", {
+        method: "POST",
+        body: JSON.stringify({ ids: pending.map((job) => job.id) }),
+      });
+      setUploadNotice(formatCpampResult(result));
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  async function approveSelectedSub2ApiSync() {
+    if (batchAction) return;
+    const pending = selectedJobs.filter((job) => job.sub2ApiSync?.state === "pending_confirmation");
+    if (!pending.length) {
+      setError("请选择至少一条待确认的 Sub2API 同步任务");
+      return;
+    }
+    const domain = displaySub2ApiHost(sub2apiMonitorStatus.baseUrl || sub2apiSettings.baseUrl);
+    if (!window.confirm(`确定允许将 ${pending.length} 个账号的 OAuth 授权信息发送到 ${domain} 吗？确认后，这些邮箱以后新完成的授权会自动更新到该服务器。`)) return;
+    setBatchAction("sub2api-approve");
+    try {
+      const result = await apiFetch(token, "/api/sub2api/approve", {
+        method: "POST",
+        body: JSON.stringify({ ids: pending.map((job) => job.id) }),
+      });
+      setUploadNotice(formatSub2ApiResult(result));
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBatchAction("");
+    }
+  }
+
+  function focusExternalSync(system, state, entries = []) {
+    const ids = entries.map((item) => item.jobId || item.pendingJobId).filter(Boolean);
+    setCpampStateFilter(system === "cpamp" ? state : "");
+    setSub2apiStateFilter(system === "sub2api" ? state : "");
+    setExternalReauthFilter("");
+    setEmailFilter([]);
+    setFilterText("");
+    setAccountSearch("");
+    setSelectedJobIds(new Set(ids));
+    setExpandedJobId(null);
+    setPage(1);
+  }
+
+  async function focusExternalReauthorization(source) {
+    setCpampStateFilter("");
+    setSub2apiStateFilter("");
+    setExternalReauthFilter(source);
+    setEmailFilter([]);
+    setFilterText("");
+    setAccountSearch("");
+    setSelectedJobIds(new Set());
+    setExpandedJobId(null);
+    setPage(1);
+    try {
+      const data = await apiFetch(token, "/api/jobs/query", {
+        method: "POST",
+        body: JSON.stringify({ page: 1, pageSize, externalReauth: source }),
+      });
+      setSelectedJobIds(new Set((data.selection || []).map((job) => job.id)));
+      setError("");
+    } catch (requestError) {
+      setError(requestError.message);
+    }
   }
 
   function selectAllMatchingJobs() {
@@ -922,6 +1238,29 @@ function App() {
                   : "号池监控未启用"}
             </span>
           )}
+          <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.autoSyncEnabled ? "" : "incomplete"}`}>
+            {sub2apiMonitorStatus.autoSyncEnabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+            {sub2apiMonitorStatus.autoSyncEnabled ? "新完成任务自动同步" : "自动同步未启用"}
+          </span>
+          <span className={`provider-ready monitor-ready ${sub2apiMonitorStatus.syncAfterManualReauthorization ? "" : "incomplete"}`}>
+            {sub2apiMonitorStatus.syncAfterManualReauthorization ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+            {sub2apiMonitorStatus.syncAfterManualReauthorization ? "手动重新授权后自动同步" : "手动重新授权后不自动同步"}
+          </span>
+          {sub2apiMonitorStatus.pendingCount > 0 && (
+            <button type="button" className="sync-attention-button" onClick={() => focusExternalSync("sub2api", "pending_confirmation", sub2apiMonitorStatus.pending)} title="查看并确认待同步的 Sub2API 账号">
+              <CircleAlert size={14} />待确认 {sub2apiMonitorStatus.pendingCount} 个账号
+            </button>
+          )}
+          {sub2apiMonitorStatus.failedCount > 0 && (
+            <button type="button" className="sync-attention-button error" onClick={() => focusExternalSync("sub2api", "failed", sub2apiMonitorStatus.attention)} title="查看 Sub2API 同步失败的账号和原因">
+              <CircleAlert size={14} />同步失败 {sub2apiMonitorStatus.failedCount} 个
+            </button>
+          )}
+          {sub2apiMonitorStatus.externalReauth?.sub2api?.count > 0 && (
+            <button type="button" className="sync-attention-button error" onClick={() => focusExternalReauthorization("sub2api")} title="查看 Sub2API 标记为需重新登录的本地账号">
+              <LogIn size={14} />需重登 {sub2apiMonitorStatus.externalReauth.sub2api.matchedCount} 个
+            </button>
+          )}
           {features.sub2apiMonitor && sub2apiMonitorStatus.enabled && (
             <button
               type="button"
@@ -937,6 +1276,76 @@ function App() {
             <Settings2 size={16} />配置
           </button>
         </div>
+
+        {features.cpampSync && (
+          <div className="provider-toolbar cpamp-toolbar" aria-label="CPAMP 授权同步配置">
+            <div className="provider-heading"><Send size={17} /><strong>CPAMP 同步</strong></div>
+            <span className="provider-name">{cpampStatus.baseUrl || "未配置服务器"}</span>
+            <span className={`provider-ready ${cpampStatus.configured ? "" : "incomplete"}`}>
+              {cpampStatus.configured ? <Check size={14} /> : <CircleAlert size={14} />}
+              {cpampStatus.configured ? "已连接，本机加密保存密钥" : "未完成配置"}
+            </span>
+            <span className={`provider-ready monitor-ready ${cpampStatus.autoSyncEnabled ? "" : "incomplete"}`}>
+              {cpampStatus.autoSyncEnabled ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+              {cpampStatus.autoSyncEnabled ? "新完成任务自动同步" : "自动同步未启用"}
+            </span>
+            <span className={`provider-ready monitor-ready ${cpampStatus.syncAfterManualReauthorization ? "" : "incomplete"}`}>
+              {cpampStatus.syncAfterManualReauthorization ? <ShieldCheck size={14} /> : <CircleAlert size={14} />}
+              {cpampStatus.syncAfterManualReauthorization ? "手动重新授权后自动同步" : "手动重新授权后不自动同步"}
+            </span>
+            {cpampStatus.inspection?.enabled && (
+              <>
+                <span className={`provider-ready monitor-ready ${cpampInspectionIssueCount(cpampStatus.inspection?.lastResult) ? "incomplete" : ""}`}>
+                  {cpampInspectionIssueCount(cpampStatus.inspection?.lastResult) ? <CircleAlert size={14} /> : <ShieldCheck size={14} />}
+                  {cpampInspectionSummary(cpampStatus.inspection)}
+                </span>
+                <button
+                  type="button"
+                  className="icon-button monitor-check-button"
+                  onClick={checkCpampInspectionNow}
+                  disabled={cpampInspectionChecking || cpampStatus.inspection?.running}
+                  title="立即检查 CPAMP 同步关联"
+                >
+                  <RefreshCw className={cpampInspectionChecking || cpampStatus.inspection?.running ? "spin" : ""} size={16} />
+                </button>
+              </>
+            )}
+            {cpampStatus.pendingCount > 0 && (
+              <button type="button" className="sync-attention-button" onClick={() => focusExternalSync("cpamp", "pending_confirmation", cpampStatus.pending)} title="查看并确认待同步的 CPAMP 账号">
+                <CircleAlert size={14} />待确认 {cpampStatus.pendingCount} 个账号
+              </button>
+            )}
+            {cpampStatus.failedCount > 0 && (
+              <button type="button" className="sync-attention-button error" onClick={() => focusExternalSync("cpamp", "failed", cpampStatus.attention)} title="查看 CPAMP 同步失败的账号和原因">
+                <CircleAlert size={14} />同步失败 {cpampStatus.failedCount} 个
+              </button>
+            )}
+            {cpampStatus.externalReauth?.cpamp?.count > 0 && (
+              <button type="button" className="sync-attention-button error" onClick={() => focusExternalReauthorization("cpamp")} title="查看 CPAMP 标记为需重新登录的本地账号">
+                <LogIn size={14} />需重登 {cpampStatus.externalReauth.cpamp.matchedCount} 个
+              </button>
+            )}
+            <button type="button" className="secondary-button provider-settings-button" onClick={openCpampSettings} disabled={!token}>
+              <Settings2 size={16} />配置
+            </button>
+          </div>
+        )}
+
+        {features.externalReauthorization && (
+          <div className="provider-toolbar external-reauth-toolbar" aria-label="外部需重新登录账号">
+            <div className="provider-heading"><LogIn size={17} /><strong>外部需重登</strong></div>
+            <span className="provider-name">只读取 CPAMP 与 Sub2API 明确标为需重新登录的账号，不会自动重新登录</span>
+            <button type="button" className="secondary-button provider-settings-button" onClick={refreshExternalReauthorization} disabled={externalReauthChecking || (!cpampStatus.configured && !sub2apiMonitorStatus.configured)}>
+              {externalReauthChecking ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}刷新需重登账号
+            </button>
+            {(cpampStatus.externalReauth?.cpamp?.count || sub2apiMonitorStatus.externalReauth?.sub2api?.count) ? (
+              <span className="provider-ready monitor-ready incomplete">
+                <CircleAlert size={14} />已匹配 {externalReauthMatchedCount} 个本地账号
+                {externalReauthMissingCount ? ` · 本地未找到 ${externalReauthMissingCount} 个` : ""}
+              </span>
+            ) : null}
+          </div>
+        )}
 
         <div className="provider-toolbar account-proxy-toolbar" aria-label="代理 IP 配置">
           <div className="provider-heading"><Globe2 size={17} /><strong>代理 IP</strong></div>
@@ -1034,6 +1443,57 @@ function App() {
               </select>
             </label>
           )}
+          {features.cpampSync && (
+            <label className="status-filter-field">
+              <span>CPAMP</span>
+              <select
+                value={cpampStateFilter}
+                onChange={(event) => {
+                  setCpampStateFilter(event.target.value);
+                  setSelectedJobIds(new Set());
+                  setExpandedJobId(null);
+                  setPage(1);
+                }}
+                aria-label="按 CPAMP 同步状态筛选"
+              >
+                {EXTERNAL_SYNC_FILTER_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
+              </select>
+            </label>
+          )}
+          {features.sub2apiUpload && (
+            <label className="status-filter-field">
+              <span>Sub2API</span>
+              <select
+                value={sub2apiStateFilter}
+                onChange={(event) => {
+                  setSub2apiStateFilter(event.target.value);
+                  setSelectedJobIds(new Set());
+                  setExpandedJobId(null);
+                  setPage(1);
+                }}
+                aria-label="按 Sub2API 同步状态筛选"
+              >
+                {EXTERNAL_SYNC_FILTER_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
+              </select>
+            </label>
+          )}
+          {features.externalReauthorization && (
+            <label className="status-filter-field">
+              <span>需重登</span>
+              <select
+                value={externalReauthFilter}
+                onChange={(event) => {
+                  setExternalReauthFilter(event.target.value);
+                  setSelectedJobIds(new Set());
+                  setExpandedJobId(null);
+                  setPage(1);
+                }}
+                aria-label="按外部需重新登录来源筛选"
+              >
+                {EXTERNAL_REAUTH_FILTER_OPTIONS.map(([value, label]) => <option key={value || "all"} value={value}>{label}</option>)}
+              </select>
+            </label>
+          )}
           <span className="job-filter-match">匹配 {pagination.total} 条</span>
           {features.accountGroups && (
             <button type="button" className="icon-button" onClick={openGroupDialog} title="管理账号分组">
@@ -1086,6 +1546,30 @@ function App() {
                 <button type="button" className="secondary-button bulk-button" onClick={() => uploadSelected([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
                   {batchAction === "upload" ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
                   上传到 Sub2API
+                </button>
+              )}
+              {features.cpampSync && (
+                <button type="button" className="secondary-button bulk-button" onClick={() => syncSelectedToCpamp([...selectedJobIds])} disabled={!canUploadSelected || Boolean(batchAction)}>
+                  {batchAction === "cpamp-sync" ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />}
+                  同步到 CPAMP
+                </button>
+              )}
+              {features.cpampSync && (
+                <button type="button" className="secondary-button bulk-button" onClick={applyCpampPolicyToSelected} disabled={!canUploadSelected || Boolean(batchAction)}>
+                  {batchAction === "cpamp-policy" ? <LoaderCircle className="spin" size={16} /> : <Settings2 size={16} />}
+                  强制应用 CPAMP 策略
+                </button>
+              )}
+              {features.cpampSync && pendingCpampSelectedCount > 0 && (
+                <button type="button" className="secondary-button bulk-button" onClick={approveSelectedCpampSync} disabled={Boolean(batchAction)}>
+                  {batchAction === "cpamp-approve" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
+                  确认待同步 {pendingCpampSelectedCount}
+                </button>
+              )}
+              {features.sub2apiUpload && pendingSub2ApiSelectedCount > 0 && (
+                <button type="button" className="secondary-button bulk-button" onClick={approveSelectedSub2ApiSync} disabled={Boolean(batchAction)}>
+                  {batchAction === "sub2api-approve" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
+                  确认待同步 {pendingSub2ApiSelectedCount}
                 </button>
               )}
               {features.sourceExport && (
@@ -1450,6 +1934,28 @@ function App() {
                   </span>
                 </label>
               )}
+              <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(sub2apiSettingsDraft.autoSyncEnabled)}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, autoSyncEnabled: event.target.checked }))}
+                />
+                <span>
+                  <strong>自动同步以后新完成的任务</strong>
+                  <small>首次同步某个邮箱前会进入待确认队列。勾选账号后点击“确认待同步”，以后该邮箱会自动更新。</small>
+                </span>
+              </label>
+              <label className="settings-field wide-settings-field sub2api-monitor-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(sub2apiSettingsDraft.syncAfterManualReauthorization)}
+                  onChange={(event) => setSub2apiSettingsDraft((current) => ({ ...current, syncAfterManualReauthorization: event.target.checked }))}
+                />
+                <span>
+                  <strong>手动重新授权成功后自动同步</strong>
+                  <small>适用于单个或批量“重新授权”和“重新登录并授权”。号池巡检的自动修复仍只更新对应远端账号，不会重复创建。</small>
+                </span>
+              </label>
               <label className="settings-field wide-settings-field">
                 <span>管理员 API Key</span>
                 <input
@@ -1591,6 +2097,190 @@ function App() {
               <button type="button" className="cancel-button" onClick={() => setSub2apiSettingsOpen(false)} disabled={sub2apiSettingsSaving}>取消</button>
               <button type="submit" className="primary-button" disabled={sub2apiSettingsSaving}>
                 {sub2apiSettingsSaving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存配置
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+      {cpampSettingsOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !cpampSettingsSaving) setCpampSettingsOpen(false);
+        }}>
+          <form className="batch-dialog cpamp-settings-dialog" onSubmit={saveCpampSettings} role="dialog" aria-modal="true" aria-labelledby="cpamp-settings-title">
+            <div className="dialog-header">
+              <div>
+                <h2 id="cpamp-settings-title">CPAMP 授权同步</h2>
+                <span>管理密钥仅在当前 Windows 用户下加密保存</span>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setCpampSettingsOpen(false)} disabled={cpampSettingsSaving} title="关闭"><X size={18} /></button>
+            </div>
+            <div className="provider-config-grid cpamp-config-grid">
+              <label className="settings-field wide-settings-field">
+                <span>CPAMP API 根地址</span>
+                <input
+                  type="url"
+                  value={cpampSettingsDraft.baseUrl}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, baseUrl: event.target.value }))}
+                  placeholder="例如 https://cpamp.example.com"
+                  autoComplete="url"
+                />
+                <small>填写服务器根地址，不要填写 management.html#/accounts 等页面地址</small>
+              </label>
+              <label className="settings-field wide-settings-field">
+                <span>CPAMP 管理密钥</span>
+                <input
+                  type="password"
+                  value={cpampSettingsDraft.managementKey}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, managementKey: event.target.value }))}
+                  placeholder={cpampStatus.configured ? "留空保持当前本机加密密钥" : "输入 CPAMP 管理密钥"}
+                  autoComplete="off"
+                />
+              </label>
+              <label className="settings-field wide-settings-field cpamp-auto-sync-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cpampSettingsDraft.autoSyncEnabled)}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, autoSyncEnabled: event.target.checked }))}
+                />
+                <span>
+                  <strong>自动同步以后新完成的任务</strong>
+                  <small>首次同步某个邮箱前会进入待确认队列。勾选账号后点击“确认待同步”，以后该邮箱会自动更新。</small>
+                </span>
+              </label>
+              <label className="settings-field wide-settings-field cpamp-auto-sync-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cpampSettingsDraft.syncAfterManualReauthorization)}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, syncAfterManualReauthorization: event.target.checked }))}
+                />
+                <span>
+                  <strong>手动重新授权成功后自动同步</strong>
+                  <small>适用于单个或批量“重新授权”和“重新登录并授权”。只更新 OAuth 授权信息，不覆盖 CPAMP 原有策略；Sub2API 自动修复不受此开关影响。</small>
+                </span>
+              </label>
+              <div className="cpamp-settings-section wide-settings-field">
+                <strong>新账号默认同步策略</strong>
+                <span>新建 CPAMP 账号时应用；同邮箱的普通同步只更新 OAuth 授权信息。使用列表中的强制操作才会覆盖既有策略。</span>
+              </div>
+              <label className="settings-field cpamp-auto-sync-toggle">
+                <input
+                  type="checkbox"
+                  checked={cpampSettingsDraft.policy.newAccountEnabled !== false}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, newAccountEnabled: event.target.checked } }))}
+                />
+                <span><strong>新账号默认启用</strong><small>取消勾选时，新建账号会在 CPAMP 中保持禁用状态。</small></span>
+              </label>
+              <label className="settings-field">
+                <span>代理来源</span>
+                <select
+                  value={cpampSettingsDraft.policy.proxyMode}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, proxyMode: event.target.value } }))}
+                >
+                  <option value="none">不设置代理</option>
+                  <option value="fixed">固定代理地址</option>
+                  <option value="job">沿用 AutoTo 登录代理</option>
+                </select>
+              </label>
+              {cpampSettingsDraft.policy.proxyMode === "fixed" && (
+                <label className="settings-field wide-settings-field">
+                  <span>固定代理地址</span>
+                  <input
+                    value={cpampSettingsDraft.policy.fixedProxyUrl}
+                    onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, fixedProxyUrl: event.target.value } }))}
+                    placeholder="例如 socks5://user:password@host:port"
+                    spellCheck="false"
+                  />
+                </label>
+              )}
+              <label className="settings-field">
+                <span>优先级</span>
+                <input
+                  type="number"
+                  min="-1000000"
+                  max="1000000"
+                  step="1"
+                  value={cpampSettingsDraft.policy.priority}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, priority: event.target.value } }))}
+                  placeholder="留空不设置"
+                />
+              </label>
+              <label className="settings-field">
+                <span>调度权重</span>
+                <input
+                  type="number"
+                  min="-1000000"
+                  max="1000000"
+                  step="1"
+                  value={cpampSettingsDraft.policy.weight}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, weight: event.target.value } }))}
+                  placeholder="留空不设置"
+                />
+              </label>
+              <label className="settings-field">
+                <span>批量同步并发</span>
+                <select
+                  value={cpampSettingsDraft.policy.syncConcurrency}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, policy: { ...current.policy, syncConcurrency: Number(event.target.value) } }))}
+                >
+                  <option value={1}>1</option>
+                  <option value={3}>3</option>
+                  <option value={5}>5</option>
+                </select>
+              </label>
+              <label className="settings-field wide-settings-field">
+                <span>仅允许模型</span>
+                <textarea
+                  className="cpamp-model-textarea"
+                  value={cpampSettingsDraft.policy.modelWhitelist.join("\n")}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({
+                    ...current,
+                    policy: { ...current.policy, modelWhitelist: splitCpampModels(event.target.value) },
+                  }))}
+                  placeholder={"留空表示不限制；每行一个模型，也支持逗号分隔，例如：\ngpt-5\ngpt-5-mini"}
+                  rows="5"
+                  spellCheck="false"
+                />
+                <small>{cpampModels.length ? `已读取 ${cpampModels.length} 个远端模型，可填写：${cpampModels.slice(0, 8).join("、")}${cpampModels.length > 8 ? " ..." : ""}` : "设置模型限制时，同步会再次读取 CPAMP 模型目录；目录不可用则同步会被拒绝。"}</small>
+              </label>
+              <div className="cpamp-settings-section wide-settings-field">
+                <strong>同步关联巡检</strong>
+                <span>仅读取 AutoTo 已关联的 CPAMP 文件状态，不会启动或影响 CPAMP 的全局巡检。</span>
+              </div>
+              <label className="settings-field wide-settings-field cpamp-auto-sync-toggle">
+                <input
+                  type="checkbox"
+                  checked={Boolean(cpampSettingsDraft.inspectionEnabled)}
+                  onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, inspectionEnabled: event.target.checked }))}
+                />
+                <span><strong>每 5 分钟检查同步关联</strong><small>仅显示远端文件缺失、CPAMP 已禁用或远端异常，不会自动重新授权或修改 CPAMP。</small></span>
+              </label>
+            </div>
+            {cpampStatus.inspection?.enabled && (
+              <div className={`cpamp-inspection-status ${cpampStatus.inspection?.lastError ? "error" : ""}`}>
+                <ShieldCheck size={15} />
+                <span>{cpampStatus.inspection?.lastError
+                  ? `上次同步关联检查失败：${cpampStatus.inspection.lastError}`
+                  : cpampStatus.inspection?.lastCheckAt
+                    ? cpampInspectionSummary(cpampStatus.inspection)
+                    : "尚未执行同步关联检查"}</span>
+              </div>
+            )}
+            {cpampStatus.lastError && <div className="cpamp-status error"><CircleAlert size={15} /><span>上次同步：{cpampStatus.lastError}</span></div>}
+            {cpampSettingsError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{cpampSettingsError}</div>}
+            <div className="dialog-footer">
+              <button type="button" className="secondary-button" onClick={loadCpampModels} disabled={cpampModelsLoading || !token || !cpampStatus.configured}>
+                {cpampModelsLoading ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}读取远端模型
+              </button>
+              {cpampStatus.inspection?.enabled && (
+                <button type="button" className="secondary-button" onClick={checkCpampInspectionNow} disabled={cpampInspectionChecking || cpampStatus.inspection?.running}>
+                  {cpampInspectionChecking || cpampStatus.inspection?.running ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}立即检查
+                </button>
+              )}
+              <span className="dialog-actions-spacer" />
+              <button type="button" className="cancel-button" onClick={() => setCpampSettingsOpen(false)} disabled={cpampSettingsSaving}>取消</button>
+              <button type="submit" className="primary-button" disabled={cpampSettingsSaving || !token}>
+                {cpampSettingsSaving ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}
+                保存并连接
               </button>
             </div>
           </form>
@@ -1925,6 +2615,12 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         {job.autoRepairBlocked && (
           <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
         )}
+        {job.cpampSync?.inspection?.state && job.cpampSync.inspection.state !== "healthy" && (
+          <div className="row-error">CPAMP 同步关联：{job.cpampSync.inspection.reason || cpampInspectionStateText(job.cpampSync.inspection.state)}</div>
+        )}
+        <ExternalReauthorizationStatus state={job.externalReauth} />
+        <ExternalSyncStatus system="CPAMP" sync={job.cpampSync} />
+        <ExternalSyncStatus system="Sub2API" sync={job.sub2ApiSync} />
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
         {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
@@ -2063,6 +2759,44 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         </div>
       </td>
     </tr>
+  );
+}
+
+function ExternalSyncStatus({ system, sync }) {
+  if (!sync?.state) return null;
+  const state = sync.state;
+  if (state === "failed") {
+    return <div className="row-error external-sync-error">{system} 同步失败：{extractResponseMessage(sync.lastError || "未知错误")}</div>;
+  }
+  if (state === "pending_confirmation") {
+    return <div className="external-sync-status pending"><CircleAlert size={13} />{system} 待确认同步</div>;
+  }
+  if (state === "syncing") {
+    return <div className="external-sync-status"><LoaderCircle className="spin" size={13} />{system} 正在同步</div>;
+  }
+  if (state === "retrying") {
+    return <div className="external-sync-status pending"><RefreshCw className="spin" size={13} />{system} 正在重试：{extractResponseMessage(sync.lastError || "远端暂时不可用")}</div>;
+  }
+  if (state === "synced") {
+    if (sync.lastError) {
+      return <div className="external-sync-status pending"><CircleAlert size={13} />{system} OAuth 已同步，但{extractResponseMessage(sync.lastError)}</div>;
+    }
+    return <div className="external-sync-status success"><Check size={13} />{system} 已同步{sync.lastSyncAt ? ` · ${formatDateTime(sync.lastSyncAt)}` : ""}</div>;
+  }
+  return null;
+}
+
+function ExternalReauthorizationStatus({ state }) {
+  const sources = Array.isArray(state?.sources) ? state.sources : [];
+  if (!sources.length) return null;
+  return (
+    <>
+      {sources.map((entry, index) => (
+        <div className="row-error external-sync-error" key={`${entry.source}-${entry.remoteId || entry.remoteName || index}`}>
+          {entry.source === "cpamp" ? "CPAMP" : "Sub2API"} 提示需重新登录：{extractResponseMessage(entry.reason || "远端授权异常")}
+        </div>
+      ))}
+    </>
   );
 }
 
@@ -2228,6 +2962,107 @@ function formatMonitorResult(result) {
   if (result.busy) parts.push(`正在运行 ${result.busy} 条`);
   if (result.cooldown) parts.push(`冷却中 ${result.cooldown} 条`);
   return parts.join("，");
+}
+
+function formatCpampResult(result) {
+  const created = Number(result?.created || 0);
+  const updated = Number(result?.updated || 0);
+  const recovered = Number(result?.recovered || 0);
+  const recoveryPending = Number(result?.recoveryPending || 0);
+  const failed = Number(result?.failed || 0);
+  const duplicates = Number(result?.duplicates || 0);
+  const parts = [`CPAMP 已同步 ${created + updated} 个账号`];
+  if (created) parts.push(`新建 ${created} 个`);
+  if (updated) parts.push(`更新 ${updated} 个`);
+  if (recovered) parts.push(`恢复 ${recovered} 个重新授权账号`);
+  if (recoveryPending) parts.push(`已上传 OAuth 但仍待恢复 ${recoveryPending} 个，请改用重新登录并授权`);
+  if (duplicates) parts.push(`发现 ${duplicates} 份同邮箱凭证，仅更新主凭证`);
+  if (failed) parts.push(`失败 ${failed} 个`);
+  const failures = Array.isArray(result?.results)
+    ? result.results.filter((item) => item?.status === "failed").slice(0, 3)
+    : [];
+  if (failures.length) parts.push(`失败详情：${failures.map((item) => `${item.email}（${extractResponseMessage(item.error || "同步失败")}）`).join("；")}`);
+  const pendingRecovery = Array.isArray(result?.results)
+    ? result.results.filter((item) => item?.recoveryWarning).slice(0, 3)
+    : [];
+  if (pendingRecovery.length) parts.push(`待恢复：${pendingRecovery.map((item) => `${item.email}（${extractResponseMessage(item.recoveryWarning)}）`).join("；")}`);
+  return parts.join("，");
+}
+
+function formatSub2ApiResult(result) {
+  const uploaded = Number(result?.uploaded ?? result?.result?.success ?? 0);
+  const failed = Number(result?.failed ?? result?.result?.failed ?? 0);
+  const skipped = Number(result?.skipped || 0);
+  const parts = [`Sub2API 已同步 ${uploaded} 个账号`];
+  if (failed) parts.push(`失败 ${failed} 个`);
+  if (skipped) parts.push(`跳过未完成任务 ${skipped} 个`);
+  const failures = Array.isArray(result?.results)
+    ? result.results.filter((item) => item?.status === "failed").slice(0, 3)
+    : [];
+  if (failures.length) parts.push(`失败详情：${failures.map((item) => `${item.email}（${extractResponseMessage(item.error || "同步失败")}）`).join("；")}`);
+  return parts.join("，");
+}
+
+function defaultCpampPolicy() {
+  return {
+    newAccountEnabled: true,
+    proxyMode: "none",
+    fixedProxyUrl: "",
+    priority: "",
+    weight: "",
+    modelWhitelist: [],
+    syncConcurrency: 1,
+  };
+}
+
+function normalizeCpampPolicy(value) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    ...defaultCpampPolicy(),
+    ...source,
+    priority: source.priority ?? "",
+    weight: source.weight ?? "",
+    modelWhitelist: Array.isArray(source.modelWhitelist) ? source.modelWhitelist : splitCpampModels(source.modelWhitelist),
+    syncConcurrency: [1, 3, 5].includes(Number(source.syncConcurrency)) ? Number(source.syncConcurrency) : 1,
+  };
+}
+
+function splitCpampModels(value) {
+  return [...new Set(String(value || "").split(/[\n,]/).map((item) => item.trim()).filter(Boolean))];
+}
+
+function cpampInspectionIssueCount(result) {
+  if (!result || typeof result !== "object") return 0;
+  return Number(result.missing || 0) + Number(result.disabled || 0) + Number(result.problem || 0);
+}
+
+function cpampInspectionSummary(inspection) {
+  if (inspection?.lastError) return "同步关联检查失败";
+  if (!inspection?.lastCheckAt) return "同步关联巡检已启用";
+  const result = inspection.lastResult || {};
+  const issues = cpampInspectionIssueCount(result);
+  return issues
+    ? `同步关联异常 ${issues} 个 · ${formatRelativeMonitorTime(inspection.lastCheckAt)}`
+    : `同步关联正常 · ${formatRelativeMonitorTime(inspection.lastCheckAt)}`;
+}
+
+function formatCpampInspectionResult(result) {
+  const checked = Number(result?.checked || 0);
+  const issues = cpampInspectionIssueCount(result);
+  return issues ? `CPAMP 同步关联检查 ${checked} 个，发现 ${issues} 个异常` : `CPAMP 同步关联检查完成，${checked} 个账号正常`;
+}
+
+function cpampInspectionStateText(state) {
+  const labels = { missing: "远端文件缺失", disabled: "CPAMP 已禁用", problem: "远端异常" };
+  return labels[state] || "远端状态异常";
+}
+
+function displayCpampHost(value) {
+  try { return new URL(value).host; } catch { return String(value || "CPAMP 服务器"); }
+}
+
+function displaySub2ApiHost(value) {
+  try { return new URL(value).host; } catch { return String(value || "Sub2API 服务器"); }
 }
 
 function formatRelativeMonitorTime(value) {
@@ -2449,6 +3284,8 @@ function normalizeSub2ApiSettings(value) {
       ? stored.codexFingerprintMode
       : "session",
     monitorEnabled: stored.monitorEnabled === true,
+    autoSyncEnabled: stored.autoSyncEnabled === true,
+    syncAfterManualReauthorization: stored.syncAfterManualReauthorization === true,
   };
 }
 

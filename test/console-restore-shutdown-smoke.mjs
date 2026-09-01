@@ -135,7 +135,7 @@ const child = spawn(process.execPath, [
     TOSUB2_MAC_CREDENTIAL_ROOT: path.join(tempRoot, "credentials"),
     TOSUB2_TLS_PROFILE: "chrome142",
   },
-  stdio: ["ignore", "pipe", "pipe"],
+  stdio: ["ignore", "pipe", "pipe", "ipc"],
   windowsHide: true,
 });
 
@@ -168,18 +168,28 @@ try {
   assert.equal(recoveredPassword.loginMode, "password");
   assert.equal(recoveredPassword.canAddPassword, false);
   assert.equal(recoveredPassword.canRetry, true);
-  assert.equal(recoveredPassword.passwordAddError, null);
   assert.equal(recoveredPassword.passwordAddedAt, "2026-08-17T05:00:00.000Z");
-  assert.match(recoveredPassword.prompt, /已恢复成功添加的新密码/);
-  await assert.rejects(fs.access(path.join(interruptedPasswordDir, "password-add-result.json")));
+  if (process.platform === "linux") {
+    assert.match(recoveredPassword.passwordAddError || "", /不支持持久凭据存储/);
+    await fs.access(path.join(interruptedPasswordDir, "password-add-result.json"));
+  } else {
+    assert.equal(recoveredPassword.passwordAddError, null);
+    assert.match(recoveredPassword.prompt, /已恢复成功添加的新密码/);
+    await assert.rejects(fs.access(path.join(interruptedPasswordDir, "password-add-result.json")));
+  }
   const recoveredTotp = page.jobs.find((job) => job.id === interruptedTotpId);
   assert.equal(recoveredTotp.status, "resume_available");
   assert.equal(recoveredTotp.hasTotpKey, true);
   assert.equal(recoveredTotp.canSetupTotp, false);
   assert.equal(recoveredTotp.canRetry, true);
-  assert.equal(recoveredTotp.totpSetupError, null);
-  assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
-  await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
+  if (process.platform === "linux") {
+    assert.match(recoveredTotp.totpSetupError || "", /不支持持久凭据存储/);
+    await fs.access(path.join(interruptedTotpDir, "totp-setup-result.json"));
+  } else {
+    assert.equal(recoveredTotp.totpSetupError, null);
+    assert.match(recoveredTotp.prompt, /已恢复成功激活的 2FA 密钥/);
+    await assert.rejects(fs.access(path.join(interruptedTotpDir, "totp-setup-result.json")));
+  }
 
   const createResponse = await fetch(`${baseUrl}/api/jobs`, {
     method: "POST",
@@ -205,9 +215,9 @@ try {
     delay(3_000).then(() => { throw new Error("monitor request did not start"); }),
   ]);
   const shutdownStartedAt = Date.now();
-  child.kill("SIGTERM");
+  assert.equal(child.send({ type: "shutdown" }), true, "console shutdown request was not sent");
   const exit = await Promise.race([childExit, delay(10_000).then(() => null)]);
-  assert.ok(exit, "console did not exit after SIGTERM");
+  assert.ok(exit, "console did not exit after the shutdown request");
   assert.equal(exit.code, 0, logs);
   assert.ok(Date.now() - shutdownStartedAt < 5_000, "shutdown should abort the pending Sub2API monitor request");
   const metadata = JSON.parse(await fs.readFile(path.join(outputRoot, created.job.id, "job-meta.json"), "utf8"));

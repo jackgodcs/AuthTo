@@ -120,8 +120,26 @@ button { letter-spacing: 0; }
 .provider-name { padding: 4px 7px; color: var(--blue); background: var(--blue-soft); border-radius: 4px; font-size: 11px; font-weight: 700; }
 .provider-settings-button { height: 34px; margin-left: auto; }
 .sub2api-toolbar .provider-name { max-width: min(360px, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cpamp-toolbar .provider-name { max-width: min(360px, 42vw); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .monitor-ready { padding-left: 8px; border-left: 1px solid var(--line); }
 .monitor-check-button { width: 34px; height: 34px; }
+.sync-attention-button {
+  height: 30px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--amber);
+  background: var(--amber-soft);
+  border: 1px solid #e5ca91;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.sync-attention-button:hover { color: #fff; background: #a66d12; border-color: #a66d12; }
+.sync-attention-button.error { color: var(--danger); background: var(--danger-soft); border-color: #edc0c0; }
+.sync-attention-button.error:hover { color: #fff; background: var(--danger); border-color: var(--danger); }
 
 .add-form { display: flex; gap: 8px; }
 .email-field {
@@ -401,6 +419,19 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .sms-status.error { color: var(--danger); }
 .sms-status svg { flex: 0 0 auto; margin-top: 1px; }
+.external-sync-status {
+  margin-top: 5px;
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  color: var(--blue);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.external-sync-status svg { flex: 0 0 auto; margin-top: 1px; }
+.external-sync-status.pending { color: var(--amber); }
+.external-sync-status.success { color: var(--green-strong); }
+.external-sync-error { margin-top: 5px; }
 .totp-setup-secret {
   width: min(100%, 440px);
   margin-top: 7px;
@@ -686,7 +717,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .sms-settings-dialog { width: min(620px, 100%); }
 .mail-request-settings-dialog { width: min(620px, 100%); }
 .sub2api-settings-dialog { width: min(620px, 100%); }
+.cpamp-settings-dialog { width: min(620px, 100%); }
 .sub2api-config-grid { margin-top: 18px; }
+.cpamp-config-grid { margin-top: 18px; }
 .mail-request-config-grid { margin-top: 18px; }
 .provider-tabs {
   margin-top: 20px;
@@ -780,6 +813,23 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .sub2api-config-grid .settings-field > input:focus,
 .sub2api-config-grid .settings-field > select:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.cpamp-config-grid .settings-field > input,
+.cpamp-config-grid .settings-field > select {
+  width: 100%;
+  height: 38px;
+  min-width: 0;
+  padding: 0 10px;
+  color: var(--ink);
+  background: #fbfcfb;
+  border: 1px solid #cdd5d1;
+  border-radius: 5px;
+  outline: 0;
+  font-size: 12px;
+}
+.cpamp-config-grid .settings-field > input:focus,
+.cpamp-config-grid .settings-field > select:focus,
+.cpamp-model-textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
+.cpamp-config-grid .settings-field > small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
 .sub2api-config-grid .sub2api-monitor-toggle {
   min-height: 52px;
   padding: 9px 11px;
@@ -803,6 +853,76 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .sub2api-monitor-toggle > span { display: grid; gap: 3px; color: var(--ink); }
 .sub2api-monitor-toggle small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
+.cpamp-config-grid .cpamp-auto-sync-toggle {
+  min-height: 58px;
+  padding: 9px 11px;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  background: #f6f9f8;
+  border: 1px solid #d7dfdb;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.cpamp-config-grid .cpamp-auto-sync-toggle > input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  box-shadow: none;
+  accent-color: var(--green);
+  cursor: pointer;
+}
+.cpamp-auto-sync-toggle > span { display: grid; gap: 3px; color: var(--ink); }
+.cpamp-auto-sync-toggle small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
+.cpamp-settings-section {
+  display: grid;
+  gap: 4px;
+  padding-top: 4px;
+  color: var(--ink);
+  font-size: 12px;
+}
+.cpamp-settings-section > span { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.45; }
+.batch-dialog .cpamp-model-textarea {
+  width: 100%;
+  min-height: 116px;
+  max-height: 220px;
+  padding: 10px 11px;
+  color: var(--ink);
+  background: #fbfcfb;
+  border: 1px solid #cdd5d1;
+  border-radius: 5px;
+  outline: 0;
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.cpamp-inspection-status {
+  margin-top: 10px;
+  padding: 9px 10px;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: #3f5750;
+  background: #f3f8f5;
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.cpamp-inspection-status svg { flex: 0 0 auto; margin-top: 1px; }
+.cpamp-inspection-status.error { color: #a33c31; background: #fff0ed; }
+.cpamp-status {
+  margin-top: 10px;
+  padding: 9px 10px;
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: #a33c31;
+  background: #fff0ed;
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.cpamp-status svg { flex: 0 0 auto; margin-top: 1px; }
 .sub2api-group-field { min-width: 0; margin: 0; padding: 0; border: 0; }
 .sub2api-group-field legend { margin-bottom: 6px; padding: 0; }
 .sub2api-group-picker {
