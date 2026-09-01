@@ -13,6 +13,12 @@ const SYNC_CONCURRENCY_OPTIONS = new Set([1, 3, 5]);
 const MAX_POLICY_INTEGER = 1_000_000;
 const ACCOUNT_HISTORY_BATCH_SIZE = 200;
 const TRANSIENT_FAILURE_THRESHOLD = 3;
+const CODEX_QUOTA_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const CODEX_QUOTA_USAGE_HEADERS = {
+  Authorization: "Bearer $TOKEN$",
+  "Content-Type": "application/json",
+  "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+};
 
 export function createCpampSync(options) {
   const outputRoot = path.resolve(options.outputRoot);
@@ -341,12 +347,42 @@ export function createCpampSync(options) {
         warning: "CPAMP 已上传最新 OAuth，但远端仍保持禁用；请使用重新登录并授权",
       };
     }
+    const quotaRefreshWarning = await refreshCodexQuotaAfterReauthorization(updated, fileName);
+    if (quotaRefreshWarning) return { recovered: false, warning: quotaRefreshWarning };
     await resolveReauthorizationCandidates(candidates, email, file, fileName);
     delete config.externalReauth.records[email];
     if (config.externalReauth.lastResult && typeof config.externalReauth.lastResult === "object") {
       config.externalReauth.lastResult.needsReauthorization = Object.keys(config.externalReauth.records).length;
     }
-    return { recovered: true, warning: null };
+    return { recovered: true, warning: quotaRefreshWarning };
+  }
+
+  async function refreshCodexQuotaAfterReauthorization(file, fileName) {
+    const authIndex = remoteAuthIndex(file);
+    if (!authIndex) {
+      return "CPAMP 已上传最新 OAuth 并重新启用，但未返回可用于刷新额度的凭证索引；请在 CPAMP 刷新额度后复核状态";
+    }
+    try {
+      const result = await request(config.baseUrl, managementKey, "/api-call", {
+        method: "POST",
+        body: JSON.stringify({
+          authIndex,
+          method: "GET",
+          url: CODEX_QUOTA_USAGE_URL,
+          header: buildCodexQuotaUsageHeaders(file),
+        }),
+      });
+      const status = apiCallStatusCode(result);
+      if (status === null) {
+        return "CPAMP 已上传最新 OAuth 并重新启用，但自动刷新额度未返回远端状态；请稍后重试同步";
+      }
+      if (status < 200 || status >= 300) {
+        return `CPAMP 已上传最新 OAuth 并重新启用，但自动刷新额度返回 HTTP ${status}；请稍后重试同步`;
+      }
+      return null;
+    } catch (error) {
+      return `CPAMP 已上传最新 OAuth 并重新启用，但自动刷新额度失败：${redactSecrets(error.message)}`;
+    }
   }
 
   async function listPendingReauthorizationCandidates() {
@@ -821,6 +857,42 @@ function shouldRecoverAfterManualReauthorization(file, syncOptions) {
 
 function remoteMutationTarget(file, fallbackName) {
   return String((file?.runtime_id ?? file?.runtimeId ?? file?.id ?? fallbackName) || "").trim();
+}
+
+function remoteAuthIndex(file) {
+  const value = file?.auth_index ?? file?.authIndex ?? file?.["auth-index"];
+  return value === null || value === undefined ? "" : String(value).trim();
+}
+
+function buildCodexQuotaUsageHeaders(file) {
+  const headers = { ...CODEX_QUOTA_USAGE_HEADERS };
+  const accountId = remoteChatgptAccountId(file);
+  if (accountId) headers["Chatgpt-Account-Id"] = accountId;
+  return headers;
+}
+
+function remoteChatgptAccountId(file) {
+  const metadata = file?.metadata && typeof file.metadata === "object" ? file.metadata : {};
+  const attributes = file?.attributes && typeof file.attributes === "object" ? file.attributes : {};
+  const value = file?.chatgpt_account_id
+    ?? file?.chatgptAccountId
+    ?? file?.account_id
+    ?? file?.accountId
+    ?? metadata.chatgpt_account_id
+    ?? metadata.chatgptAccountId
+    ?? metadata.account_id
+    ?? metadata.accountId
+    ?? attributes.chatgpt_account_id
+    ?? attributes.chatgptAccountId
+    ?? attributes.account_id
+    ?? attributes.accountId;
+  return value === null || value === undefined ? "" : String(value).trim();
+}
+
+function apiCallStatusCode(payload) {
+  const value = payload?.status_code ?? payload?.statusCode ?? payload?.status;
+  const status = Number.parseInt(String(value ?? ""), 10);
+  return Number.isSafeInteger(status) && status >= 100 && status <= 599 ? status : null;
 }
 
 function buildAuthFileStatusPayload(file, targetName, disabled) {

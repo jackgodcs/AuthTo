@@ -2977,7 +2977,7 @@ function formatCpampResult(result) {
   if (created) parts.push(`新建 ${created} 个`);
   if (updated) parts.push(`更新 ${updated} 个`);
   if (recovered) parts.push(`恢复 ${recovered} 个重新授权账号`);
-  if (recoveryPending) parts.push(`已上传 OAuth 但仍待恢复 ${recoveryPending} 个，请改用重新登录并授权`);
+  if (recoveryPending) parts.push(`已上传 OAuth 但状态复核待完成 ${recoveryPending} 个，请查看待恢复详情`);
   if (duplicates) parts.push(`发现 ${duplicates} 份同邮箱凭证，仅更新主凭证`);
   if (failed) parts.push(`失败 ${failed} 个`);
   const failures = Array.isArray(result?.results)

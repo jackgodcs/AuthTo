@@ -11,6 +11,7 @@ const files = new Map();
 const fileStates = new Map();
 const accountHistoryByFile = new Map();
 const credentialRefreshRequests = [];
+const quotaRefreshRequests = [];
 const actionCandidates = [];
 let storedManagementKey = "";
 let requiresManagementPrefix = false;
@@ -34,6 +35,7 @@ const server = http.createServer(async (req, res) => {
   const actionCandidatesPath = requiresManagementPrefix ? "/v0/management/account-action-candidates" : "/account-action-candidates";
   const accountHistoryPath = requiresManagementPrefix ? "/v0/management/monitoring/account-history" : "/monitoring/account-history";
   const modelDefinitionsPath = requiresManagementPrefix ? "/v0/management/model-definitions/codex" : "/model-definitions/codex";
+  const apiCallPath = requiresManagementPrefix ? "/v0/management/api-call" : "/api-call";
   if (req.method === "GET" && requestUrl.pathname === actionCandidatesPath) {
     const status = requestUrl.searchParams.get("status") || "pending";
     res.writeHead(200, { "content-type": "application/json" });
@@ -84,6 +86,25 @@ const server = http.createServer(async (req, res) => {
     }));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ items, generated_at_ms: Date.now() }));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === apiCallPath) {
+    const payload = JSON.parse(await readBody(req));
+    quotaRefreshRequests.push(payload);
+    const fileEntry = [...fileStates.entries()].find(([, state]) => String(state.authIndex || "") === String(payload.authIndex || ""));
+    if (!fileEntry || payload.method !== "GET" || payload.url !== "https://chatgpt.com/backend-api/wham/usage") {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "invalid quota refresh request" }));
+      return;
+    }
+    const [fileName] = fileEntry;
+    accountHistoryByFile.set(fileName, {
+      latest_request: { timestamp_ms: Date.now(), failed: false, fail_status_code: 200 },
+      recent_requests: [{ timestamp_ms: Date.now() - 1, failed: true, fail_status_code: 401, fail_summary: "token invalidated" }],
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ status_code: 200, body: { plan_type: "plus", limits: [] } }));
     return;
   }
 
@@ -376,6 +397,18 @@ try {
     expired: "2000-01-01T00:00:00Z",
     last_refresh: "2000-01-01T00:00:00Z",
   });
+  assert.deepEqual(quotaRefreshRequests.at(-1), {
+    authIndex: "manual-reauthorization-index",
+    method: "GET",
+    url: "https://chatgpt.com/backend-api/wham/usage",
+    header: {
+      Authorization: "Bearer $TOKEN$",
+      "Content-Type": "application/json",
+      "User-Agent": "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+    },
+  });
+  const refreshedHistory = await sync.refreshExternalReauth();
+  assert.equal(refreshedHistory.needsReauthorization, 0, "重新授权后的成功额度查询必须覆盖 CPAMP 的旧登录失效记录");
   assert.equal(sync.recordFor("manual-reauthorization@example.com").state, "synced");
   requiresStatusIdentityMetadata = false;
 
