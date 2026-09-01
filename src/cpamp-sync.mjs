@@ -347,7 +347,7 @@ export function createCpampSync(options) {
         warning: "CPAMP 已上传最新 OAuth，但远端仍保持禁用；请使用重新登录并授权",
       };
     }
-    const quotaRefreshWarning = await refreshCodexQuotaAfterReauthorization(updated, fileName);
+    const quotaRefreshWarning = await refreshCodexQuotaAfterReauthorization(updated);
     if (quotaRefreshWarning) return { recovered: false, warning: quotaRefreshWarning };
     await resolveReauthorizationCandidates(candidates, email, file, fileName);
     delete config.externalReauth.records[email];
@@ -357,7 +357,7 @@ export function createCpampSync(options) {
     return { recovered: true, warning: quotaRefreshWarning };
   }
 
-  async function refreshCodexQuotaAfterReauthorization(file, fileName) {
+  async function refreshCodexQuotaAfterReauthorization(file) {
     const authIndex = remoteAuthIndex(file);
     if (!authIndex) {
       return "CPAMP 已上传最新 OAuth 并重新启用，但未返回可用于刷新额度的凭证索引；请在 CPAMP 刷新额度后复核状态";
