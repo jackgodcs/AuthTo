@@ -9,6 +9,7 @@ import { createCpampSync } from "../src/cpamp-sync.mjs";
 const outputRoot = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-cpamp-sync-"));
 const files = new Map();
 const fileStates = new Map();
+const accountHistoryByFile = new Map();
 const credentialRefreshRequests = [];
 const actionCandidates = [];
 let storedManagementKey = "";
@@ -31,6 +32,7 @@ const server = http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url, "http://127.0.0.1");
   const authFilesPath = requiresManagementPrefix ? "/v0/management/auth-files" : "/auth-files";
   const actionCandidatesPath = requiresManagementPrefix ? "/v0/management/account-action-candidates" : "/account-action-candidates";
+  const accountHistoryPath = requiresManagementPrefix ? "/v0/management/monitoring/account-history" : "/monitoring/account-history";
   const modelDefinitionsPath = requiresManagementPrefix ? "/v0/management/model-definitions/codex" : "/model-definitions/codex";
   if (req.method === "GET" && requestUrl.pathname === actionCandidatesPath) {
     const status = requestUrl.searchParams.get("status") || "pending";
@@ -57,6 +59,7 @@ const server = http.createServer(async (req, res) => {
     const listed = [...files.entries()].map(([name, payload]) => {
       const state = fileStates.get(name) || {};
       return {
+        ...state.publicFields,
         name,
         id: state.id || name,
         auth_index: state.authIndex || undefined,
@@ -69,6 +72,18 @@ const server = http.createServer(async (req, res) => {
     });
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ files: listed }));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === accountHistoryPath) {
+    const body = JSON.parse(await readBody(req));
+    const accounts = Array.isArray(body.accounts) ? body.accounts : [];
+    const items = accounts.map((account) => ({
+      row_key: account.row_key,
+      ...(accountHistoryByFile.get(account.auth_file_snapshot) || {}),
+    }));
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ items, generated_at_ms: Date.now() }));
     return;
   }
 
@@ -400,6 +415,47 @@ try {
   assert.equal(externalRefresh.needsReauthorization, 1);
   assert.equal(sync.externalReauthFor("external-problem@example.com").reason, "refresh token revoked");
   assert.equal(sync.externalReauthFor("intentionally-disabled@example.com"), null, "没有认证失败记录的手动禁用账号不能被标记为需重登");
+
+  const historyCredentialFailure = await writeJob("history-credential-failure", "history-credential@example.com", "history-credential-access", "history-credential-refresh");
+  const historyCredentialCreated = await sync.syncManual([historyCredentialFailure]);
+  const historyCredentialFileName = historyCredentialCreated.results[0].remoteFileName;
+  accountHistoryByFile.set(historyCredentialFileName, {
+    latest_request: { timestamp_ms: 4_000, failed: true, fail_status_code: 401, fail_summary: "token invalidated" },
+    recent_requests: [{ timestamp_ms: 3_000, failed: false, fail_status_code: 200 }],
+  });
+
+  const historyTransientFailure = await writeJob("history-transient-failure", "history-transient@example.com", "history-transient-access", "history-transient-refresh");
+  const historyTransientCreated = await sync.syncManual([historyTransientFailure]);
+  const historyTransientFileName = historyTransientCreated.results[0].remoteFileName;
+  accountHistoryByFile.set(historyTransientFileName, {
+    latest_request: { timestamp_ms: 7_000, failed: true, fail_status_code: 503, fail_summary: "upstream unavailable" },
+    recent_requests: [
+      { timestamp_ms: 6_000, failed: true, fail_status_code: 503, fail_summary: "upstream unavailable" },
+      { timestamp_ms: 5_000, failed: true, fail_status_code: 503, fail_summary: "upstream unavailable" },
+    ],
+  });
+
+  const quotaRiskOnly = await writeJob("history-quota-risk", "history-quota@example.com", "history-quota-access", "history-quota-refresh");
+  const quotaRiskCreated = await sync.syncManual([quotaRiskOnly]);
+  const quotaRiskFileName = quotaRiskCreated.results[0].remoteFileName;
+  accountHistoryByFile.set(quotaRiskFileName, {
+    latest_request: { timestamp_ms: 8_000, failed: true, fail_status_code: 429, fail_summary: "rate limit reached" },
+  });
+
+  const recoveredHistoryFailure = await writeJob("history-recovered", "history-recovered@example.com", "history-recovered-access", "history-recovered-refresh");
+  const recoveredHistoryCreated = await sync.syncManual([recoveredHistoryFailure]);
+  const recoveredHistoryFileName = recoveredHistoryCreated.results[0].remoteFileName;
+  accountHistoryByFile.set(recoveredHistoryFileName, {
+    latest_request: { timestamp_ms: 10_000, failed: false, fail_status_code: 200 },
+    recent_requests: [{ timestamp_ms: 9_000, failed: true, fail_status_code: 401, fail_summary: "token invalidated" }],
+  });
+
+  const historyRefresh = await sync.refreshExternalReauth();
+  assert.equal(historyRefresh.needsReauthorization, 3, "CPAMP 请求历史的异常账号必须与官方候选合并，而不能因候选存在而提前返回");
+  assert.equal(sync.externalReauthFor("history-credential@example.com")?.source, "request_credential_failure");
+  assert.equal(sync.externalReauthFor("history-transient@example.com")?.source, "request_transient_failure");
+  assert.equal(sync.externalReauthFor("history-quota@example.com"), null, "额度风险不能误标为需重新登录");
+  assert.equal(sync.externalReauthFor("history-recovered@example.com"), null, "新的成功请求必须覆盖旧的认证失败");
 
   const stillDisabled = await writeJob("still-disabled", "still-disabled@example.com", "still-disabled-access", "still-disabled-refresh");
   const stillDisabledCreated = await sync.syncManual([stillDisabled]);

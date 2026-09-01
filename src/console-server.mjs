@@ -3499,7 +3499,7 @@ function externalReauthorizationForEmail(email) {
   const normalized = String(email || "").trim().toLowerCase();
   const sources = [];
   const cpamp = cpampSync.externalReauthFor(normalized);
-  if (cpamp) sources.push({ source: "cpamp", ...cpamp });
+  if (cpamp) sources.push({ ...cpamp, source: "cpamp" });
   const sub2apiRecords = sub2ApiMonitorConfig?.externalReauth?.records?.[normalized];
   for (const record of Array.isArray(sub2apiRecords) ? sub2apiRecords : []) {
     sources.push({ source: "sub2api", ...publicExternalReauthRecord(record) });

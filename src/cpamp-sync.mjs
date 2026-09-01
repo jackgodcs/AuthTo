@@ -11,6 +11,8 @@ const REQUEST_TIMEOUT_MS = 120_000;
 const INSPECTION_INTERVAL_MS = 5 * 60_000;
 const SYNC_CONCURRENCY_OPTIONS = new Set([1, 3, 5]);
 const MAX_POLICY_INTEGER = 1_000_000;
+const ACCOUNT_HISTORY_BATCH_SIZE = 200;
+const TRANSIENT_FAILURE_THRESHOLD = 3;
 
 export function createCpampSync(options) {
   const outputRoot = path.resolve(options.outputRoot);
@@ -319,7 +321,8 @@ export function createCpampSync(options) {
   async function recoverAfterManualReauthorization(email, file, fileName, context) {
     const candidates = await context.getReauthorizationCandidates();
     const matchesCandidate = candidates.some((candidate) => actionCandidateMatches(candidate, email, fileName, remoteMutationTarget(file, fileName)));
-    if (!matchesCandidate && !cpampReauthorizationIssue(file)) {
+    const externalIssue = config.externalReauth.records[normalizeEmail(email)];
+    if (!matchesCandidate && !cpampReauthorizationIssue(file) && externalIssue?.action !== "reauth") {
       return { recovered: false, warning: null };
     }
     const targetName = remoteMutationTarget(file, fileName);
@@ -454,7 +457,13 @@ export function createCpampSync(options) {
     try {
       requestPromise = fetchImpl(`${baseUrl}${endpoint}`, {
         method: options.method || "GET",
-        headers: { authorization: `Bearer ${key}`, accept: "application/json" },
+        headers: {
+          authorization: `Bearer ${key}`,
+          accept: "application/json",
+          ...(options.body ? { "content-type": "application/json" } : {}),
+          ...(options.headers || {}),
+        },
+        body: options.body,
         signal: controller.signal,
       });
       requests.add(requestPromise);
@@ -623,8 +632,18 @@ export function createCpampSync(options) {
       try {
         const files = extractFiles(await request(config.baseUrl, managementKey, "/auth-files"));
         const candidates = await listPendingReauthorizationCandidates();
+        const histories = await listAccountHistories(files);
         const records = {};
-        const summary = { checked: files.length, needsReauthorization: 0, missingEmail: 0, source: candidates.length ? "cpamp_candidates" : "explicit_auth_status" };
+        const summary = {
+          checked: files.length,
+          needsReauthorization: 0,
+          explicitCandidates: 0,
+          requestCredentialFailures: 0,
+          requestTransientFailures: 0,
+          credentialStatusFailures: 0,
+          missingEmail: 0,
+          historySupported: histories.supported,
+        };
         for (const candidate of candidates) {
           const file = files.find((entry) => actionCandidateMatches(candidate, remoteFileEmail(entry), entry.name, remoteMutationTarget(entry, entry.name)));
           const email = remoteFileEmail(file) || actionCandidateEmail(candidate);
@@ -632,16 +651,8 @@ export function createCpampSync(options) {
             summary.missingEmail += 1;
             continue;
           }
-          records[email] = publicCandidateReauthorizationRecord(candidate, email, file);
-        }
-        summary.needsReauthorization = Object.keys(records).length;
-        if (candidates.length > 0) {
-          config.externalReauth.records = records;
-          config.externalReauth.lastCheckAt = checkedAt;
-          config.externalReauth.lastError = null;
-          config.externalReauth.lastResult = summary;
-          await persist();
-          return summary;
+          records[email] = publicCandidateReauthorizationRecord(candidate, email, file, checkedAt);
+          summary.explicitCandidates += 1;
         }
         for (const file of files) {
           const email = remoteFileEmail(file);
@@ -649,17 +660,24 @@ export function createCpampSync(options) {
             summary.missingEmail += 1;
             continue;
           }
-          const issue = cpampReauthorizationIssue(file);
+          const historyIssue = cpampAccountHistoryIssue(histories.byFileName.get(String(file.name || "")));
+          const issue = historyIssue || cpampReauthorizationIssue(file);
           if (!issue) continue;
+          if (records[email]) continue;
           records[email] = {
             email,
             remoteId: remoteMutationTarget(file, file.name),
             remoteName: String(file.name || "").trim().slice(0, 300) || null,
-            reason: issue,
+            reason: typeof issue === "string" ? issue : issue.reason,
+            source: typeof issue === "string" ? "credential_status" : issue.source,
+            action: typeof issue === "string" ? "reauth" : issue.action,
             detectedAt: checkedAt,
           };
-          summary.needsReauthorization += 1;
+          if (historyIssue?.source === "request_credential_failure") summary.requestCredentialFailures += 1;
+          else if (historyIssue?.source === "request_transient_failure") summary.requestTransientFailures += 1;
+          else if (!historyIssue) summary.credentialStatusFailures += 1;
         }
+        summary.needsReauthorization = Object.keys(records).length;
         config.externalReauth.records = records;
         config.externalReauth.lastCheckAt = checkedAt;
         config.externalReauth.lastError = null;
@@ -678,6 +696,36 @@ export function createCpampSync(options) {
       if (externalReauthPromise === task) externalReauthPromise = null;
     }).catch(() => {});
     return task;
+  }
+
+  async function listAccountHistories(files) {
+    const entries = files.map((file, index) => ({
+      rowKey: `tosub2:${index}`,
+      file,
+      target: buildAccountHistoryTarget(file, `tosub2:${index}`),
+    }));
+    const byFileName = new Map();
+    if (!entries.length) return { supported: true, byFileName };
+    try {
+      for (let index = 0; index < entries.length; index += ACCOUNT_HISTORY_BATCH_SIZE) {
+        const batch = entries.slice(index, index + ACCOUNT_HISTORY_BATCH_SIZE);
+        const payload = await request(config.baseUrl, managementKey, "/monitoring/account-history", {
+          method: "POST",
+          body: JSON.stringify({ accounts: batch.map((entry) => entry.target) }),
+        });
+        const historyByRowKey = new Map(extractAccountHistoryItems(payload)
+          .map((item) => [String(item?.row_key ?? item?.rowKey ?? ""), item])
+          .filter(([rowKey]) => rowKey));
+        for (const entry of batch) {
+          const history = historyByRowKey.get(entry.rowKey);
+          if (history) byFileName.set(String(entry.file.name || ""), history);
+        }
+      }
+      return { supported: true, byFileName };
+    } catch (error) {
+      if (error?.remoteStatus === 404) return { supported: false, byFileName };
+      throw error;
+    }
   }
 }
 
@@ -703,7 +751,9 @@ function publicExternalReauthRecord(record) {
     email: record.email || null,
     remoteId: record.remoteId || null,
     remoteName: record.remoteName || null,
-    reason: record.reason || "CPAMP 要求重新授权",
+    reason: record.reason || "CPAMP 需要处理",
+    source: record.source || "credential_status",
+    action: record.action || "reauth",
     detectedAt: record.detectedAt || null,
   };
 }
@@ -904,6 +954,93 @@ function remoteFileEmail(file) {
   return isEmail(fallback) ? fallback : null;
 }
 
+function buildAccountHistoryTarget(file, rowKey) {
+  return removeEmpty({
+    row_key: rowKey,
+    account_snapshot: String(file?.account_snapshot ?? file?.accountSnapshot ?? remoteFileEmail(file) ?? "").trim(),
+    auth_label_snapshot: String(file?.auth_label ?? file?.authLabel ?? file?.email ?? file?.account ?? "").trim(),
+    auth_file_snapshot: String(file?.name ?? "").trim(),
+    auth_provider_snapshot: String(file?.provider ?? file?.type ?? "codex").trim(),
+    auth_account_id_snapshot: String(file?.account_id ?? file?.accountId ?? file?.chatgpt_account_id ?? "").trim(),
+    auth_index: String(file?.auth_index ?? file?.authIndex ?? "").trim(),
+    source: String(file?.name ?? "").trim(),
+  });
+}
+
+function extractAccountHistoryItems(payload) {
+  return Array.isArray(payload?.items)
+    ? payload.items
+    : Array.isArray(payload?.data?.items)
+      ? payload.data.items
+      : Array.isArray(payload)
+        ? payload
+        : [];
+}
+
+function cpampAccountHistoryIssue(history) {
+  if (!history || typeof history !== "object") return null;
+  const requests = [history.latest_request, history.latestRequest, ...(history.recent_requests ?? history.recentRequests ?? [])]
+    .filter((request) => request && typeof request === "object")
+    .sort((left, right) => requestTimestamp(right) - requestTimestamp(left));
+  if (!requests.length) return null;
+
+  const latest = requests[0];
+  const latestKind = cpampRequestKind(latest);
+  if (latestKind === "success" || latestKind === "quota" || latestKind === "neutral") return null;
+  if (latestKind === "credential_failure") {
+    return {
+      source: "request_credential_failure",
+      action: "reauth",
+      reason: cpampRequestReason(latest, "CPAMP 最近请求提示凭证失效"),
+    };
+  }
+  if (latestKind !== "transient_failure") return null;
+
+  let consecutiveTransientFailures = 0;
+  for (const request of requests) {
+    if (cpampRequestKind(request) !== "transient_failure") break;
+    consecutiveTransientFailures += 1;
+  }
+  if (consecutiveTransientFailures < TRANSIENT_FAILURE_THRESHOLD) return null;
+  return {
+    source: "request_transient_failure",
+    action: "review",
+    reason: `CPAMP 最近连续 ${consecutiveTransientFailures} 次请求失败：${cpampRequestReason(latest, "请求暂时失败")}`,
+  };
+}
+
+function cpampRequestKind(request) {
+  if (request?.failed !== true) return "success";
+  const status = requestStatusCode(request);
+  const detail = cpampRequestReason(request, "").toLowerCase();
+  if (status === 401 || /reauth|auth(?:entication|orization)?|oauth|token|credential|login|sign[ -]?in|unauthori[sz]ed|forbidden|invalid_grant|expired/.test(detail)) {
+    return "credential_failure";
+  }
+  if (status === 402 || status === 429 || /quota|rate.?limit|limit.?reached|insufficient.?credit|billing|spend.?control/.test(detail)) return "quota";
+  if (status === 499 || (status !== null && status >= 400 && status < 500 && status !== 408)) return "neutral";
+  return "transient_failure";
+}
+
+function cpampRequestReason(request, fallback) {
+  const detail = [request?.fail_summary, request?.failSummary, request?.header_error_kind, request?.headerErrorKind, request?.header_error_code, request?.headerErrorCode, request?.error, request?.message]
+    .find((value) => typeof value === "string" && value.trim());
+  const status = requestStatusCode(request);
+  return redactSecrets(detail || (status ? `HTTP ${status}` : fallback)).slice(0, 300);
+}
+
+function requestStatusCode(request) {
+  for (const value of [request?.fail_status_code, request?.failStatusCode, request?.status_code, request?.statusCode]) {
+    const parsed = Number.parseInt(String(value ?? ""), 10);
+    if (Number.isSafeInteger(parsed) && parsed >= 100 && parsed <= 599) return parsed;
+  }
+  return null;
+}
+
+function requestTimestamp(request) {
+  const timestamp = Number(request?.timestamp_ms ?? request?.timestampMs ?? 0);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
 function cpampReauthorizationIssue(file) {
   const status = String(file?.status || file?.state || file?.inspection_status || "").trim().toLowerCase();
   const detail = remoteIssueDetail(file);
@@ -956,13 +1093,15 @@ function actionCandidateMatches(candidate, email, fileName, target) {
   return Boolean(candidateEmail && normalizedEmail && candidateEmail === normalizedEmail);
 }
 
-function publicCandidateReauthorizationRecord(candidate, email, file) {
+function publicCandidateReauthorizationRecord(candidate, email, file, detectedAt = new Date().toISOString()) {
   return {
     email,
     remoteId: remoteMutationTarget(file, file?.name) || null,
     remoteName: String(file?.name || candidate.authFileName || "").trim().slice(0, 300) || null,
     reason: redactSecrets(candidate.reason || candidate.reasonCode || "CPAMP 要求重新登录").slice(0, 300),
-    detectedAt: new Date().toISOString(),
+    source: "candidate_reauth",
+    action: "reauth",
+    detectedAt,
   };
 }
 
@@ -1187,7 +1326,9 @@ function normalizeStoredExternalReauth(value) {
       email,
       remoteId: typeof raw?.remoteId === "string" ? raw.remoteId.slice(0, 300) : null,
       remoteName: typeof raw?.remoteName === "string" ? raw.remoteName.slice(0, 300) : null,
-      reason: typeof raw?.reason === "string" ? redactSecrets(raw.reason).slice(0, 300) : "CPAMP 要求重新授权",
+      reason: typeof raw?.reason === "string" ? redactSecrets(raw.reason).slice(0, 300) : "CPAMP 需要处理",
+      source: typeof raw?.source === "string" ? raw.source.slice(0, 80) : "credential_status",
+      action: raw?.action === "review" ? "review" : "reauth",
       detectedAt: typeof raw?.detectedAt === "string" ? raw.detectedAt : null,
     };
   }

@@ -810,7 +810,7 @@ function App() {
       const failureText = failures.length
         ? `，未读取 ${failures.map((item) => item.source === "cpamp" ? "CPAMP" : "Sub2API").join("、")}`
         : "";
-      setUploadNotice(`外部需重登账号已刷新：CPAMP ${cpampCount} 个，Sub2API ${sub2apiCount} 个${missing ? `，本地未找到 ${missing} 个` : ""}${failureText}`);
+      setUploadNotice(`外部异常账号已刷新：CPAMP ${cpampCount} 个，Sub2API ${sub2apiCount} 个${missing ? `，本地未找到 ${missing} 个` : ""}${failureText}`);
       setError("");
     } catch (requestError) {
       setError(requestError.message);
@@ -897,7 +897,9 @@ function App() {
         method: "POST",
         body: JSON.stringify({ page: 1, pageSize, externalReauth: source }),
       });
-      setSelectedJobIds(new Set((data.selection || []).map((job) => job.id)));
+      setSelectedJobIds(new Set((data.selection || [])
+        .filter((job) => job.externalReauth?.sources?.some((entry) => entry.source === source && entry.action !== "review"))
+        .map((job) => job.id)));
       setError("");
     } catch (requestError) {
       setError(requestError.message);
@@ -1321,8 +1323,8 @@ function App() {
               </button>
             )}
             {cpampStatus.externalReauth?.cpamp?.count > 0 && (
-              <button type="button" className="sync-attention-button error" onClick={() => focusExternalReauthorization("cpamp")} title="查看 CPAMP 标记为需重新登录的本地账号">
-                <LogIn size={14} />需重登 {cpampStatus.externalReauth.cpamp.matchedCount} 个
+              <button type="button" className="sync-attention-button error" onClick={() => focusExternalReauthorization("cpamp")} title="查看 CPAMP 标记为需要处理的本地账号；列表会显示重新登录或复核原因">
+                <CircleAlert size={14} />异常 {cpampStatus.externalReauth.cpamp.count} 个
               </button>
             )}
             <button type="button" className="secondary-button provider-settings-button" onClick={openCpampSettings} disabled={!token}>
@@ -1332,15 +1334,15 @@ function App() {
         )}
 
         {features.externalReauthorization && (
-          <div className="provider-toolbar external-reauth-toolbar" aria-label="外部需重新登录账号">
-            <div className="provider-heading"><LogIn size={17} /><strong>外部需重登</strong></div>
-            <span className="provider-name">只读取 CPAMP 与 Sub2API 明确标为需重新登录的账号，不会自动重新登录</span>
+          <div className="provider-toolbar external-reauth-toolbar" aria-label="外部异常账号">
+            <div className="provider-heading"><CircleAlert size={17} /><strong>外部异常</strong></div>
+            <span className="provider-name">读取 CPAMP 与 Sub2API 的异常账号；只有凭证失效才提示重新登录，临时请求故障会标记为复核</span>
             <button type="button" className="secondary-button provider-settings-button" onClick={refreshExternalReauthorization} disabled={externalReauthChecking || (!cpampStatus.configured && !sub2apiMonitorStatus.configured)}>
-              {externalReauthChecking ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}刷新需重登账号
+              {externalReauthChecking ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}刷新异常账号
             </button>
             {(cpampStatus.externalReauth?.cpamp?.count || sub2apiMonitorStatus.externalReauth?.sub2api?.count) ? (
               <span className="provider-ready monitor-ready incomplete">
-                <CircleAlert size={14} />已匹配 {externalReauthMatchedCount} 个本地账号
+                <CircleAlert size={14} />CPAMP 异常 {cpampStatus.externalReauth?.cpamp?.count || 0} 个 · Sub2API 异常 {sub2apiMonitorStatus.externalReauth?.sub2api?.count || 0} 个 · 已匹配 {externalReauthMatchedCount} 个本地账号
                 {externalReauthMissingCount ? ` · 本地未找到 ${externalReauthMissingCount} 个` : ""}
               </span>
             ) : null}
@@ -2793,7 +2795,7 @@ function ExternalReauthorizationStatus({ state }) {
     <>
       {sources.map((entry, index) => (
         <div className="row-error external-sync-error" key={`${entry.source}-${entry.remoteId || entry.remoteName || index}`}>
-          {entry.source === "cpamp" ? "CPAMP" : "Sub2API"} 提示需重新登录：{extractResponseMessage(entry.reason || "远端授权异常")}
+          {entry.source === "cpamp" ? "CPAMP" : "Sub2API"}{entry.action === "review" ? " 提示需复核：" : " 提示需重新登录："}{extractResponseMessage(entry.reason || "远端授权异常")}
         </div>
       ))}
     </>
