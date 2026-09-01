@@ -18,6 +18,7 @@ let requiresManagementPrefix = false;
 let rejectsManagementKey = false;
 let ignoresEnableRequests = false;
 let requiresStatusIdentityMetadata = false;
+let quotaRefreshStatus = 200;
 let codexModels = ["gpt-5", "gpt-5-mini", "gpt-4.1"];
 let modelDirectoryAvailable = true;
 let uploadDelayMs = 0;
@@ -99,12 +100,14 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const [fileName] = fileEntry;
-    accountHistoryByFile.set(fileName, {
-      latest_request: { timestamp_ms: Date.now(), failed: false, fail_status_code: 200 },
-      recent_requests: [{ timestamp_ms: Date.now() - 1, failed: true, fail_status_code: 401, fail_summary: "token invalidated" }],
-    });
+    if (quotaRefreshStatus >= 200 && quotaRefreshStatus < 300) {
+      accountHistoryByFile.set(fileName, {
+        latest_request: { timestamp_ms: Date.now(), failed: false, fail_status_code: 200 },
+        recent_requests: [{ timestamp_ms: Date.now() - 1, failed: true, fail_status_code: 401, fail_summary: "token invalidated" }],
+      });
+    }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status_code: 200, body: { plan_type: "plus", limits: [] } }));
+    res.end(JSON.stringify({ status_code: quotaRefreshStatus, body: { plan_type: "plus", limits: [] } }));
     return;
   }
 
@@ -412,15 +415,60 @@ try {
   assert.equal(sync.recordFor("manual-reauthorization@example.com").state, "synced");
   requiresStatusIdentityMetadata = false;
 
+  const historyOnlyReauthorization = await writeJob("history-only-reauthorization", "history-only@example.com", "history-only-access", "history-only-refresh");
+  const historyOnlyCreated = await sync.syncManual([historyOnlyReauthorization]);
+  const historyOnlyFileName = historyOnlyCreated.results[0].remoteFileName;
+  fileStates.set(historyOnlyFileName, {
+    disabled: false,
+    status: "active",
+    authIndex: "history-only-index",
+    publicFields: { account_id: "history-only-account" },
+  });
+  const quotaRefreshCount = quotaRefreshRequests.length;
+  const historyOnlyRefresh = await writeJob("history-only-reauthorization-refresh", "history-only@example.com", "history-only-new-access", "history-only-new-refresh");
+  await sync.syncAfterManualReauthorization(historyOnlyRefresh);
+  assert.equal(quotaRefreshRequests.length, quotaRefreshCount + 1, "已有账号完成手动重新授权后，即使 CPAMP 尚未返回候选项，也必须刷新额度以清除请求历史中的需重登状态");
+  assert.equal(quotaRefreshRequests.at(-1).authIndex, "history-only-index");
+  assert.equal(quotaRefreshRequests.at(-1).header["Chatgpt-Account-Id"], "history-only-account");
+  assert.equal(sync.recordFor("history-only@example.com").lastError, null);
+  assert.match(sync.recordFor("history-only@example.com").quotaRefreshedAt || "", /^\d{4}-\d{2}-\d{2}T/);
+  const historyOnlyStatus = sync.status();
+  assert.match(historyOnlyStatus.lastSyncAt || "", /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(historyOnlyStatus.lastError, null);
+
   const intentionallyDisabled = await writeJob("intentionally-disabled", "intentionally-disabled@example.com", "intentionally-disabled-access", "intentionally-disabled-refresh");
   const intentionallyDisabledCreated = await sync.syncManual([intentionallyDisabled]);
   const intentionallyDisabledFileName = intentionallyDisabledCreated.results[0].remoteFileName;
   fileStates.set(intentionallyDisabledFileName, { disabled: true, status: "disabled", failed: 0, success: 1 });
   const intentionallyDisabledRefresh = await writeJob("intentionally-disabled-refresh", "intentionally-disabled@example.com", "intentionally-disabled-new-access", "intentionally-disabled-new-refresh");
+  const disabledQuotaRefreshCount = quotaRefreshRequests.length;
   const intentionallyDisabledResult = await sync.syncAfterManualReauthorization(intentionallyDisabledRefresh);
   assert.equal(intentionallyDisabledResult, true);
   assert.equal(fileStates.get(intentionallyDisabledFileName).disabled, true);
   assert.equal(credentialRefreshRequests.some((request) => request.name === intentionallyDisabledFileName), false);
+  assert.equal(quotaRefreshRequests.length, disabledQuotaRefreshCount, "手动禁用且没有认证异常证据的账号不能自动触发额度查询");
+
+  const missingAuthIndex = await writeJob("missing-auth-index", "missing-auth-index@example.com", "missing-auth-index-access", "missing-auth-index-refresh");
+  const missingAuthIndexCreated = await sync.syncManual([missingAuthIndex]);
+  const missingAuthIndexFileName = missingAuthIndexCreated.results[0].remoteFileName;
+  fileStates.set(missingAuthIndexFileName, { disabled: false, status: "active" });
+  const missingAuthIndexRefresh = await writeJob("missing-auth-index-refresh", "missing-auth-index@example.com", "missing-auth-index-new-access", "missing-auth-index-new-refresh");
+  const missingAuthIndexQuotaRefreshCount = quotaRefreshRequests.length;
+  await sync.syncAfterManualReauthorization(missingAuthIndexRefresh);
+  assert.equal(quotaRefreshRequests.length, missingAuthIndexQuotaRefreshCount);
+  assert.match(sync.recordFor("missing-auth-index@example.com").lastError || "", /未返回可用于刷新额度的凭证索引/);
+
+  const rejectedQuotaRefresh = await writeJob("rejected-quota-refresh", "rejected-quota@example.com", "rejected-quota-access", "rejected-quota-refresh");
+  const rejectedQuotaCreated = await sync.syncManual([rejectedQuotaRefresh]);
+  const rejectedQuotaFileName = rejectedQuotaCreated.results[0].remoteFileName;
+  fileStates.set(rejectedQuotaFileName, { disabled: false, status: "active", authIndex: "rejected-quota-index" });
+  quotaRefreshStatus = 503;
+  const rejectedQuotaRetry = await writeJob("rejected-quota-retry", "rejected-quota@example.com", "rejected-quota-new-access", "rejected-quota-new-refresh");
+  const rejectedQuotaRefreshCount = quotaRefreshRequests.length;
+  await sync.syncAfterManualReauthorization(rejectedQuotaRetry);
+  assert.equal(quotaRefreshRequests.length, rejectedQuotaRefreshCount + 1);
+  assert.match(sync.recordFor("rejected-quota@example.com").lastError || "", /自动刷新额度返回 HTTP 503/);
+  quotaRefreshStatus = 200;
 
   const externalProblem = await writeJob("external-reauth-problem", "external-problem@example.com", "external-problem-access", "external-problem-refresh");
   const externalProblemCreated = await sync.syncManual([externalProblem]);

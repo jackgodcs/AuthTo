@@ -2157,7 +2157,7 @@ function App() {
                 />
                 <span>
                   <strong>手动重新授权成功后自动同步</strong>
-                  <small>适用于单个或批量“重新授权”和“重新登录并授权”。只更新 OAuth 授权信息，不覆盖 CPAMP 原有策略；Sub2API 自动修复不受此开关影响。</small>
+                  <small>适用于单个或批量“重新授权”和“重新登录并授权”。对已有且启用的 CPAMP 账号会刷新额度复核需重登状态，不覆盖原有策略；Sub2API 自动修复不受此开关影响。</small>
                 </span>
               </label>
               <div className="cpamp-settings-section wide-settings-field">
@@ -2783,6 +2783,9 @@ function ExternalSyncStatus({ system, sync }) {
     if (sync.lastError) {
       return <div className="external-sync-status pending"><CircleAlert size={13} />{system} OAuth 已同步，但{extractResponseMessage(sync.lastError)}</div>;
     }
+    if (system === "CPAMP" && sync.quotaRefreshedAt) {
+      return <div className="external-sync-status success"><Check size={13} />CPAMP 已同步并完成额度复核{sync.lastSyncAt ? ` · ${formatDateTime(sync.lastSyncAt)}` : ""}</div>;
+    }
     return <div className="external-sync-status success"><Check size={13} />{system} 已同步{sync.lastSyncAt ? ` · ${formatDateTime(sync.lastSyncAt)}` : ""}</div>;
   }
   return null;
@@ -2970,6 +2973,7 @@ function formatCpampResult(result) {
   const created = Number(result?.created || 0);
   const updated = Number(result?.updated || 0);
   const recovered = Number(result?.recovered || 0);
+  const quotaRefreshed = Number(result?.quotaRefreshed || 0);
   const recoveryPending = Number(result?.recoveryPending || 0);
   const failed = Number(result?.failed || 0);
   const duplicates = Number(result?.duplicates || 0);
@@ -2977,6 +2981,7 @@ function formatCpampResult(result) {
   if (created) parts.push(`新建 ${created} 个`);
   if (updated) parts.push(`更新 ${updated} 个`);
   if (recovered) parts.push(`恢复 ${recovered} 个重新授权账号`);
+  if (quotaRefreshed) parts.push(`已刷新额度复核 ${quotaRefreshed} 个`);
   if (recoveryPending) parts.push(`已上传 OAuth 但状态复核待完成 ${recoveryPending} 个，请查看待恢复详情`);
   if (duplicates) parts.push(`发现 ${duplicates} 份同邮箱凭证，仅更新主凭证`);
   if (failed) parts.push(`失败 ${failed} 个`);

@@ -228,7 +228,7 @@ export function createCpampSync(options) {
 
   async function syncJobs(jobs, syncOptions) {
     const unique = uniqueByEmail(jobs);
-    const summary = { selected: jobs.length, attempted: unique.length, created: 0, updated: 0, recovered: 0, recoveryPending: 0, failed: 0, duplicates: 0, results: [] };
+    const summary = { selected: jobs.length, attempted: unique.length, created: 0, updated: 0, recovered: 0, quotaRefreshed: 0, recoveryPending: 0, failed: 0, duplicates: 0, results: [] };
     let modelIdsPromise = null;
     const context = {
       async getModelIds() {
@@ -255,6 +255,7 @@ export function createCpampSync(options) {
       else if (result.operation === "created") summary.created += 1;
       else summary.updated += 1;
       if (result.recovered === true) summary.recovered += 1;
+      if (result.quotaRefreshed === true) summary.quotaRefreshed += 1;
       if (result.recoveryWarning) summary.recoveryPending += 1;
       summary.duplicates += Number(result.duplicateCount || 0);
       summary.results.push(result);
@@ -281,6 +282,7 @@ export function createCpampSync(options) {
     const record = recordForWrite(email);
     record.state = "syncing";
     record.lastError = null;
+    record.quotaRefreshedAt = null;
     await persist();
     const auth = await buildCodexAuth(job);
     const files = extractFiles(await request(config.baseUrl, managementKey, "/auth-files"));
@@ -300,7 +302,7 @@ export function createCpampSync(options) {
     await uploadAuthFile(config.baseUrl, managementKey, fileName, payload);
     const recovery = shouldRecoverAfterManualReauthorization(selection.file, syncOptions)
       ? await recoverAfterManualReauthorization(email, selection.file, fileName, context)
-      : { recovered: false, warning: null };
+      : { recovered: false, quotaRefreshed: false, warning: null };
     record.email = email;
     record.remoteFileName = fileName;
     record.pendingJobId = null;
@@ -308,6 +310,7 @@ export function createCpampSync(options) {
     record.state = "synced";
     record.lastSyncAt = new Date().toISOString();
     record.lastError = recovery.warning;
+    record.quotaRefreshedAt = recovery.quotaRefreshed ? record.lastSyncAt : null;
     record.retryAttempt = 0;
     record.nextRetryAt = null;
     record.duplicateCount = selection.duplicateCount;
@@ -320,6 +323,7 @@ export function createCpampSync(options) {
       remoteFileName: fileName,
       duplicateCount: selection.duplicateCount,
       recovered: recovery.recovered,
+      quotaRefreshed: recovery.quotaRefreshed,
       recoveryWarning: recovery.warning,
     };
   }
@@ -328,39 +332,50 @@ export function createCpampSync(options) {
     const candidates = await context.getReauthorizationCandidates();
     const matchesCandidate = candidates.some((candidate) => actionCandidateMatches(candidate, email, fileName, remoteMutationTarget(file, fileName)));
     const externalIssue = config.externalReauth.records[normalizeEmail(email)];
-    if (!matchesCandidate && !cpampReauthorizationIssue(file) && externalIssue?.action !== "reauth") {
-      return { recovered: false, warning: null };
+    const needsReenable = matchesCandidate || Boolean(cpampReauthorizationIssue(file)) || externalIssue?.action === "reauth";
+    if (needsReenable) {
+      const targetName = remoteMutationTarget(file, fileName);
+      if (!targetName) throw syncError(409, "CPAMP 返回的凭证标识无效，无法恢复重新授权后的账号");
+      await patchAuthFileFields(config.baseUrl, managementKey, targetName, {
+        expired: "2000-01-01T00:00:00Z",
+        last_refresh: "2000-01-01T00:00:00Z",
+      });
+      const statusPayload = buildAuthFileStatusPayload(file, targetName, false);
+      await patchAuthFileStatus(config.baseUrl, managementKey, statusPayload);
     }
-    const targetName = remoteMutationTarget(file, fileName);
-    if (!targetName) throw syncError(409, "CPAMP 返回的凭证标识无效，无法恢复重新授权后的账号");
-    await patchAuthFileFields(config.baseUrl, managementKey, targetName, {
-      expired: "2000-01-01T00:00:00Z",
-      last_refresh: "2000-01-01T00:00:00Z",
-    });
-    const statusPayload = buildAuthFileStatusPayload(file, targetName, false);
-    await patchAuthFileStatus(config.baseUrl, managementKey, statusPayload);
     const files = extractFiles(await request(config.baseUrl, managementKey, "/auth-files"));
     const updated = selectRecoveredRemoteFile(files, file, fileName);
-    if (!updated || updated.disabled === true || isDisabledRemoteStatus(updated)) {
+    if (!updated) {
       return {
         recovered: false,
+        quotaRefreshed: false,
+        warning: "CPAMP 已上传最新 OAuth，但未能重新读取远端凭证；请稍后重试同步",
+      };
+    }
+    if (updated.disabled === true || isDisabledRemoteStatus(updated)) {
+      if (!needsReenable) return { recovered: false, quotaRefreshed: false, warning: null };
+      return {
+        recovered: false,
+        quotaRefreshed: false,
         warning: "CPAMP 已上传最新 OAuth，但远端仍保持禁用；请使用重新登录并授权",
       };
     }
     const quotaRefreshWarning = await refreshCodexQuotaAfterReauthorization(updated);
-    if (quotaRefreshWarning) return { recovered: false, warning: quotaRefreshWarning };
-    await resolveReauthorizationCandidates(candidates, email, file, fileName);
-    delete config.externalReauth.records[email];
-    if (config.externalReauth.lastResult && typeof config.externalReauth.lastResult === "object") {
-      config.externalReauth.lastResult.needsReauthorization = Object.keys(config.externalReauth.records).length;
+    if (quotaRefreshWarning) return { recovered: false, quotaRefreshed: false, warning: quotaRefreshWarning };
+    if (needsReenable) {
+      await resolveReauthorizationCandidates(candidates, email, file, fileName);
+      delete config.externalReauth.records[email];
+      if (config.externalReauth.lastResult && typeof config.externalReauth.lastResult === "object") {
+        config.externalReauth.lastResult.needsReauthorization = Object.keys(config.externalReauth.records).length;
+      }
     }
-    return { recovered: true, warning: quotaRefreshWarning };
+    return { recovered: needsReenable, quotaRefreshed: true, warning: null };
   }
 
   async function refreshCodexQuotaAfterReauthorization(file) {
     const authIndex = remoteAuthIndex(file);
     if (!authIndex) {
-      return "CPAMP 已上传最新 OAuth 并重新启用，但未返回可用于刷新额度的凭证索引；请在 CPAMP 刷新额度后复核状态";
+      return "CPAMP 已上传最新 OAuth，但未返回可用于刷新额度的凭证索引；请在 CPAMP 刷新额度后复核状态";
     }
     try {
       const result = await request(config.baseUrl, managementKey, "/api-call", {
@@ -374,14 +389,14 @@ export function createCpampSync(options) {
       });
       const status = apiCallStatusCode(result);
       if (status === null) {
-        return "CPAMP 已上传最新 OAuth 并重新启用，但自动刷新额度未返回远端状态；请稍后重试同步";
+        return "CPAMP 已上传最新 OAuth，但自动刷新额度未返回远端状态；请稍后重试同步";
       }
       if (status < 200 || status >= 300) {
-        return `CPAMP 已上传最新 OAuth 并重新启用，但自动刷新额度返回 HTTP ${status}；请稍后重试同步`;
+        return `CPAMP 已上传最新 OAuth，但自动刷新额度返回 HTTP ${status}；请稍后重试同步`;
       }
       return null;
     } catch (error) {
-      return `CPAMP 已上传最新 OAuth 并重新启用，但自动刷新额度失败：${redactSecrets(error.message)}`;
+      return `CPAMP 已上传最新 OAuth，但自动刷新额度失败：${redactSecrets(error.message)}`;
     }
   }
 
@@ -775,6 +790,7 @@ function publicSyncRecord(record) {
     remoteFileName: record.remoteFileName || null,
     lastSyncAt: record.lastSyncAt || null,
     lastError: record.lastError || null,
+    quotaRefreshedAt: record.quotaRefreshedAt || null,
     duplicateCount: Number(record.duplicateCount || 0),
     retryAttempt: Number(record.retryAttempt || 0),
     nextRetryAt: record.nextRetryAt || null,
