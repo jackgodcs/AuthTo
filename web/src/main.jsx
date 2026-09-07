@@ -2783,8 +2783,11 @@ function ExternalSyncStatus({ system, sync }) {
     if (sync.lastError) {
       return <div className="external-sync-status pending"><CircleAlert size={13} />{system} OAuth 已同步，但{extractResponseMessage(sync.lastError)}</div>;
     }
-    if (system === "CPAMP" && (sync.stateEvidencePersistedAt || sync.quotaRefreshedAt)) {
+    if (system === "CPAMP" && sync.stateEvidencePersistedAt) {
       return <div className="external-sync-status success"><Check size={13} />CPAMP 已确认新授权并完成健康复核{sync.lastSyncAt ? ` · ${formatDateTime(sync.lastSyncAt)}` : ""}</div>;
+    }
+    if (system === "CPAMP" && sync.quotaRefreshedAt) {
+      return <div className="external-sync-status pending"><CircleAlert size={13} />CPAMP 已载入新授权并读取额度，等待持久化状态确认{sync.lastSyncAt ? ` · ${formatDateTime(sync.lastSyncAt)}` : ""}</div>;
     }
     if (system === "CPAMP" && sync.runtimeStateRecoveredAt) {
       return <div className="external-sync-status success"><Check size={13} />CPAMP 已恢复账号运行状态{sync.lastSyncAt ? ` · ${formatDateTime(sync.lastSyncAt)}` : ""}</div>;
@@ -2991,7 +2994,7 @@ function formatCpampResult(result) {
   if (recovered) parts.push(`恢复 ${recovered} 个重新授权账号`);
   if (credentialVerified) parts.push(`已确认新授权载入 ${credentialVerified} 个`);
   if (runtimeStateRecovered) parts.push(`已恢复账号运行状态 ${runtimeStateRecovered} 个`);
-  if (stateEvidencePersisted) parts.push(`已持久化并验证状态证据 ${stateEvidencePersisted} 个`);
+  if (stateEvidencePersisted) parts.push(`已由 CPAMP 持久化请求历史确认 ${stateEvidencePersisted} 个`);
   if (recoveryPending) parts.push(`已上传 OAuth 但状态复核待完成 ${recoveryPending} 个，请查看待恢复详情`);
   if (duplicates) parts.push(`发现 ${duplicates} 份同邮箱凭证，仅更新主凭证`);
   if (failed) parts.push(`失败 ${failed} 个`);

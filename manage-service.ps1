@@ -74,14 +74,14 @@ if ($Action -eq "start") {
 
   Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ascii
   $ready = $false
-  for ($attempt = 0; $attempt -lt 30; $attempt += 1) {
+  for ($attempt = 0; $attempt -lt 240; $attempt += 1) {
     $process.Refresh()
     if ($process.HasExited) { break }
     try {
       $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:4399/api/bootstrap" -TimeoutSec 1
       if ($response.StatusCode -eq 200) { $ready = $true; break }
     } catch {}
-    Start-Sleep -Milliseconds 250
+    Start-Sleep -Milliseconds 500
   }
   if (-not $ready) {
     Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue

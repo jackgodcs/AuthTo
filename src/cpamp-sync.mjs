@@ -16,6 +16,9 @@ const TRANSIENT_FAILURE_THRESHOLD = 3;
 const CREDENTIAL_CONFIRMATION_ATTEMPTS = 6;
 const CREDENTIAL_CONFIRMATION_DELAY_MS = 1_000;
 const CREDENTIAL_TIMESTAMP_TOLERANCE_MS = 5_000;
+// A successful request must be produced after the OAuth upload. Accepting an
+// older history event turns a stale success into a false recovery result.
+const ACCOUNT_HISTORY_TIMESTAMP_TOLERANCE_MS = 0;
 const CODEX_QUOTA_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_QUOTA_USAGE_HEADERS = {
   Authorization: "Bearer $TOKEN$",
@@ -315,8 +318,8 @@ export function createCpampSync(options) {
       payload = applyPolicyToPayload(payload, email, config.policy, models, job);
     }
     await uploadAuthFile(config.baseUrl, managementKey, fileName, payload);
-    const recovery = shouldRecoverAfterManualReauthorization(selection.file, syncOptions)
-      ? await recoverAfterManualReauthorization(email, selection.file, fileName, auth.last_refresh, context)
+    const recovery = shouldRecoverAfterAuthorizationSync(selection.file, syncOptions, config.externalReauth.records[normalizeEmail(email)])
+      ? await recoverAfterManualReauthorization(email, selection.file, fileName, auth.last_refresh, auth, context)
       : { recovered: false, credentialVerified: false, runtimeStateRecovered: false, stateEvidencePersisted: false, quotaRefreshed: false, warning: null };
     record.email = email;
     record.remoteFileName = fileName;
@@ -349,7 +352,8 @@ export function createCpampSync(options) {
     };
   }
 
-  async function recoverAfterManualReauthorization(email, file, fileName, uploadedLastRefresh, context) {
+  async function recoverAfterManualReauthorization(email, file, fileName, uploadedLastRefresh, uploadedCredential, context) {
+    const recoveryStartedAtMs = Date.now();
     const candidates = await context.getReauthorizationCandidates();
     const matchesCandidate = candidates.some((candidate) => actionCandidateMatches(candidate, email, fileName, remoteMutationTarget(file, fileName)));
     const externalIssue = config.externalReauth.records[normalizeEmail(email)];
@@ -361,7 +365,7 @@ export function createCpampSync(options) {
       await patchAuthFileStatus(config.baseUrl, managementKey, statusPayload);
     }
     const expectedRefreshAt = parseTimestamp(uploadedLastRefresh);
-    const updated = await waitForUploadedCredential(file, fileName, expectedRefreshAt);
+    const updated = await waitForUploadedCredential(file, fileName, expectedRefreshAt, uploadedCredential);
     if (!updated) {
       return {
         recovered: false,
@@ -387,27 +391,36 @@ export function createCpampSync(options) {
     if (runtimeRecovery.warning) {
       return { recovered: false, credentialVerified: true, runtimeStateRecovered: false, stateEvidencePersisted: false, quotaRefreshed: false, warning: runtimeRecovery.warning };
     }
-    const stateEvidence = await persistCpampHealthEvidenceAfterReauthorization(runtimeRecovery.file);
-    if (stateEvidence.warning) {
-      return { recovered: false, credentialVerified: true, runtimeStateRecovered: runtimeRecovery.recovered, stateEvidencePersisted: false, quotaRefreshed: false, warning: stateEvidence.warning };
+    const healthProbe = await runCpampHealthProbeAfterReauthorization(runtimeRecovery.file);
+    const quotaRead = await refreshCpampQuotaSnapshotAfterReauthorization(runtimeRecovery.file);
+    if (quotaRead.warning) {
+      return { recovered: false, credentialVerified: true, runtimeStateRecovered: runtimeRecovery.recovered, stateEvidencePersisted: false, quotaRefreshed: false, warning: quotaRead.warning };
     }
-    const histories = await listAccountHistories([runtimeRecovery.file]);
-    const historyIssue = cpampAccountHistoryIssue(
-      histories.byFileName.get(String(runtimeRecovery.file.name || "")),
-      Math.max(remoteCredentialRefreshAt(runtimeRecovery.file), stateEvidence.observedAtMs || 0),
+    const candidateResolution = needsReenable
+      ? await resolveReauthorizationCandidates(candidates, email, runtimeRecovery.file, fileName)
+      : { confirmed: false, warning: null };
+    if (candidateResolution.warning) {
+      return { recovered: false, credentialVerified: true, runtimeStateRecovered: runtimeRecovery.recovered, stateEvidencePersisted: false, quotaRefreshed: true, warning: candidateResolution.warning };
+    }
+    const historyConfirmation = await waitForCpampPersistedReauthorization(
+      runtimeRecovery.file,
+      recoveryStartedAtMs,
+      healthProbe.supported && !healthProbe.warning,
     );
-    if (historyIssue?.action === "reauth") {
+    if (!historyConfirmation.confirmed && !candidateResolution.confirmed) {
+      const healthProbeReason = healthProbe.supported
+        ? healthProbe.warning || `正式健康探测已调用，但${historyConfirmation.reason}`
+        : healthProbe.warning;
       return {
         recovered: false,
         credentialVerified: true,
         runtimeStateRecovered: runtimeRecovery.recovered,
-        stateEvidencePersisted: true,
-        quotaRefreshed: false,
-        warning: `CPAMP 已载入新 OAuth 并写入状态证据，但复核后仍提示需重登：${historyIssue.reason}`,
+        stateEvidencePersisted: false,
+        quotaRefreshed: true,
+        warning: `CPAMP 已载入新 OAuth 并完成额度读取，但 CPAMP 持久化状态尚未确认：${healthProbeReason || historyConfirmation.reason}`,
       };
     }
     if (needsReenable) {
-      await resolveReauthorizationCandidates(candidates, email, file, fileName);
       delete config.externalReauth.records[email];
       if (config.externalReauth.lastResult && typeof config.externalReauth.lastResult === "object") {
         config.externalReauth.lastResult.needsReauthorization = Object.keys(config.externalReauth.records).length;
@@ -416,7 +429,51 @@ export function createCpampSync(options) {
     return { recovered: needsReenable, credentialVerified: true, runtimeStateRecovered: runtimeRecovery.recovered, stateEvidencePersisted: true, quotaRefreshed: true, warning: null };
   }
 
-  async function waitForUploadedCredential(file, fileName, expectedRefreshAt) {
+  async function runCpampHealthProbeAfterReauthorization(file) {
+    const authIndex = remoteAuthIndex(file);
+    if (!authIndex) {
+      return { supported: false, warning: "远端未返回可用于正式健康探测的凭证索引" };
+    }
+    try {
+      const result = await request(config.baseUrl, managementKey, "/auth-health-probe", {
+        method: "POST",
+        body: JSON.stringify({ auth_index: authIndex }),
+      });
+      if (healthProbeReportedFailure(result)) {
+        return { supported: true, warning: `正式健康探测失败：${healthProbeFailureReason(result)}` };
+      }
+      const returnedAuthIndex = String(result?.auth_index ?? result?.authIndex ?? "").trim();
+      if (returnedAuthIndex && returnedAuthIndex !== authIndex) {
+        return { supported: true, warning: "正式健康探测返回了不匹配的凭证索引，已拒绝确认账号状态" };
+      }
+      return { supported: true, warning: null };
+    } catch (error) {
+      if (error?.remoteStatus === 404) {
+        return { supported: false, warning: "当前 CPAMP/CLIProxyAPI 未提供按账号执行正式健康探测的接口；额度读取不会改变网页刷新后的需重登状态" };
+      }
+      return { supported: true, warning: `正式健康探测请求失败：${redactSecrets(error.message)}` };
+    }
+  }
+
+  async function waitForCpampPersistedReauthorization(file, recoveryStartedAtMs, waitForProbe) {
+    const attempts = waitForProbe ? credentialConfirmationAttempts : 1;
+    let confirmation = {
+      confirmed: false,
+      reason: "尚未出现新的请求记录；网页刷新后仍会沿用原来的需重登状态",
+    };
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt > 0) await delay(credentialConfirmationDelayMs);
+      const histories = await listAccountHistories([file]);
+      confirmation = confirmCpampPersistedReauthorization(
+        histories.byFileName.get(String(file.name || "")),
+        recoveryStartedAtMs,
+      );
+      if (confirmation.confirmed) return confirmation;
+    }
+    return confirmation;
+  }
+
+  async function waitForUploadedCredential(file, fileName, expectedRefreshAt, expectedCredential) {
     let latest = null;
     for (let attempt = 0; attempt < credentialConfirmationAttempts; attempt += 1) {
       if (attempt > 0) await delay(credentialConfirmationDelayMs);
@@ -424,8 +481,20 @@ export function createCpampSync(options) {
       latest = selectRecoveredRemoteFile(files, file, fileName);
       if (latest && expectedRefreshAt > 0
         && remoteCredentialRefreshAt(latest) >= expectedRefreshAt - CREDENTIAL_TIMESTAMP_TOLERANCE_MS) return latest;
+      if (latest && await uploadedCredentialMatches(fileName, expectedCredential)) return latest;
     }
     return null;
+  }
+
+  async function uploadedCredentialMatches(fileName, expectedCredential) {
+    const targetName = String(fileName || "").trim();
+    if (!targetName) return false;
+    try {
+      const raw = await requestText(config.baseUrl, managementKey, `/auth-files/download?name=${encodeURIComponent(targetName)}`);
+      return credentialPayloadMatches(JSON.parse(raw), expectedCredential);
+    } catch {
+      return false;
+    }
   }
 
   async function resetCpampRuntimeStateAfterReauthorization(file, fileName) {
@@ -460,7 +529,7 @@ export function createCpampSync(options) {
     }
   }
 
-  async function persistCpampHealthEvidenceAfterReauthorization(file) {
+  async function refreshCpampQuotaSnapshotAfterReauthorization(file) {
     const authIndex = remoteAuthIndex(file);
     if (!authIndex) {
       return { warning: "CPAMP 已上传最新 OAuth，但未返回可用于状态复核的凭证索引；请稍后重试同步", observedAtMs: null };
@@ -526,10 +595,16 @@ export function createCpampSync(options) {
     const target = remoteMutationTarget(file, fileName);
     const matching = candidates.filter((candidate) => candidate.actionType === "reauth"
       && actionCandidateMatches(candidate, email, fileName, target));
+    if (!matching.length) return { confirmed: false, warning: null };
     try {
       await Promise.all(matching.map((candidate) => request(config.baseUrl, managementKey, `/account-action-candidates/${encodeURIComponent(candidate.id)}/resolve`, { method: "POST" })));
-    } catch {
-      // The credential itself has been verified. Leaving a stale CPAMP suggestion is safer than failing the successful sync.
+      const remaining = await listPendingReauthorizationCandidates();
+      if (remaining.some((candidate) => actionCandidateMatches(candidate, email, fileName, target))) {
+        return { confirmed: false, warning: "CPAMP 已验证新 OAuth 可读取额度，但需重登状态回读仍未清除；请稍后重试同步" };
+      }
+      return { confirmed: true, warning: null };
+    } catch (error) {
+      return { confirmed: false, warning: `CPAMP 已验证新 OAuth 可读取额度，但清除旧需重登状态失败：${redactSecrets(error.message)}` };
     }
   }
 
@@ -980,9 +1055,9 @@ function isDisabledRemoteStatus(file) {
   return ["disabled", "inactive"].includes(status);
 }
 
-function shouldRecoverAfterManualReauthorization(file, syncOptions) {
-  return syncOptions?.source === "manual_reauthorization"
-    && Boolean(file);
+function shouldRecoverAfterAuthorizationSync(file, syncOptions, externalIssue) {
+  return Boolean(file) && (syncOptions?.source === "manual_reauthorization"
+    || (syncOptions?.source === "manual" && externalIssue?.action === "reauth"));
 }
 
 function remoteMutationTarget(file, fallbackName) {
@@ -1302,6 +1377,32 @@ function authMatchesEmail(value, email) {
   return candidates.some((candidate) => normalizeEmail(candidate) === normalized);
 }
 
+function credentialPayloadMatches(payload, file) {
+  const expected = credentialMatchFields(file);
+  if (!expected.email || !expected.accessToken) return false;
+  const entries = Array.isArray(payload) ? payload : [payload];
+  return entries.some((entry) => {
+    if (!entry || typeof entry !== "object" || !authMatchesEmail(entry, expected.email)) return false;
+    const candidate = credentialMatchFields(entry);
+    if (candidate.accessToken !== expected.accessToken) return false;
+    if (expected.refreshToken && candidate.refreshToken !== expected.refreshToken) return false;
+    if (expected.idToken && candidate.idToken !== expected.idToken) return false;
+    return true;
+  });
+}
+
+function credentialMatchFields(value) {
+  const credentials = value?.credentials && typeof value.credentials === "object" ? value.credentials : {};
+  const extra = value?.extra && typeof value.extra === "object" ? value.extra : {};
+  const pick = (...values) => values.find((item) => typeof item === "string" && item.trim())?.trim() || "";
+  return {
+    email: normalizeEmail(pick(value?.email, value?.account, value?.display_account, value?.displayAccount, credentials.email, credentials.email_address, extra.email, extra.email_address)),
+    accessToken: pick(value?.access_token, value?.accessToken, credentials.access_token, credentials.accessToken, extra.access_token, extra.accessToken),
+    refreshToken: pick(value?.refresh_token, value?.refreshToken, credentials.refresh_token, credentials.refreshToken, extra.refresh_token, extra.refreshToken),
+    idToken: pick(value?.id_token, value?.idToken, credentials.id_token, credentials.idToken, extra.id_token, extra.idToken),
+  };
+}
+
 function mergeAuthFields(remote, auth) {
   const merged = { ...remote };
   const fields = [
@@ -1427,6 +1528,57 @@ function cpampAccountHistoryIssue(history, supersededAtMs = 0) {
     action: "review",
     reason: `CPAMP 最近连续 ${consecutiveTransientFailures} 次请求失败：${cpampRequestReason(latest, "请求暂时失败")}`,
   };
+}
+
+function confirmCpampPersistedReauthorization(history, recoveryStartedAtMs) {
+  if (!history || typeof history !== "object") {
+    return {
+      confirmed: false,
+      reason: "未返回账号请求历史；当前 CPAMP/CLIProxyAPI 未提供可指定账号的正式健康探测接口",
+    };
+  }
+  const requests = [history.latest_request, history.latestRequest, ...(history.recent_requests ?? history.recentRequests ?? [])]
+    .filter((request) => request && typeof request === "object")
+    .sort((left, right) => requestTimestamp(right) - requestTimestamp(left));
+  if (!requests.length) {
+    return {
+      confirmed: false,
+      reason: "尚未出现新的请求记录；网页刷新后仍会沿用原来的需重登状态",
+    };
+  }
+  const latest = requests[0];
+  const earliestAcceptedAtMs = recoveryStartedAtMs - ACCOUNT_HISTORY_TIMESTAMP_TOLERANCE_MS;
+  if (requestTimestamp(latest) < earliestAcceptedAtMs) {
+    return {
+      confirmed: false,
+      reason: "最近请求仍早于本次重新授权，网页刷新后仍会沿用原来的需重登状态",
+    };
+  }
+  if (latest.failed === false) return { confirmed: true, reason: null };
+  if (latest.failed !== true) {
+    return {
+      confirmed: false,
+      reason: "最近正式请求未返回明确的成功状态，无法确认网页刷新后的账号状态",
+    };
+  }
+  return {
+    confirmed: false,
+    reason: `本次后的最近请求仍失败：${cpampRequestReason(latest, "请求失败")}`,
+  };
+}
+
+function healthProbeReportedFailure(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.ok === false || payload.success === false || payload.failed === true) return true;
+  const status = apiCallStatusCode(payload);
+  return status !== null && (status < 200 || status >= 300);
+}
+
+function healthProbeFailureReason(payload) {
+  const detail = [payload?.error, payload?.message, payload?.reason, payload?.detail]
+    .find((value) => typeof value === "string" && value.trim());
+  const status = apiCallStatusCode(payload);
+  return redactSecrets(detail || (status ? `HTTP ${status}` : "远端未返回失败详情")).slice(0, 300);
 }
 
 function cpampRequestKind(request) {
