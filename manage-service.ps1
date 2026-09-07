@@ -63,7 +63,7 @@ if ($Action -eq "start") {
   $env:TOSUB2_PYTHON = $pythonExe
   $env:ONBOARDING_OUTPUT_ROOT = $outputRoot
   $env:TOSUB2_POWERSHELL = if (Test-Path -LiteralPath $powerShell7) { $powerShell7 } else { "pwsh.exe" }
-  $env:CHATGPT_DEFAULT_PROXY_URL = "socks5h://127.0.0.1:10808"
+  Remove-Item Env:CHATGPT_DEFAULT_PROXY_URL -ErrorAction SilentlyContinue
   $process = Start-Process -FilePath $nodeExe `
     -ArgumentList @("src/console-server.mjs", "--host", "127.0.0.1", "--port", "4399") `
     -WorkingDirectory $appDir `

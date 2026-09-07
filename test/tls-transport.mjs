@@ -291,6 +291,18 @@ try {
   );
   assert.equal(timeoutRequests, 1, "a timed-out login request should rotate the proxy instead of retrying it in place");
 
+  const directConnectionFailure = new TlsFingerprintTransport({ enabled: true });
+  let directRequests = 0;
+  directConnectionFailure.send = async (message) => {
+    if (message.operation === "configure") return {};
+    directRequests += 1;
+    if (directRequests < 3) throw new Error("ConnectionError: Failed to perform, curl: (56) Connection closed abruptly");
+    return { status: 200, headers: [], body: "", cookies: [] };
+  };
+  await directConnectionFailure.configure(null);
+  assert.equal((await directConnectionFailure.request("GET", "https://chatgpt.com/")).status, 200);
+  assert.equal(directRequests, 3, "direct Chrome transport should retry two transient connection failures without adding a proxy");
+
   const ordinaryRequestFailure = new TlsFingerprintTransport({ enabled: true });
   ordinaryRequestFailure.send = async (message) => {
     if (message.operation === "configure") return {};

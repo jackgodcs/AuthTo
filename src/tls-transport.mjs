@@ -12,6 +12,7 @@ const PROFILE_PROBE_TOTAL_TIMEOUT_MS = 300_000;
 const PROFILE_PROBE_CONCURRENCY = 4;
 const DEFAULT_SAME_PROXY_RISK_RETRIES = 3;
 const DEFAULT_SAME_PROXY_RISK_RETRY_DELAY_MS = 1_000;
+const DEFAULT_DIRECT_CONNECTION_RETRIES = 2;
 const DEFAULT_CLOUDFLARE_SOLVER_TIMEOUT_MS = 70_000;
 const UNCONFIGURED = Symbol("unconfigured");
 
@@ -203,6 +204,7 @@ export class TlsFingerprintTransport {
     };
     let result;
     let retries = 0;
+    let directConnectionRetries = 0;
     let cloudflareSolveAttempted = false;
     for (;;) {
       try {
@@ -213,6 +215,11 @@ export class TlsFingerprintTransport {
             `PROXY_CONNECTION_RETRY: ${method} ${safeRequestTarget(url)} failed: ` +
               redactProxyError(error?.message || "proxy connection failed"),
           );
+        }
+        if (!this.hasConfiguredProxy() && isRetryableProxyConnectionError(error) && directConnectionRetries < DEFAULT_DIRECT_CONNECTION_RETRIES) {
+          directConnectionRetries += 1;
+          console.log(`[tls] 本机直连暂时中断，保持 Chrome 指纹重试 ${directConnectionRetries}/${DEFAULT_DIRECT_CONNECTION_RETRIES}。`);
+          continue;
         }
         throw error;
       }

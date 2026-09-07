@@ -22,7 +22,7 @@ import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-trans
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
 const MAX_ACTIVE_JOBS = 20;
-const DEFAULT_TLS_PROFILE = "chrome";
+const DEFAULT_TLS_PROFILE = "auto";
 const DEFAULT_CHATGPT_PROXY_URL = String(process.env.CHATGPT_DEFAULT_PROXY_URL || "").trim();
 const MAX_BATCH_JOBS = 500;
 const JOB_STATUSES = new Set([
