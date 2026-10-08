@@ -1836,7 +1836,10 @@ function isTemporaryError(error) {
 
 function remoteError(status, text) {
   const message = responseMessage(text);
-  const error = syncError(status === 401 || status === 403 || status === 400 || status === 404 ? 502 : 503, `CPAMP 返回 HTTP ${status}${message ? `：${message}` : ""}`);
+  const authHint = status === 401 && /invalid(?:_| )admin key/i.test(message)
+    ? "；此地址运行 CPAMP Manager Server，请填写 CPAMP Admin Key（通常为 cpamp_ 开头），不要填写 CPA Management Key"
+    : "";
+  const error = syncError(status === 401 || status === 403 || status === 400 || status === 404 ? 502 : 503, `CPAMP 返回 HTTP ${status}${message ? `：${message}` : ""}${authHint}`);
   error.remoteStatus = status;
   return error;
 }

@@ -395,7 +395,7 @@ function App() {
       return;
     }
     if (!cpampStatus.configured && !String(cpampSettingsDraft.managementKey || "").trim()) {
-      setCpampSettingsError("请输入 CPAMP 管理密钥");
+      setCpampSettingsError("请输入 CPAMP Admin Key");
       return;
     }
     setCpampSettingsSaving(true);
@@ -425,7 +425,7 @@ function App() {
 
   async function loadCpampModels() {
     if (!cpampStatus.configured) {
-      setCpampSettingsError("请先保存 CPAMP 服务器地址和管理密钥，再读取模型目录");
+      setCpampSettingsError("请先保存 CPAMP 服务器地址和 CPAMP Admin Key，再读取模型目录");
       return;
     }
     setCpampModelsLoading(true);
@@ -729,7 +729,7 @@ function App() {
   async function syncSelectedToCpamp(ids) {
     if (!cpampStatus.configured) {
       openCpampSettings();
-      setCpampSettingsError("请先配置 CPAMP API 根地址和管理密钥");
+      setCpampSettingsError("请先配置 CPAMP API 根地址和 CPAMP Admin Key");
       return;
     }
     if (batchAction) return;
@@ -756,7 +756,7 @@ function App() {
   async function applyCpampPolicyToSelected() {
     if (!cpampStatus.configured) {
       openCpampSettings();
-      setCpampSettingsError("请先配置 CPAMP API 根地址和管理密钥");
+      setCpampSettingsError("请先配置 CPAMP API 根地址和 CPAMP Admin Key");
       return;
     }
     if (batchAction) return;
@@ -2112,7 +2112,7 @@ function App() {
             <div className="dialog-header">
               <div>
                 <h2 id="cpamp-settings-title">CPAMP 授权同步</h2>
-                <span>管理密钥仅在当前 Windows 用户下加密保存</span>
+                <span>CPAMP Admin Key 仅在当前 Windows 用户下加密保存</span>
               </div>
               <button type="button" className="icon-button" onClick={() => setCpampSettingsOpen(false)} disabled={cpampSettingsSaving} title="关闭"><X size={18} /></button>
             </div>
@@ -2129,14 +2129,15 @@ function App() {
                 <small>填写服务器根地址，不要填写 management.html#/accounts 等页面地址</small>
               </label>
               <label className="settings-field wide-settings-field">
-                <span>CPAMP 管理密钥</span>
+                <span>CPAMP Admin Key</span>
                 <input
                   type="password"
                   value={cpampSettingsDraft.managementKey}
                   onChange={(event) => setCpampSettingsDraft((current) => ({ ...current, managementKey: event.target.value }))}
-                  placeholder={cpampStatus.configured ? "留空保持当前本机加密密钥" : "输入 CPAMP 管理密钥"}
+                  placeholder={cpampStatus.configured ? "留空保持当前本机加密密钥" : "输入 CPAMP Admin Key（通常以 cpamp_ 开头）"}
                   autoComplete="off"
                 />
+                <small>完整 Manager Server 模式应填写 CPAMP Admin Key，不是 CPA Management Key</small>
               </label>
               <label className="settings-field wide-settings-field cpamp-auto-sync-toggle">
                 <input

@@ -20,6 +20,7 @@ const actionCandidates = [];
 let storedManagementKey = "";
 let requiresManagementPrefix = false;
 let rejectsManagementKey = false;
+let rejectedManagementKeyMessage = "invalid management key";
 let ignoresEnableRequests = false;
 let requiresStatusIdentityMetadata = false;
 let quotaRefreshStatus = 200;
@@ -35,7 +36,7 @@ let maxUploadsInFlight = 0;
 const server = http.createServer(async (req, res) => {
   if (rejectsManagementKey || req.headers.authorization !== "Bearer test-management-key") {
     res.writeHead(401, { "content-type": "application/json" });
-    res.end(JSON.stringify({ message: "invalid management key" }));
+    res.end(JSON.stringify({ message: rejectedManagementKeyMessage }));
     return;
   }
 
@@ -477,6 +478,14 @@ try {
   });
   assert.equal(locallySavedReauthorization.syncAfterManualReauthorization, true);
   rejectsManagementKey = false;
+  rejectsManagementKey = true;
+  rejectedManagementKeyMessage = "invalid admin key";
+  await assert.rejects(
+    sync.configure({ baseUrl, managementKey: "wrong-admin-key", autoSyncEnabled: false }),
+    (error) => error.message.includes("CPAMP Admin Key") && error.message.includes("不要填写 CPA Management Key"),
+  );
+  rejectsManagementKey = false;
+  rejectedManagementKeyMessage = "invalid management key";
   const manualReauthorization = await writeJob("manual-reauthorization", "manual-reauthorization@example.com", "manual-reauthorization-access", "manual-reauthorization-refresh");
   const manualReauthorizationCreated = await sync.syncManual([manualReauthorization]);
   const manualReauthorizationFileName = manualReauthorizationCreated.results[0].remoteFileName;

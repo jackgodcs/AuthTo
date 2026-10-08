@@ -32,6 +32,8 @@ try {
   });
   assert.equal(rejected.ok, false);
   assert.match(rejected.message, /HTTP 401/);
+  assert.match(rejected.message, /CPAMP Admin Key/);
+  assert.match(rejected.message, /CPA Management Key/);
   assert.equal(saved, null);
 
   const empty = await validateAndSaveCpampManagementKey("", { configPath, secretStore });

@@ -12,7 +12,7 @@ async function main() {
   const key = await readStdin();
   const result = await validateAndSaveCpampManagementKey(key);
   if (result.ok) {
-    console.log("CPAMP 管理密钥已验证并加密保存，现在可以重启 toSub2。");
+    console.log("CPAMP Admin Key已验证并加密保存，现在可以重启 toSub2。");
     return;
   }
   console.error(result.message);
@@ -21,7 +21,7 @@ async function main() {
 
 export async function validateAndSaveCpampManagementKey(key, options = {}) {
   const normalizedKey = String(key || "").trim();
-  if (!normalizedKey) return { ok: false, message: "未输入 CPAMP 管理密钥，未修改任何内容。" };
+  if (!normalizedKey) return { ok: false, message: "未输入 CPAMP Admin Key，未修改任何内容。" };
 
   const configPath = options.configPath || defaultConfigPath();
   const secretStore = options.secretStore || createProtectedStore();
@@ -56,11 +56,11 @@ export async function validateAndSaveCpampManagementKey(key, options = {}) {
   }
 
   if (!response.ok) {
-    return { ok: false, message: "CPAMP 拒绝了此密钥，HTTP " + response.status + "；未修改任何内容。" };
+    return { ok: false, message: "CPAMP 拒绝了此 Admin Key，HTTP " + response.status + "；完整 Manager Server 模式请使用 CPAMP Admin Key（通常为 cpamp_ 开头），不要使用 CPA Management Key；未修改任何内容。" };
   }
 
   await secretStore.save(MANAGEMENT_KEY_ID, normalizedKey);
-  return { ok: true, message: "CPAMP 管理密钥已验证并加密保存。" };
+  return { ok: true, message: "CPAMP Admin Key已验证并加密保存。" };
 }
 
 function defaultConfigPath() {
