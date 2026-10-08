@@ -46,6 +46,25 @@ try {
   await store.delete(email);
   assert.deepEqual(await store.load(email), { password: "", totpSecret: "", proxyUrl: "" });
 
+  let activeDpapiCalls = 0;
+  let maxActiveDpapiCalls = 0;
+  const queuedStore = createCredentialStore({
+    platform: "win32",
+    windowsRoot: path.join(tempRoot, "queued-dpapi"),
+    powerShellRunner: async (_script, input) => {
+      activeDpapiCalls += 1;
+      maxActiveDpapiCalls = Math.max(maxActiveDpapiCalls, activeDpapiCalls);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      activeDpapiCalls -= 1;
+      return { code: 0, stdout: Buffer.from(input, "utf8").toString("base64"), stderr: "" };
+    },
+  });
+  await Promise.all(Array.from({ length: 12 }, (_, index) => queuedStore.save(
+    `queued-${index}@example.com`,
+    credentials,
+  )));
+  assert.equal(maxActiveDpapiCalls, 8);
+
   if (process.platform === "win32") {
     const realStore = createCredentialStore({ windowsRoot: path.join(tempRoot, "real-dpapi") });
     await realStore.save(email, credentials);

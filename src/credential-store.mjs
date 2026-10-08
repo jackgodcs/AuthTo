@@ -8,6 +8,9 @@ const KEYCHAIN_SERVICE = "com.local.chatgpt-onboarding.credentials";
 const MAC_CREDENTIAL_ROOT = path.join(os.homedir(), "Library", "Application Support", "toSub2", "credentials");
 const WINDOWS_ENTROPY = "toSub2.credentials.v1";
 const CHILD_TIMEOUT_MS = 15_000;
+const WINDOWS_DPAPI_CONCURRENCY = 8;
+const windowsDpapiQueues = Array.from({ length: WINDOWS_DPAPI_CONCURRENCY }, () => Promise.resolve());
+let nextWindowsDpapiQueue = 0;
 
 const WINDOWS_PROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = "Stop"
@@ -63,7 +66,7 @@ export function createCredentialStore(options = {}) {
       if (platform === "win32") {
         let result;
         try {
-          result = await powerShellRunner(WINDOWS_PROTECT_SCRIPT, payload);
+          result = await queueWindowsDpapi(() => powerShellRunner(WINDOWS_PROTECT_SCRIPT, payload));
         } catch {
           result = { code: 1, stdout: "" };
         }
@@ -91,7 +94,7 @@ export function createCredentialStore(options = {}) {
           return emptyCredentials();
         }
         try {
-          const result = await powerShellRunner(WINDOWS_UNPROTECT_SCRIPT, cipherText);
+          const result = await queueWindowsDpapi(() => powerShellRunner(WINDOWS_UNPROTECT_SCRIPT, cipherText));
           return result.code === 0 ? parseCredentialPayload(result.stdout) : emptyCredentials();
         } catch {
           return emptyCredentials();
@@ -126,6 +129,13 @@ export function createCredentialStore(options = {}) {
       }
     },
   };
+}
+
+function queueWindowsDpapi(operation) {
+  const queueIndex = nextWindowsDpapiQueue++ % WINDOWS_DPAPI_CONCURRENCY;
+  const queued = windowsDpapiQueues[queueIndex].then(operation, operation);
+  windowsDpapiQueues[queueIndex] = queued.catch(() => {});
+  return queued;
 }
 
 function defaultWindowsCredentialRoot() {
