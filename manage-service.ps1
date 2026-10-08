@@ -31,6 +31,33 @@ function Get-ManagedProcess {
   return $process
 }
 
+function Test-ServiceReady {
+  try {
+    $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:4399/api/bootstrap" -TimeoutSec 2
+    return $response.StatusCode -eq 200
+  } catch {
+    return $false
+  }
+}
+
+function Stop-ManagedProcessTree([int]$ProcessId) {
+  $allProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+  $pending = [System.Collections.Generic.Queue[int]]::new()
+  $descendants = [System.Collections.Generic.List[int]]::new()
+  $pending.Enqueue($ProcessId)
+  while ($pending.Count -gt 0) {
+    $parentId = $pending.Dequeue()
+    foreach ($child in $allProcesses | Where-Object ParentProcessId -eq $parentId) {
+      $descendants.Add([int]$child.ProcessId)
+      $pending.Enqueue([int]$child.ProcessId)
+    }
+  }
+  for ($index = $descendants.Count - 1; $index -ge 0; $index -= 1) {
+    Stop-Process -Id $descendants[$index] -Force -ErrorAction SilentlyContinue
+  }
+  Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
+
 function Get-NodeExe {
   $candidates = @("D:\Program Files\nodejs\node.exe")
   $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
@@ -50,8 +77,14 @@ function Get-PythonExe {
 if ($Action -eq "start") {
   $existing = Get-ManagedProcess
   if ($existing) {
-    Write-Host "toSub2 is already running (PID $($existing.ProcessId))."
-    exit 0
+    if (Test-ServiceReady) {
+      Write-Host "toSub2 is already running (PID $($existing.ProcessId))."
+      exit 0
+    }
+    Write-Host "Found an unresponsive toSub2 startup process (PID $($existing.ProcessId)); restarting it."
+    Stop-ManagedProcessTree $existing.ProcessId
+    Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
   }
 
   $nodeExe = Get-NodeExe
@@ -84,6 +117,7 @@ if ($Action -eq "start") {
     Start-Sleep -Milliseconds 500
   }
   if (-not $ready) {
+    Stop-ManagedProcessTree $process.Id
     Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
     $lastError = if (Test-Path -LiteralPath $errLog) { (Get-Content -LiteralPath $errLog -Tail 8) -join [Environment]::NewLine } else { "No error log was written." }
     throw "toSub2 did not become ready during startup.`n$lastError"
@@ -103,10 +137,7 @@ if (-not $existing) {
   exit 0
 }
 
-Stop-Process -Id $existing.ProcessId -ErrorAction SilentlyContinue
+Stop-ManagedProcessTree $existing.ProcessId
 Start-Sleep -Seconds 2
-if (Get-Process -Id $existing.ProcessId -ErrorAction SilentlyContinue) {
-  Stop-Process -Id $existing.ProcessId -Force -ErrorAction SilentlyContinue
-}
 Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
 Write-Host "toSub2 stopped."

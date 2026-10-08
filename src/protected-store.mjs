@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 const WINDOWS_ENTROPY = "toSub2.protected-store.v1";
+const CHILD_TIMEOUT_MS = 15_000;
 
 const WINDOWS_PROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = "Stop"
@@ -110,10 +111,22 @@ function runChild(command, args, input) {
     const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    const finish = (result, error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const timeout = setTimeout(() => {
+      child.kill();
+      finish({ code: 1, stdout: stdout.trim(), stderr: "protected-store helper timed out" });
+    }, CHILD_TIMEOUT_MS);
     child.stdout.on("data", (chunk) => { stdout = `${stdout}${chunk}`.slice(-65_536); });
     child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-16_384); });
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
+    child.on("error", (error) => finish(null, error));
+    child.on("close", (code) => finish({ code: code ?? 1, stdout: stdout.trim(), stderr: stderr.trim() }));
     child.stdin.end(input);
   });
 }
